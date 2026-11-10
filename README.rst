@@ -1,5 +1,5 @@
-Tool to reduce and extract JWST timeseries data
------------------------------------------------
+Tool to reduce, extract, and analyze JWST timeseries data
+---------------------------------------------------------
 
 License
 -------
