@@ -1,6 +1,41 @@
 Tool to reduce, extract, and analyze JWST timeseries data
 ---------------------------------------------------------
 
+``jstark`` is a modular toolkit for JWST time-series observations of
+transiting exoplanets, from raw ``uncal`` files to light curves and spectra.
+
+Reduction (``jstark.reduction``)
+================================
+
+* ``Stage1`` -- ``uncal`` -> ``rateints``: all jwst Detector1 steps, plus
+  custom bias correction, group-level background / 1/f subtraction
+  (column, row-by-amplifier, polynomial, or difference-image methods) and
+  time-domain jump detection.
+* ``Stage2`` -- wavelength maps on the full subarray (``assign_wcs``;
+  PASTASOSS for NIRISS/SOSS).
+* ``ExposureCleaner`` / ``CubeCleaner`` -- error fixing, bad-pixel and
+  cosmic-ray identification and replacement, background subtraction;
+  processed and written segment by segment (no stitching of segments).
+
+Supported modes: NIRSpec PRISM / G395H / G235H / G395M / G235M, NIRISS SOSS,
+NIRCam F444W / F322W2 grism, MIRI LRS and MIRI F1500W imaging. See
+``docs/reduction.rst`` for a walk-through.
+
+.. code-block:: python
+
+    from jstark.reduction import Stage1, Stage2, ExposureCleaner
+    s1 = Stage1('/data/NRS1', outdir='/data/NRS1/reduction'); s1.run()
+    s2 = Stage2('/data/NRS1/reduction'); wfile = s2.run()['wavelength']
+    ec = ExposureCleaner('/data/NRS1/reduction', wavelength=wfile)
+    info = ec.run()          # cleaned segment files + <exposure>_cleaninfo.fits
+
+Light-curve analysis
+====================
+
+``ApPhoto`` (aperture photometry and PLD), ``SpectroscopicLC`` (fitting of
+spectroscopic light curves with juliet) and ``julietPlots`` live in
+``jstark.jstark``.
+
 License
 -------
 

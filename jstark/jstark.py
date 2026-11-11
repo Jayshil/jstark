@@ -1582,9 +1582,10 @@ class ApPhoto(object):
     errors : ndarray
         Per-pixel uncertainties with the same shape as ``frames``.
     badpix : ndarray
-        2D bad-pixel mask for a single frame (shape ``(Ny, Nx)``).
-        A value of zero indicates a bad/ignored pixel; non-zero
-        indicates a usable pixel.
+        Bad-pixel mask, either 2D (shape ``(Ny, Nx)``, the same for all
+        frames) or 3D (shape ``(N_frames, Ny, Nx)``, e.g.
+        ``CubeCleaner.good_mask``). A value of zero indicates a bad/ignored
+        pixel; non-zero indicates a usable pixel. It is stored as a 3D array.
     aprad : float or None, optional
         Aperture radius in pixels for circular aperture photometry.
         Used by :meth:`aperture_mask` and :meth:`simple_aperture_photometry`.
@@ -1650,7 +1651,8 @@ class ApPhoto(object):
         self.times = times
         self.frames = frames
         self.errors = errors
-        self.badpix = badpix
+        # 2D maps are broadcast to every frame so that per-frame flags (e.g. cosmic rays) can be added
+        self.badpix = np.array(np.broadcast_to(np.asarray(badpix, dtype=float), np.shape(frames)))
 
         # The aperture information
         self.aprad = aprad

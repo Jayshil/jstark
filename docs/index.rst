@@ -7,6 +7,8 @@ This is the documentation for jstark.
    :maxdepth: 2
    :caption: Contents:
 
+   reduction
+
 Indices and tables
 ==================
 
