@@ -16,6 +16,12 @@ Overview
 1. :class:`~jstark.reduction.Stage1` -- detector processing, ``uncal`` ->
    ``rateints``. Wraps every ``jwst`` Detector1 step and adds custom steps:
 
+   * ``consistent_saturation`` -- partially saturated pixels use the same
+     set of groups in every integration of the exposure (a quick pre-pass
+     over all segments builds the map; ``scope='segment'`` avoids the
+     pre-pass). Otherwise a pixel that saturates at group 5 in some
+     integrations and not in others switches between 4- and 5-group slopes,
+     which differ by several per cent.
    * ``custom_bias`` -- scaled CRDS superbias (Eureka!-style), a superbias
      measured from the data (``median(2 g0 - g1)``), or a user bias.
    * ``group_bkg`` -- group-level background / 1/f subtraction:

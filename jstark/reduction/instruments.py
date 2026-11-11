@@ -21,6 +21,10 @@ The defaults follow typical choices in the published literature:
   trend.
 * For NIRISS/SOSS, the "difference-image" 1/f method of exoTEDRF is the
   default because there is very little background area on the detector.
+* Consistent saturation flags: each pixel uses the same set of groups in
+  every integration of the exposure. Otherwise partially saturated pixels
+  switch between e.g. 4 and 5 fitted groups from one integration to the next,
+  and their rates jump by several per cent (measured on NIRSpec/PRISM).
 * Jump detection in the time domain (as in exoTEDRF's ``jumpstep_in_time``)
   instead of the default up-the-ramp two-point-difference algorithm.
 * Dark-current subtraction is skipped for NIRSpec and NIRCam (dark current
@@ -38,10 +42,14 @@ __all__ = ['StepSpec', 'ModeConfig', 'identify_mode', 'get_mode_config', 'list_m
            'JSTARK_STEPS', 'BAD_DQ_FLAGS']
 
 # Custom (non-jwst) Stage 1 steps implemented in jstark.
-JSTARK_STEPS = ('custom_bias', 'group_bkg', 'temporal_jump')
+JSTARK_STEPS = ('consistent_saturation', 'custom_bias', 'group_bkg', 'temporal_jump')
 
 # Default DQ flags treated as "bad" when building bad-pixel maps.
-BAD_DQ_FLAGS = ('DO_NOT_USE', 'SATURATED', 'DEAD', 'HOT', 'NONLINEAR', 'NO_LIN_CORR',
+# SATURATED is deliberately *not* included: in rateints products jwst sets it for any
+# pixel that saturated in some group, even when a valid slope was fitted from the
+# unsaturated groups (partial saturation, e.g. the core of a bright NIRSpec/PRISM trace).
+# Pixels without a valid slope carry DO_NOT_USE (or a NaN rate) and are still caught.
+BAD_DQ_FLAGS = ('DO_NOT_USE', 'DEAD', 'HOT', 'NONLINEAR', 'NO_LIN_CORR',
                 'NO_GAIN_VALUE', 'REFERENCE_PIXEL', 'NON_SCIENCE', 'UNRELIABLE_SLOPE',
                 'OTHER_BAD_PIXEL')
 
@@ -136,6 +144,7 @@ def _nir_recipe(onef_axis, onef_method='median', dark=False, refpix_kwargs=None,
         StepSpec('group_scale'),
         StepSpec('dq_init'),
         StepSpec('saturation', {'n_pix_grow_sat': 1}),
+        StepSpec('consistent_saturation', {'min_frac': 0.01, 'scope': 'exposure'}),
         StepSpec('superbias'),
         StepSpec('custom_bias', {'method': 'scaled', 'mode': 'smooth'}, skip=True),
         StepSpec('refpix', refpix_kwargs or {}),
@@ -158,6 +167,7 @@ def _miri_recipe():
         StepSpec('dq_init'),
         StepSpec('emicorr'),
         StepSpec('saturation'),
+        StepSpec('consistent_saturation', {'min_frac': 0.01, 'scope': 'exposure'}),
         StepSpec('firstframe', {'bright_use_group1': True}),
         StepSpec('lastframe'),
         StepSpec('reset'),

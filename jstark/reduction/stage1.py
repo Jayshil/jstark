@@ -110,6 +110,7 @@ class Stage1:
         self.trace_mask = None
         self.bkg_mask = None
         self.signal_image = None
+        self.saturation_map = None
         self._user_mask = False
         self.diagnostics = {}
         self.model = None
@@ -304,7 +305,9 @@ class Stage1:
 
     def run_step(self, name, model, segment=None, **kwargs):
         """Run a single step (jwst or jstark) on ``model`` and return the result."""
-        if name == 'custom_bias':
+        if name == 'consistent_saturation':
+            out = self._consistent_saturation(model, segment=segment, **kwargs)
+        elif name == 'custom_bias':
             out = self._custom_bias(model, segment=segment, **kwargs)
         elif name == 'group_bkg':
             out = self._group_bkg(model, segment=segment, **kwargs)
@@ -361,6 +364,116 @@ class Stage1:
         with datamodels.ReadnoiseModel(fname) as ref:
             sub = get_subarray_model(model, ref)
             return np.array(sub.data, dtype=np.float32)
+
+    @staticmethod
+    def _first_saturated_group(sat_counts, nint, min_frac):
+        """First group saturated in at least ``min_frac`` of the integrations (ngroup if none)."""
+        ngroup = sat_counts.shape[0]
+        frac = sat_counts / max(nint, 1)
+        hit = frac >= min_frac
+        first = np.where(hit.any(axis=0), np.argmax(hit, axis=0), ngroup)
+        return first.astype(np.int16)
+
+    def compute_saturation_map(self, segments=None, min_frac=0.01, save=True):
+        """Pre-pass: first consistently saturated group of every pixel over the exposure.
+
+        Runs only the recipe steps up to and including ``saturation`` (with
+        their current parameters) on every segment and counts, for each pixel
+        and group, in how many integrations the group is flagged SATURATED.
+        A pixel is considered saturated from group ``g`` on if group ``g`` is
+        saturated in at least ``min_frac`` of all integrations (so that
+        saturation by single cosmic rays does not count).
+
+        Returns
+        -------
+        ndarray
+            ``(ny, nx)`` map of the first saturated group (``ngroup`` = never).
+        """
+        segments = list(range(len(self.files))) if segments is None else list(segments)
+        names = self.step_names
+        stop = names.index('saturation')
+        counts, nint = None, 0
+        for seg in segments:
+            m = self.load(seg)
+            for spec in self.recipe[:stop + 1]:
+                if spec.skip or spec.is_custom:
+                    continue
+                m = self._jwst_step(spec.name, m, **spec.kwargs)
+            sat = (np.asarray(m.groupdq) & 2) > 0
+            c = sat.sum(axis=0).astype(np.int32)
+            counts = c if counts is None else counts + c
+            nint += sat.shape[0]
+            m.close()
+            if self.verbose:
+                print(f'  saturation pre-pass: segment {seg + 1}/{len(self.files)}')
+        self.saturation_map = self._first_saturated_group(counts, nint, min_frac)
+        self._saturation_counts = (counts, nint)
+        ngroup = counts.shape[0]
+        n = int((self.saturation_map < ngroup).sum())
+        if self.verbose:
+            print(f'  saturation map: {n} pixels saturate (in >= {min_frac * 100:g}% of integrations); '
+                  f'first saturated group histogram {np.bincount(self.saturation_map.ravel(), minlength=ngroup + 1).tolist()}')
+        if save:
+            fn = os.path.join(self.outdir, f'{self.exposure}_saturation_map.fits')
+            hdr = fits.Header()
+            hdr['MINFRAC'] = (min_frac, 'min fraction of integrations saturated')
+            hdr['NINT'] = nint
+            fits.HDUList([fits.PrimaryHDU(self.saturation_map, header=hdr),
+                          fits.ImageHDU(counts, name='SATCOUNT')]).writeto(fn, overwrite=True)
+        self.log.add('compute_saturation_map', segment=None, min_frac=min_frac, n_pixels=n)
+        return self.saturation_map
+
+    def _consistent_saturation(self, model, segment=None, min_frac=0.01, scope='exposure',
+                               saturation_map=None):
+        """Use the same set of groups for every pixel in every integration.
+
+        Partially saturated pixels otherwise switch between different numbers
+        of fitted groups from one integration to the next, which changes
+        their rate by several per cent (residual non-linearity near
+        saturation, charge spilling from saturated neighbours), and the
+        switching can correlate with the transit itself. Groups from the
+        pixel's first consistently saturated group on are flagged SATURATED
+        in all integrations.
+
+        Parameters
+        ----------
+        min_frac : float
+            Fraction of integrations in which a group must be saturated.
+        scope : {'exposure', 'segment'}
+            ``'exposure'`` (default) uses a map built from all segments by
+            :meth:`compute_saturation_map` (computed automatically the first
+            time); ``'segment'`` uses only the current segment (cheaper, but
+            the group set can change at segment boundaries).
+        saturation_map : ndarray or str or None
+            User-supplied map (first saturated group per pixel) or FITS file.
+        """
+        gdq = model.groupdq
+        nint, ngroup = gdq.shape[:2]
+        if saturation_map is not None:
+            smap = fits.getdata(saturation_map) if isinstance(saturation_map, str) else saturation_map
+        elif scope == 'exposure':
+            if self.saturation_map is None:
+                if self.verbose:
+                    print('  consistent_saturation: building the exposure-wide saturation map')
+                self.compute_saturation_map(min_frac=min_frac)
+            smap = self.saturation_map
+        elif scope == 'segment':
+            counts = ((np.asarray(gdq) & 2) > 0).sum(axis=0)
+            smap = self._first_saturated_group(counts, nint, min_frac)
+        else:
+            raise ValueError("scope must be 'exposure' or 'segment'.")
+        smap = np.asarray(smap)
+        g = np.arange(ngroup)[:, None, None]
+        flag = g >= smap[None]                                       # (ngroup, ny, nx)
+        before = int(((np.asarray(gdq) & 2) > 0).sum())
+        gdq |= (flag[None] * np.uint8(2)).astype(gdq.dtype)
+        after = int(((np.asarray(gdq) & 2) > 0).sum())
+        info = self._diag(segment, 'consistent_saturation')
+        info.update({'saturation_map': smap.astype(np.int16), 'n_groups_added': after - before})
+        if self.verbose:
+            print(f'    consistent_saturation: {int((smap < ngroup).sum())} pixels, '
+                  f'{after - before} saturated-group flags added')
+        return model
 
     def _custom_bias(self, model, segment=None, method='scaled', mode='smooth', window=51,
                      bias=None, propagate_dq=True):
