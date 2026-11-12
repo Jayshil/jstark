@@ -31,7 +31,10 @@ The defaults follow typical choices in the published literature:
   is negligible and the reference files add noise), and applied for
   NIRISS/SOSS and MIRI.
 * MIRI: ``emicorr`` (390 Hz EMI), ``firstframe``, ``lastframe``, ``reset``
-  and ``rscd`` are applied; no group-level background subtraction.
+  and ``rscd`` are applied; no group-level background subtraction. The
+  ramp fit starts at group 12, excluding the RSCD-affected early groups
+  (``rscd`` itself flags only 8); ``firstgroup='auto'`` measures this from
+  the data instead.
 
 All of these can be changed by the user through :class:`~jstark.reduction.Stage1`.
 """
@@ -178,7 +181,12 @@ def _miri_recipe():
         StepSpec('group_bkg', {'method': 'median', 'axis': 'row'}, skip=True),
         StepSpec('jump', {'rejection_threshold': 15., 'maximum_cores': 'half'}, skip=True),
         StepSpec('temporal_jump', {'window': 11, 'threshold': 10., 'mode': 'auto'}),
-        StepSpec('ramp_fit', {'algorithm': 'OLS_C', 'maximum_cores': 'half'}),
+        # RSCD distorts the first groups of MIRI ramps (group-to-group increases too high by
+        # ~50-110% in group 1, still ~1.8% at group 8, <=0.6% from group 12; measured on
+        # WASP-43 LRS). The rscd step flags only the first 8 groups, so the fit starts at
+        # group 12 (common choice in the literature). firstgroup='auto' measures it from the
+        # data instead (see Stage1.find_linear_group_range).
+        StepSpec('ramp_fit', {'algorithm': 'OLS_C', 'maximum_cores': 'half', 'firstgroup': 12}),
         StepSpec('gain_scale'),
     ]
 

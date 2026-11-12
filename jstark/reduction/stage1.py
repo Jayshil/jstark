@@ -111,6 +111,7 @@ class Stage1:
         self.bkg_mask = None
         self.signal_image = None
         self.saturation_map = None
+        self.auto_firstgroup = None
         self._user_mask = False
         self.diagnostics = {}
         self.model = None
@@ -314,9 +315,81 @@ class Stage1:
         elif name == 'temporal_jump':
             out = self._temporal_jump(model, segment=segment, **kwargs)
         else:
+            if name == 'ramp_fit' and 'auto' in (kwargs.get('firstgroup'), kwargs.get('lastgroup')):
+                kwargs = dict(kwargs)
+                first, last = self.find_linear_group_range(model, **kwargs.pop('auto_kwargs', {}))
+                if kwargs.get('firstgroup') == 'auto':
+                    kwargs['firstgroup'] = first
+                if kwargs.get('lastgroup') == 'auto':
+                    kwargs['lastgroup'] = last
+            kwargs = {k: v for k, v in kwargs.items() if k != 'auto_kwargs'}
             out = self._jwst_step(name, model, **kwargs)
         self.log.add(name, segment=segment, **kwargs)
         return out
+
+    def find_linear_group_range(self, model=None, tol=0.005, nrun=5, recompute=False):
+        """Range of groups over which the ramps are linear (e.g. MIRI RSCD / end-of-ramp effects).
+
+        The median (over integrations, excluding the first one) group-to-group
+        increase is summed over the source pixels and compared with the
+        plateau (median over the middle third of the ramp). The first group
+        is the first ``k`` from which ``nrun`` consecutive increases stay
+        within ``tol`` of the plateau; the last group is found in the same way
+        from the end of the ramp. Groups already flagged (e.g. by ``rscd``,
+        ``firstframe``, ``lastframe``) are excluded. The result is computed
+        once (on the first segment processed) and reused, so the whole
+        exposure uses the same groups.
+
+        Use it with ``s1.set('ramp_fit', firstgroup='auto')`` (and/or
+        ``lastgroup='auto'``; tune with ``auto_kwargs={'tol': 0.01}``).
+        Caveat: a dark reference (``dark_current``) adds a fixed
+        group-to-group pattern of ~1-3 per cent to the summed increases of
+        MIRI ramps, which can hide sub-per-cent curvature; a larger ``tol``
+        is then needed.
+
+        Returns
+        -------
+        (int, int)
+            Zero-indexed ``(firstgroup, lastgroup)`` for ``ramp_fit``.
+        """
+        if self.auto_firstgroup is not None and not recompute:
+            return self.auto_firstgroup
+        if model is None:
+            raise ValueError('A ramp model is needed to determine the linear group range.')
+        if self.trace_mask is None:
+            self.build_trace_mask(model)
+        nint, ng = model.data.shape[:2]
+        sel = slice(1, min(nint, 201)) if nint > 2 else slice(None)
+        d = np.array(model.data[sel], dtype=np.float32)
+        d[(np.asarray(model.groupdq[sel]) & 3) > 0] = np.nan
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            inc = np.diff(np.nanmedian(d, axis=0), axis=0)              # increase k: group k -> k+1
+            tot = np.nansum(np.where(self.trace_mask[None], inc, 0.), axis=(1, 2))
+        valid = np.isfinite(tot) & (tot != 0)
+        k_valid = np.where(valid)[0]
+        if len(k_valid) < 3 * nrun:
+            first, last = (int(k_valid[0]), int(k_valid[-1]) + 1) if len(k_valid) else (0, ng - 1)
+            self.auto_firstgroup = (first, last)
+            return self.auto_firstgroup
+        n = len(k_valid)
+        plateau = np.median(tot[k_valid[n // 3: 2 * n // 3]])
+        ok = valid & (np.abs(tot / plateau - 1) < tol)
+        run = np.convolve(ok.astype(int), np.ones(nrun, int), mode='valid') == nrun   # run starting at k
+        starts = np.where(run)[0]
+        if len(starts) == 0:
+            warnings.warn(f'No linear stretch of {nrun} increases within {tol * 100:g}% found; '
+                          f'using all unflagged groups.')
+            first, last = int(k_valid[0]), int(k_valid[-1]) + 1
+        else:
+            first = int(starts[0])                         # fit starts at group first
+            last = int(starts[-1] + nrun)                  # ... and ends at group last (inclusive)
+        self.auto_firstgroup = (first, last)
+        if self.verbose:
+            print(f'    ramp_fit: linear group range = {first}-{last} of 0-{ng - 1} (increases within '
+                  f'{tol * 100:g}% of the plateau; used for the whole exposure)')
+        self.log.add('find_linear_group_range', segment=None, tol=tol, firstgroup=first, lastgroup=last)
+        return self.auto_firstgroup
 
     def _jwst_step(self, name, model, **kwargs):
         _, Detector1Pipeline = _jwst_imports()

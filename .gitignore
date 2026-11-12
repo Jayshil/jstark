@@ -222,3 +222,6 @@ __marimo__/
 *DS_Store
 /jstark/data
 /jstark/tests
+# macOS AppleDouble metadata files (created on exFAT/non-Apple volumes)
+._*
+.claude/settings.local.json

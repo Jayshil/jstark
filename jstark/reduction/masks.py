@@ -35,11 +35,14 @@ def quick_signal_image(data, groupdq=None, max_ints=200):
     if groupdq is not None:
         bad = (np.asarray(groupdq[sel]) & 3) > 0  # DO_NOT_USE | SATURATED
         d = np.where(bad, np.nan, d)
-    # last valid group - first group (per pixel)
+    # last valid group - first valid group (per pixel); e.g. MIRI flags group 0 (firstframe)
     valid = np.isfinite(d)
+    first_idx = np.argmax(valid, axis=1)
     last_idx = d.shape[1] - 1 - np.argmax(valid[:, ::-1], axis=1)
+    first = np.take_along_axis(d, first_idx[:, None], axis=1)[:, 0]
     last = np.take_along_axis(d, last_idx[:, None], axis=1)[:, 0]
-    cds = (last - d[:, 0]) / np.maximum(last_idx, 1) * (d.shape[1] - 1)
+    nstep = last_idx - first_idx
+    cds = np.where(nstep > 0, (last - first) / np.maximum(nstep, 1) * (d.shape[1] - 1), np.nan)
     return nanmedian(cds, axis=0)
 
 
