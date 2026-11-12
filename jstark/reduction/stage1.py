@@ -101,6 +101,11 @@ class Stage1:
         self.header = fits.getheader(self.files[0], 0)
         self.mode = mode if mode is not None else identify_mode(self.header)
         self.config = get_mode_config(self.mode)
+        det = str(self.header.get('DETECTOR', '')).upper()
+        grating = str(self.header.get('GRATING', '')).upper()
+        if det == 'NRS2' and (grating == 'PRISM' or grating.endswith('M')):
+            warnings.warn(f'{self.exposure}: for NIRSpec {grating} the spectral trace falls on NRS1 only; '
+                          f'NRS2 contains no source. Pass exposure="nrs1" to select NRS1.')
         if outdir is None:
             outdir = os.path.join(os.path.dirname(os.path.abspath(self.files[0])), 'jstark_stage1')
         self.outdir = outdir
@@ -323,9 +328,35 @@ class Stage1:
                 if kwargs.get('lastgroup') == 'auto':
                     kwargs['lastgroup'] = last
             kwargs = {k: v for k, v in kwargs.items() if k != 'auto_kwargs'}
+            if name == 'ramp_fit':
+                kwargs = self._check_group_range(model, kwargs)
             out = self._jwst_step(name, model, **kwargs)
         self.log.add(name, segment=segment, **kwargs)
         return out
+
+    def _check_group_range(self, model, kwargs, min_groups=3):
+        """Guard ``firstgroup`` / ``lastgroup`` against ramps that are too short.
+
+        jwst ignores the selection (and silently uses all groups) when
+        ``firstgroup >= lastgroup``, and leaves pixels without a rate when
+        only one usable group remains. If fewer than ``min_groups`` groups
+        that are not flagged in every integration would be left, the
+        selection is dropped with a warning.
+        """
+        first, last = kwargs.get('firstgroup'), kwargs.get('lastgroup')
+        if first is None and last is None:
+            return kwargs
+        ngroup = model.data.shape[1]
+        lo = 0 if first is None else int(first)
+        hi = ngroup - 1 if last is None else min(int(last), ngroup - 1)
+        always_flagged = np.all((np.asarray(model.groupdq[:, :, 0, 0]) & 1) > 0, axis=0) \
+            if model.groupdq.shape[0] else np.zeros(ngroup, bool)
+        usable = [g for g in range(lo, hi + 1) if not always_flagged[g]]
+        if len(usable) < min_groups:
+            warnings.warn(f'ramp_fit: firstgroup={first}, lastgroup={last} would leave {len(usable)} usable '
+                          f'group(s) of {ngroup}; ignoring the group selection and fitting all usable groups.')
+            kwargs = {k: v for k, v in kwargs.items() if k not in ('firstgroup', 'lastgroup')}
+        return kwargs
 
     def find_linear_group_range(self, model=None, tol=0.005, nrun=5, recompute=False):
         """Range of groups over which the ramps are linear (e.g. MIRI RSCD / end-of-ramp effects).

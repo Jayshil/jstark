@@ -61,6 +61,8 @@ def find_exposures(inputs, suffix='uncal'):
             files = glob(inputs)
         else:
             files = [inputs]
+    # skip macOS AppleDouble metadata files ('._name') created on exFAT / FAT volumes
+    files = [f for f in files if not os.path.basename(f).startswith('._')]
     if len(files) == 0:
         raise FileNotFoundError(f'No *_{suffix}.fits files found in {inputs}.')
 
