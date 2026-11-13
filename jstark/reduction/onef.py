@@ -42,6 +42,20 @@ Three algorithms are provided, all working on a 4D cube
     the rows where it has none (e.g. rows fully covered by the trace),
     instead of simply borrowing the other amplifiers' value. Rows with
     enough background pixels keep their directly measured offset.
+
+``'rowcol'``
+    Row then column medians of the background pixels: the amplifiers are
+    first equalised (one offset per amplifier from all its background
+    pixels), then one row offset common to all amplifiers is subtracted
+    (median over the background pixels of the whole row), then a column
+    offset (median over the background pixels of each column).
+
+For ``'diff'`` and ``'readout'``, ``wing_max`` adds the faint trace pixels
+(median signal per group below ``wing_max``) to the pixels used to measure
+the offsets. The difference images remove the static stellar light, and in
+the faint wings flux changes are far smaller than the 1/f offsets, so the
+offsets can be measured there directly; only the bright core is left to the
+model.
 """
 import warnings
 
@@ -51,7 +65,7 @@ import bottleneck as bn
 from .robust import clipped_median, nanmedian, mad_sigma, MAD_TO_SIGMA
 from .masks import amplifier_bounds
 
-__all__ = ['group_background', 'stripe_median', 'stripe_wmean', 'stripe_poly', 'readout_model',
+__all__ = ['group_background', 'stripe_median', 'stripe_rowcol', 'stripe_wmean', 'stripe_poly', 'readout_model',
            'diff_scale_factors']
 
 _BAD_GROUP = 1 | 2  # DO_NOT_USE | SATURATED
@@ -123,6 +137,24 @@ def stripe_median(cube, bkg_mask, axis='column', nsigma=3., maxiters=3, amp_boun
         model[..., x0:x1] += seg[..., None]
         prof[..., k] = model[..., x0]
     return model, prof
+
+
+def stripe_rowcol(cube, bkg_mask, amp_bounds=None, nsigma=3., maxiters=3):
+    """Amplifier equalisation, a row offset common to all amplifiers, then column offsets.
+
+    Returns
+    -------
+    model : ndarray
+        Background model with the same shape as ``cube``.
+    profile : ndarray
+        The row part of the model, ``(..., ny, namp)``.
+    """
+    # a huge min_pixels forces the full-row (all-amplifier) estimate after equalisation
+    rows, prof = stripe_median(cube, bkg_mask, axis='row', nsigma=nsigma, maxiters=maxiters,
+                               amp_bounds=amp_bounds, min_pixels=np.iinfo(np.int64).max)
+    cols, _ = stripe_median(cube - rows, bkg_mask, axis='column', nsigma=nsigma,
+                            maxiters=maxiters)
+    return rows + cols, prof
 
 
 def stripe_wmean(cube, weights, axis='column', nsigma=4., maxiters=3, amp_bounds=None):
@@ -308,7 +340,7 @@ def group_background(data, bkg_mask, method='median', axis='column', groupdq=Non
                      nsigma=3., maxiters=3, poly_order=1, amp_bounds=None, min_pixels=4,
                      source_mask=None, chunk=50, return_model=False, inplace=True, exclude=None,
                      use_source_pixels=False, weight_ints=200, readout_order=3,
-                     readout_direct=True):
+                     readout_direct=True, wing_max=None, wing_min_pixels=100):
     """Subtract a column/row background (including 1/f noise) from every group.
 
     Parameters
@@ -318,7 +350,7 @@ def group_background(data, bkg_mask, method='median', axis='column', groupdq=Non
         ``inplace=False``.
     bkg_mask : ndarray
         Boolean ``(ny, nx)`` background mask (``True`` = background pixel).
-    method : {'median', 'poly', 'diff', 'readout'}
+    method : {'median', 'poly', 'diff', 'readout', 'rowcol'}
         Algorithm, see the module documentation.
     axis : {'column', 'row'}
         Direction of the 1/f stripes.
@@ -360,6 +392,16 @@ def group_background(data, bkg_mask, method='median', axis='column', groupdq=Non
         ``method='readout'``: keep directly measured offsets where an
         amplifier has enough background pixels (``False`` uses the model
         everywhere).
+    wing_max : float or None
+        ``method='diff'`` / ``'readout'``: also measure the offsets on source
+        pixels whose median signal per group (DN, from the median frames) is
+        below this value. ``None`` uses only ``bkg_mask``.
+    wing_min_pixels : int
+        With ``wing_max``: an amplifier-row (or column) without enough
+        background pixels uses its wing pixels only if at least this many
+        qualify; otherwise it is left to the model. A few faint pixels at the
+        end of the spectrum in a bright row are sensitive to shifts along the
+        dispersion and would set the offset of the whole row.
 
     Returns
     -------
@@ -400,6 +442,18 @@ def group_background(data, bkg_mask, method='median', axis='column', groupdq=Non
             weights = np.where((var > 0) & np.isfinite(var) & valid[None], 1. / var, 0.)
             info['weights'] = weights.astype(np.float32)
 
+    fit_mask = bkg_mask
+    if wing_max is not None:
+        if method not in ('diff', 'readout'):
+            raise ValueError("wing_max requires method='diff' or 'readout'.")
+        rate = (median_frames[-1] - median_frames[0]) / (ngroup - 1) if ngroup > 1 \
+            else median_frames[0]
+        src = source_mask if source_mask is not None else ~bkg_mask
+        wing = src & np.isfinite(rate) & (rate < wing_max)
+        wing = _drop_sparse_wings(wing, bkg_mask, axis, amp_bounds, min_pixels, wing_min_pixels)
+        fit_mask = bkg_mask | wing
+        info['fit_mask'] = fit_mask
+
     for sl in _chunks(nint, chunk):
         d = np.array(data[sl], dtype=np.float32)
         if groupdq is not None:
@@ -409,14 +463,17 @@ def group_background(data, bkg_mask, method='median', axis='column', groupdq=Non
         if method in ('diff', 'readout'):
             d = d - scale[sl, None, None, None] * median_frames[None]
         if method == 'readout':
-            model, prof = _readout_stripes(d, bkg_mask, axis, amp_bounds, min_pixels, nsigma,
+            model, prof = _readout_stripes(d, fit_mask, axis, amp_bounds, min_pixels, nsigma,
                                            maxiters, readout_order, readout_direct)
         elif method == 'diff' and use_source_pixels:
             model, prof = stripe_wmean(d, weights[None], axis=axis, nsigma=max(nsigma, 4.),
                                        maxiters=maxiters,
                                        amp_bounds=amp_bounds if axis == 'row' else None)
+        elif method == 'rowcol':
+            model, prof = stripe_rowcol(d, bkg_mask, amp_bounds=amp_bounds, nsigma=nsigma,
+                                        maxiters=maxiters)
         elif method in ('median', 'diff'):
-            model, prof = stripe_median(d, bkg_mask, axis=axis, nsigma=nsigma, maxiters=maxiters,
+            model, prof = stripe_median(d, fit_mask, axis=axis, nsigma=nsigma, maxiters=maxiters,
                                         amp_bounds=amp_bounds if axis == 'row' else None,
                                         min_pixels=min_pixels)
         elif method == 'poly':
@@ -433,6 +490,19 @@ def group_background(data, bkg_mask, method='median', axis='column', groupdq=Non
     if return_model:
         info['model'] = np.concatenate(models, axis=0)
     return data, info
+
+
+def _drop_sparse_wings(wing, bkg_mask, axis, amp_bounds, min_pixels, wing_min_pixels):
+    """Remove wing pixels of lines (amplifier-rows / columns) that have too few of them."""
+    wing = wing.copy()
+    if axis == 'column':
+        nb, nw = bkg_mask.sum(0), wing.sum(0)
+        wing[:, (nb < min_pixels) & (nw < wing_min_pixels)] = False
+        return wing
+    for (x0, x1) in (amp_bounds or [(0, wing.shape[1])]):
+        nb, nw = bkg_mask[:, x0:x1].sum(1), wing[:, x0:x1].sum(1)
+        wing[(nb < min_pixels) & (nw < wing_min_pixels), x0:x1] = False
+    return wing
 
 
 def _readout_stripes(d, bkg_mask, axis, amp_bounds, min_pixels, nsigma, maxiters, order, direct):

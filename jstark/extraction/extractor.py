@@ -1123,7 +1123,8 @@ class SpectralExtractor:
             if o not in self.cov:
                 self.estimate_covariance(orders=[o])
             Gc = G & ~res['rejected']
-            cf, cv = covariance_extract(self, o, D, V, Gc, P, e, W['rows'])
+            cf, cv = covariance_extract(self, o, D, V, Gc, P, e, W['rows'],
+                                        scale=pe.get('cov_scale', 1.))
             out['opt'], out['opt_var'] = res['flux'], res['var']
             out['flux'], out['var'] = cf, cv
         else:

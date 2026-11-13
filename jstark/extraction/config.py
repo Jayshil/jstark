@@ -60,7 +60,7 @@ DEFAULTS = {
                 init_ints=200, ints='all', second_pass=False, pixel_correction=True, cv='phase'),
     'extract': dict(method='optimal', aperture=5., variance='mean', reject=6., reject_iters=3,
                     reject_mode='temporal', fit_background=False, refine_shift=2, joint_iters=3,
-                    max_maskfrac=0.98),
+                    max_maskfrac=0.98, cov_scale=1.),
 }
 
 MODE_DEFAULTS = {
@@ -77,7 +77,10 @@ MODE_DEFAULTS = {
         'orders': [1],
         'background': dict(inner=12., min_pixels=10),
         'psf': dict(halfwidth=9., oversample=2., knot_col=20),
-        'extract': dict(aperture=6.),
+        # 1/f row offsets are shared by the ~500 columns of an amplifier: weights for
+        # sums of columns (C = V + 500 K) lowered the white-light scatter by ~10% on
+        # HD 207496 F444W / F322W2 (extraction_notes.md, 5.13)
+        'extract': dict(aperture=6., method='covariance', cov_scale=500.),
     },
     'MIRI/LRS': {
         'orders': [1],

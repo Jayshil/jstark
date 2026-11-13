@@ -17,6 +17,16 @@ indistinguishable from a change of the flux and is removed by the fit (it is
 absent from the residuals). No weighting can reduce it; ``K`` describes the
 remaining part, which is exactly what the weights can act on. The returned
 errors therefore do not include the profile-shaped part of the 1/f noise.
+
+Weights for sums of columns (``cov_scale``). A row offset is shared by all
+columns of an amplifier, so in a sum of ``B`` columns (a spectral bin, the
+white light) it adds up coherently (variance ~ B**2 K) while the pixel noise
+adds in quadrature (~ B V). The weights that minimise the noise of the sum use
+``C = diag(V) + B K``; per column (B = 1) K is negligible next to V. With
+``set('extract', method='covariance', cov_scale=B)`` the faint wings, where
+the read noise is small and the row offsets dominate, are down-weighted. On
+HD 207496 (one segment) B = 500 lowered the white-light scatter by ~10%.
+The returned variances are those of each column for these weights.
 """
 import numpy as np
 
@@ -92,8 +102,11 @@ def estimate_row_covariance(ex, order, nblocks=3, block_len=300, segments=None, 
     return dict(K=K, group=grp, rows=good_rows, nint=len(o))
 
 
-def covariance_extract(ex, order, D, V, G, P, e, rows, max_mb=400):
-    """Covariance-weighted flux of a chunk (window arrays as in :func:`optimal`)."""
+def covariance_extract(ex, order, D, V, G, P, e, rows, max_mb=400, scale=1.):
+    """Covariance-weighted flux of a chunk (window arrays as in :func:`optimal`).
+
+    ``scale`` multiplies the row-offset covariance (number of columns summed).
+    """
     cv = ex.cov[order]
     use = np.any(e > 0, axis=(0, 2))            # window rows inside the aperture
     sl = slice(int(np.argmax(use)), len(use) - int(np.argmax(use[::-1])))
@@ -106,5 +119,5 @@ def covariance_extract(ex, order, D, V, G, P, e, rows, max_mb=400):
     for a in range(0, n, step):
         s = slice(a, a + step)
         flux[s], var[s] = covariance_weighted(D[s], V[s], G[s], P[s], e[s], cv['K'],
-                                              (rows[s], cv['group']))
+                                              (rows[s], cv['group']), scale=scale)
     return flux, var

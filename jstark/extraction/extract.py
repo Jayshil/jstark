@@ -176,7 +176,7 @@ def refine_shift(D, V, G, P, dP, u, flux, width=False):
     return (a22 * b1 - a12 * b2) / det, (a11 * b2 - a12 * b1) / det
 
 
-def covariance_weighted(D, V, G, P, e, cov_rows, row_index):
+def covariance_weighted(D, V, G, P, e, cov_rows, row_index, scale=1.):
     """Covariance-weighted extraction (generalised least squares per column).
 
     The noise of the pixels of a column is modelled as
@@ -184,6 +184,11 @@ def covariance_weighted(D, V, G, P, e, cov_rows, row_index):
     correlated offsets shared by whole detector rows (e.g. NIRCam 1/f,
     which runs along rows). The flux is
     ``f = P^T C^-1 D / P^T C^-1 P`` with variance ``1 / P^T C^-1 P``.
+
+    With ``scale = B`` the weights use ``C_B = diag(V) + B K`` (optimal for a
+    sum of ``B`` columns sharing the row offsets) and the returned variance is
+    that of the column for these weights, ``w^T (diag(V) + K) w`` with
+    ``w = C_B^-1 P / P^T C_B^-1 P`` (equal to ``1 / P^T C^-1 P`` for B = 1).
 
     Parameters
     ----------
@@ -195,6 +200,8 @@ def covariance_weighted(D, V, G, P, e, cov_rows, row_index):
     row_index : tuple ``(rows, group)``
         ``rows`` ``(n, nwin, ncol)`` detector rows of the window pixels and
         ``group`` ``(ncol,)`` the covariance group of every column.
+    scale : float
+        Multiplier of the row-offset covariance in the weights.
 
     Returns
     -------
@@ -209,7 +216,7 @@ def covariance_weighted(D, V, G, P, e, cov_rows, row_index):
     g = np.broadcast_to(group[None, :], (n, ncol))
     K = cov_rows[g[..., None, None], r[..., :, None], r[..., None, :]]
     Vd = np.moveaxis(np.where(use, V, big), 1, 2)
-    C = K + Vd[..., :, None] * np.eye(nwin)
+    C = scale * K + Vd[..., :, None] * np.eye(nwin)
     u = np.moveaxis(use, 1, 2)
     C = np.where(u[..., :, None] & u[..., None, :], C, 0.) + \
         np.where(u, 0., big)[..., :, None] * np.eye(nwin)
@@ -219,4 +226,10 @@ def covariance_weighted(D, V, G, P, e, cov_rows, row_index):
     a = np.sum(p * x[..., 0], -1)
     b = np.sum(p * x[..., 1], -1)
     a = np.where(a > 0, a, np.nan)
-    return b / a, 1. / a
+    if scale == 1.:
+        return b / a, 1. / a
+    w = np.where(u, x[..., 0], 0.) / a[..., None]               # (n, ncol, nwin)
+    Vu = np.where(u, Vd, 0.)
+    var = np.sum(w * w * Vu, -1) + np.einsum('...i,...ij,...j->...', w, np.where(
+        u[..., :, None] & u[..., None, :], K, 0.), w)
+    return b / a, var

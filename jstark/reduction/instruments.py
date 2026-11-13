@@ -220,12 +220,15 @@ def _nircam(filt):
         per_amplifier=True,
         recipe=_nir_recipe('row', 'readout', dark=False,
                            refpix_kwargs={'odd_even_columns': True, 'use_side_ref_pixels': True},
-                           onef_kwargs={'readout_order': 1}),
+                           onef_kwargs={'readout_order': 1, 'wing_max': 200., 'wing_min_pixels': 100}),
         trace_mask={'method': 'threshold', 'nsigma': 3., 'pad': 3, 'min_pixels': 10},
         notes='NIRCam long-wave grism time series (GRISMR). 1/f stripes run along DMS rows. '
               'Default group-level method: readout-time model (per-amplifier read-time trend '
               '+ common mode across amplifiers), which fills rows where an amplifier has no '
-              'background pixels; ~15% lower white-light scatter than row-by-row medians.')
+              'background pixels; ~15% lower white-light scatter than row-by-row medians. '
+              'Offsets are also measured on the faint trace wings (< 200 DN/group, '
+              'wing_max), leaving only the bright core rows to the model: ~30% lower '
+              'white-light scatter on HD 207496 (detector_processing_notes.md, 6.4).')
 
 
 def _miri_lrs():

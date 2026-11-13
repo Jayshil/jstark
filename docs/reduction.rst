@@ -27,10 +27,18 @@ Overview
    * ``group_bkg`` -- group-level background / 1/f subtraction:
      column-by-column (NIRSpec, NIRISS), row-by-row and
      amplifier-by-amplifier (NIRCam), with ``'median'``, ``'poly'``, the
-     ``'diff'`` (difference-image, exoTEDRF-like) or the ``'readout'``
-     (read-time model with a common mode across amplifiers) algorithm. The
-     direction and method are only defaults, e.g.
+     ``'diff'`` (difference-image, exoTEDRF-like), the ``'readout'``
+     (read-time model with a common mode across amplifiers) or the
+     ``'rowcol'`` (row offset common to all amplifiers, then column offsets)
+     algorithm. The direction and method are only defaults, e.g.
      ``s1.set('group_bkg', axis='column', method='poly')``.
+     With ``'diff'`` / ``'readout'``, ``wing_max`` also measures the offsets
+     on the faint wings of the trace (median signal below ``wing_max`` DN per
+     group; at least ``wing_min_pixels`` of them per amplifier-row). The
+     difference images remove the static stellar light, and in the faint
+     wings flux changes are far smaller than the 1/f offsets, so only the
+     bright core rows are left to the model. NIRCam default:
+     ``wing_max=200``, ``wing_min_pixels=100``.
    * ``temporal_jump`` -- jump detection in the time domain: each pixel's
      group differences are compared with a running median over
      integrations. Jumps are either repaired (default for short ramps) or
@@ -155,7 +163,9 @@ Mode                      Group-level background / 1/f   Notes
 ========================  =============================  ===========================
 NIRSpec (all gratings)    column median, trace masked    dark skipped
 NIRISS SOSS               column, difference-image       dark applied
-NIRCam F444W / F322W2     row, readout-time model        side reference pixels used
+NIRCam F444W / F322W2     row, readout-time model,       side reference pixels used
+                          offsets also measured on the
+                          faint trace wings
 MIRI LRS / imaging        none                           emicorr, firstframe,
                                                          lastframe, reset, rscd, dark
 ========================  =============================  ===========================

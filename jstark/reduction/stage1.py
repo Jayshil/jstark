@@ -650,12 +650,13 @@ class Stage1:
 
     def _group_bkg(self, model, segment=None, method='median', axis=None, nsigma=3., maxiters=3,
                    poly_order=1, per_amplifier=None, min_pixels=None, chunk=50, keep_profile=True,
-                   use_source_pixels=False, readout_order=3, readout_direct=True):
+                   use_source_pixels=False, readout_order=3, readout_direct=True,
+                   wing_max=None, wing_min_pixels=100):
         """Group-level background / 1/f subtraction (see :mod:`jstark.reduction.onef`).
 
         Parameters
         ----------
-        method : {'median', 'poly', 'diff', 'readout'}
+        method : {'median', 'poly', 'diff', 'readout', 'rowcol'}
         axis : {'column', 'row'} or None
             Stripe direction (mode default if ``None``).
         per_amplifier : bool or None
@@ -668,6 +669,12 @@ class Stage1:
         readout_order, readout_direct
             ``method='readout'`` only, see
             :func:`~jstark.reduction.onef.group_background`.
+        wing_max : float or None
+            ``method='diff'`` / ``'readout'``: also measure the offsets on
+            trace pixels fainter than this (DN per group).
+        wing_min_pixels : int
+            With ``wing_max``: minimum number of wing pixels for an
+            amplifier-row without background pixels to be measured directly.
         """
         axis = axis or self.config.onef_axis or 'column'
         self._ensure_masks(model)
@@ -681,7 +688,8 @@ class Stage1:
                                    poly_order=poly_order, amp_bounds=amps, min_pixels=min_pixels,
                                    source_mask=self.trace_mask, chunk=chunk,
                                    use_source_pixels=use_source_pixels,
-                                   readout_order=readout_order, readout_direct=readout_direct)
+                                   readout_order=readout_order, readout_direct=readout_direct,
+                                   wing_max=wing_max, wing_min_pixels=wing_min_pixels)
         d = self._diag(segment, 'group_bkg')
         d.update({k: v for k, v in info.items() if k not in ('median_frames', 'weights')})
         if not keep_profile:

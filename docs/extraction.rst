@@ -87,13 +87,19 @@ Overview
      still measured well from the wings.
    * ``method='box'``: aperture sum, masked pixels filled with the model.
      The box spectra are always saved as well.
-   * ``method='covariance'`` (NIRCam): generalised least squares per column
-     with ``C = diag(V) + K``, ``K`` being the covariance of row offsets
-     (1/f) per amplifier estimated from the residuals of the PSF fit
-     (:meth:`~jstark.extraction.SpectralExtractor.estimate_covariance`). On
-     the F444W / F322W2 test data it gave no gain (1.00 / 1.04 times the
-     optimal scatter): the 1/f that dominates the white light has the shape
-     of the profile and no weighting can remove it. Not the default.
+   * ``method='covariance'`` (NIRCam default): generalised least squares per
+     column with ``C = diag(V) + cov_scale * K``, ``K`` being the covariance
+     of row offsets (1/f) per amplifier estimated from the residuals of the
+     PSF fit (:meth:`~jstark.extraction.SpectralExtractor.estimate_covariance`).
+     A row offset is shared by all columns of an amplifier, so in a sum of
+     ``B`` columns (a spectral bin, the white light) it adds up coherently
+     while the pixel noise adds in quadrature; the weights that minimise the
+     noise of the sum use ``C = diag(V) + B K``. Per column (``cov_scale=1``)
+     ``K`` is negligible and the result equals optimal extraction. The NIRCam
+     default ``cov_scale=500`` (the columns of one amplifier) down-weights
+     the faint wings and lowered the white-light scatter by ~10% on the
+     F444W / F322W2 test data. The saved variance is that of each column
+     for these weights.
    * ``method='joint'`` (NIRISS/SOSS default): the orders are extracted
      together. Each order is extracted from the data minus the current models
      of the other orders, alternating until convergence; the PSF of each
