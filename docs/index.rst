@@ -8,6 +8,7 @@ This is the documentation for jstark.
    :caption: Contents:
 
    reduction
+   extraction
 
 Indices and tables
 ==================

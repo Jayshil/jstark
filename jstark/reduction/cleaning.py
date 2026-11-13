@@ -4,7 +4,7 @@ The :class:`CubeCleaner` keeps two masks:
 
 ``badpix``
     2D ``(ny, nx)`` map of *persistent* bad pixels (``1`` = good, ``0`` = bad;
-    the same convention as :class:`jstark.ApPhoto`). Built from the DQ
+    the same convention as :class:`jstark.extraction.ApPhoto`). Built from the DQ
     flags (pixels flagged in more than a given fraction of integrations),
     from hot / noisy pixel detection on the median and scatter images, or
     supplied by the user.
@@ -754,12 +754,12 @@ class CubeCleaner:
     # Quick-look products
     # ------------------------------------------------------------------
     def to_apphoto(self, **kwargs):
-        """Create a :class:`jstark.ApPhoto` object (e.g. for MIRI imaging time series).
+        """Create a :class:`jstark.extraction.ApPhoto` object (e.g. for MIRI imaging time series).
 
         The 3D :attr:`good_mask` is passed as the bad-pixel mask and the
         times are full BJD_TDB. Keyword arguments go to ``ApPhoto``.
         """
-        from ..jstark import ApPhoto
+        from ..extraction.photometry import ApPhoto
         t = self.bjd if self.times is not None else np.arange(self.shape[0], dtype=float)
         return ApPhoto(t, self.data, self.err, self.good_mask.astype(float), **kwargs)
 
@@ -1040,21 +1040,70 @@ class ExposureCleaner:
                   + (f' -> {os.path.basename(self.outputs[i])}' if save else ''))
         return out
 
-    def run(self, segments=None, **kwargs):
+    def run(self, segments=None, remove_inputs=False, **kwargs):
         """Run both passes on all (or the given) segments and save the products.
 
         Keyword arguments are passed to :meth:`clean_segment`.
+
+        Parameters
+        ----------
+        segments : list of int or None
+            Segments to clean (default: all).
+        remove_inputs : bool
+            Delete each input (``rateints``) file as soon as it is no longer
+            needed: after the next segment, which borrows integrations from it,
+            has been cleaned. Only allowed when all segments are cleaned. The
+            info file is rewritten after every segment, so the products on disk
+            stay consistent if the run is interrupted. Re-cleaning then
+            requires re-running Stage 1.
 
         Returns
         -------
         str
             The exposure-level info file (see :meth:`save_info`).
         """
+        if remove_inputs and segments is not None and sorted(segments) != list(range(len(self.files))):
+            raise ValueError('remove_inputs=True requires cleaning all segments.')
+        if remove_inputs and kwargs.get('save') is False:
+            raise ValueError('remove_inputs=True requires saving the cleaned segments.')
         if self.badpix is None:
             self.compute_global()
-        for i in (range(len(self.files)) if segments is None else segments):
+        segs = list(range(len(self.files)) if segments is None else segments)
+        if remove_inputs:
+            self._int_times_cache = self._read_int_times()
+        for i in segs:
             self.clean_segment(i, **kwargs)
+            if remove_inputs:
+                self.save_info()
+                if i > 0:
+                    self._remove_input(i - 1)
+        if remove_inputs and segs:
+            self.save_info()
+            self._remove_input(segs[-1])
         return self.save_info()
+
+    def _remove_input(self, i):
+        fn = self.files[i]
+        for f in (fn, os.path.join(os.path.dirname(fn), '._' + os.path.basename(fn))):
+            if os.path.isfile(f):
+                os.remove(f)
+        if self.verbose:
+            print(f'  removed input {os.path.basename(fn)}')
+
+    def _read_int_times(self):
+        """``INT_TIMES`` columns of all integrations, read from the input files."""
+        cols = {}
+        for i in range(len(self.files)):
+            with fits.open(self.files[i]) as h:
+                if 'INT_TIMES' not in h:
+                    continue
+                tab = h['INT_TIMES'].data
+                num = np.asarray(tab['integration_number'])
+                i0 = h[0].header.get('INTSTART', num[0])
+                sel = (num >= i0) & (num < i0 + self.seg_nint[i])
+                for n in tab.names:
+                    cols.setdefault(n, []).append(np.asarray(tab[n])[sel])
+        return cols
 
     # ------------------------------------------------------------------
     def save_info(self, fname=None, overwrite=True):
@@ -1077,18 +1126,8 @@ class ExposureCleaner:
                               ('WAVELENGTH', self.wavelength, np.float32)):
             if arr is not None:
                 hdus.append(fits.ImageHDU(np.asarray(arr, dtype=dt), name=name))
-        # all integration times (read from the headers of the input files)
-        cols = {}
-        for i in range(len(self.files)):
-            with fits.open(self.files[i]) as h:
-                if 'INT_TIMES' not in h:
-                    continue
-                tab = h['INT_TIMES'].data
-                num = np.asarray(tab['integration_number'])
-                i0 = h[0].header.get('INTSTART', num[0])
-                sel = (num >= i0) & (num < i0 + self.seg_nint[i])
-                for n in tab.names:
-                    cols.setdefault(n, []).append(np.asarray(tab[n])[sel])
+        # all integration times (read from the input files, or cached before they were removed)
+        cols = getattr(self, '_int_times_cache', None) or self._read_int_times()
         if cols:
             hdus.append(fits.BinTableHDU.from_columns(
                 [fits.Column(name=n, array=np.concatenate(v),

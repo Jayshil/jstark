@@ -239,7 +239,7 @@ class Stage1:
         return datamodels.RampModel(self.files[segment])
 
     def run(self, segments=None, start=None, stop=None, model=None, save_after=None,
-            overwrite=True):
+            overwrite=True, save_variances=True):
         """Run the recipe on one or more segments.
 
         Parameters
@@ -259,6 +259,10 @@ class Stage1:
             after ``ramp_fit`` / ``gain_scale``.
         overwrite : bool
             Overwrite existing products.
+        save_variances : bool
+            Keep the ``VAR_POISSON`` and ``VAR_RNOISE`` arrays in the
+            ``rateints`` files. jstark does not use them (``ERR`` is kept);
+            ``False`` makes the files 40% smaller.
 
         Returns
         -------
@@ -300,6 +304,10 @@ class Stage1:
                     m.save(fn, overwrite=overwrite)
             if ramp_done:
                 fn = output_filename(self.files[seg], self.outdir, 'rateints')
+                if not save_variances:
+                    for attr in ('var_poisson', 'var_rnoise', 'var_flat'):
+                        if m.hasattr(attr):
+                            delattr(m, attr)
                 m.save(fn, overwrite=overwrite)
                 outputs.append(fn)
                 self.outputs[seg] = fn

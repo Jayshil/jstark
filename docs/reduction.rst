@@ -120,6 +120,27 @@ trace and background masks) are stored in ``s1.diagnostics`` and in a
 ``*_stage1diag.npz`` file per segment. :mod:`jstark.reduction.diagnostics`
 provides plotting functions for all of them.
 
+Disk space
+----------
+
+Each stage reads the previous stage's files, so intermediate products are
+needed until the next stage has run. Three options keep the total small:
+
+* ``s1.run(save_variances=False)``: the ``rateints`` files are written without
+  ``VAR_POISSON`` and ``VAR_RNOISE`` (40 per cent smaller; jstark uses only
+  ``SCI``, ``ERR`` and ``DQ``).
+* ``ExposureCleaner(...).run(remove_inputs=True)``: each ``rateints`` file is
+  deleted as soon as it is no longer needed (after the next segment, which
+  borrows integrations from it, is cleaned). The info file is rewritten after
+  every segment, so the products on disk stay consistent if the run stops.
+  Re-cleaning then requires re-running Stage 1.
+* ``SpectralExtractor.run(keep_segments=False)`` /
+  ``Photometry.run(keep_segments=False)``: the per-segment spectra are deleted
+  after they are combined (the combined file holds the same data).
+
+The cleaned cubes (``*_cleaned.fits``) are the input of the extraction; keep
+them while extraction settings are explored.
+
 Times
 -----
 
