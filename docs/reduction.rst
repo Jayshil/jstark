@@ -32,13 +32,17 @@ Overview
      ``'rowcol'`` (row offset common to all amplifiers, then column offsets)
      algorithm. The direction and method are only defaults, e.g.
      ``s1.set('group_bkg', axis='column', method='poly')``.
-     With ``'diff'`` / ``'readout'``, ``wing_max`` also measures the offsets
-     on the faint wings of the trace (median signal below ``wing_max`` DN per
-     group; at least ``wing_min_pixels`` of them per amplifier-row). The
-     difference images remove the static stellar light, and in the faint
-     wings flux changes are far smaller than the 1/f offsets, so only the
-     bright core rows are left to the model. NIRCam default:
-     ``wing_max=200``, ``wing_min_pixels=100``.
+     With ``'diff'`` / ``'readout'``, ``wing_frac`` (or ``wing_max``) also
+     measures the offsets on the faint wings of the trace: pixels whose
+     median signal per group is below ``wing_frac`` times the peak signal
+     per group (or below ``wing_max`` DN), with at least ``wing_min_pixels``
+     of them per amplifier-row. The difference images remove the static
+     stellar light, and in the faint wings flux changes are far smaller than
+     the 1/f offsets, so only the bright core rows are left to the model.
+     The threshold is measured on the first segment and reused for all
+     (``Stage1.wing_threshold``). A relative threshold keeps the same rows
+     measured whatever the brightness of the star. NIRCam default:
+     ``wing_frac=0.04``, ``wing_min_pixels=100``.
    * ``temporal_jump`` -- jump detection in the time domain: each pixel's
      group differences are compared with a running median over
      integrations. Jumps are either repaired (default for short ramps) or

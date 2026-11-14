@@ -50,8 +50,9 @@ Three algorithms are provided, all working on a 4D cube
     (median over the background pixels of the whole row), then a column
     offset (median over the background pixels of each column).
 
-For ``'diff'`` and ``'readout'``, ``wing_max`` adds the faint trace pixels
-(median signal per group below ``wing_max``) to the pixels used to measure
+For ``'diff'`` and ``'readout'``, ``wing_max`` (DN per group) or ``wing_frac``
+(fraction of the peak signal per group) adds the faint trace pixels
+(median signal per group below the threshold) to the pixels used to measure
 the offsets. The difference images remove the static stellar light, and in
 the faint wings flux changes are far smaller than the 1/f offsets, so the
 offsets can be measured there directly; only the bright core is left to the
@@ -65,7 +66,7 @@ import bottleneck as bn
 from .robust import clipped_median, nanmedian, mad_sigma, MAD_TO_SIGMA
 from .masks import amplifier_bounds
 
-__all__ = ['group_background', 'stripe_median', 'stripe_rowcol', 'stripe_wmean', 'stripe_poly', 'readout_model',
+__all__ = ['group_background', 'stripe_median', 'stripe_rowcol', 'wing_peak', 'stripe_wmean', 'stripe_poly', 'readout_model',
            'diff_scale_factors']
 
 _BAD_GROUP = 1 | 2  # DO_NOT_USE | SATURATED
@@ -340,7 +341,7 @@ def group_background(data, bkg_mask, method='median', axis='column', groupdq=Non
                      nsigma=3., maxiters=3, poly_order=1, amp_bounds=None, min_pixels=4,
                      source_mask=None, chunk=50, return_model=False, inplace=True, exclude=None,
                      use_source_pixels=False, weight_ints=200, readout_order=3,
-                     readout_direct=True, wing_max=None, wing_min_pixels=100):
+                     readout_direct=True, wing_max=None, wing_frac=None, wing_min_pixels=100):
     """Subtract a column/row background (including 1/f noise) from every group.
 
     Parameters
@@ -395,7 +396,14 @@ def group_background(data, bkg_mask, method='median', axis='column', groupdq=Non
     wing_max : float or None
         ``method='diff'`` / ``'readout'``: also measure the offsets on source
         pixels whose median signal per group (DN, from the median frames) is
-        below this value. ``None`` uses only ``bkg_mask``.
+        below this value. ``None`` uses only ``bkg_mask`` (unless ``wing_frac``
+        is given).
+    wing_frac : float or None
+        Threshold relative to the brightness of the source: ``wing_max =
+        wing_frac * peak``, with ``peak`` from :func:`wing_peak`. A relative
+        threshold keeps the same rows measured whatever the brightness.
+        Ignored when ``wing_max`` is given. The threshold used is returned in
+        ``info['wing_threshold']``.
     wing_min_pixels : int
         With ``wing_max``: an amplifier-row (or column) without enough
         background pixels uses its wing pixels only if at least this many
@@ -443,12 +451,16 @@ def group_background(data, bkg_mask, method='median', axis='column', groupdq=Non
             info['weights'] = weights.astype(np.float32)
 
     fit_mask = bkg_mask
-    if wing_max is not None:
+    if wing_max is not None or wing_frac is not None:
         if method not in ('diff', 'readout'):
-            raise ValueError("wing_max requires method='diff' or 'readout'.")
+            raise ValueError("wing_max / wing_frac require method='diff' or 'readout'.")
         rate = (median_frames[-1] - median_frames[0]) / (ngroup - 1) if ngroup > 1 \
             else median_frames[0]
         src = source_mask if source_mask is not None else ~bkg_mask
+        if wing_max is None:
+            info['wing_peak'] = wing_peak(rate, src)
+            wing_max = wing_frac * info['wing_peak']
+        info['wing_threshold'] = float(wing_max)
         wing = src & np.isfinite(rate) & (rate < wing_max)
         wing = _drop_sparse_wings(wing, bkg_mask, axis, amp_bounds, min_pixels, wing_min_pixels)
         fit_mask = bkg_mask | wing
@@ -490,6 +502,27 @@ def group_background(data, bkg_mask, method='median', axis='column', groupdq=Non
     if return_model:
         info['model'] = np.concatenate(models, axis=0)
     return data, info
+
+
+def wing_peak(rate, source_mask, percentile=95.):
+    """Peak signal of the source: a high percentile of the per-column maxima.
+
+    Parameters
+    ----------
+    rate : ndarray
+        Signal per group ``(ny, nx)``.
+    source_mask : ndarray
+        Boolean ``(ny, nx)``, ``True`` on the source.
+    percentile : float
+        Percentile of the column maxima (robust against a few hot columns and
+        independent of the spectral shape's faint ends).
+    """
+    r = np.where(source_mask & np.isfinite(rate), rate, np.nan)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        colmax = np.nanmax(r, axis=0)
+    colmax = colmax[np.isfinite(colmax) & (colmax > 0)]
+    return float(np.percentile(colmax, percentile)) if colmax.size else np.nan
 
 
 def _drop_sparse_wings(wing, bkg_mask, axis, amp_bounds, min_pixels, wing_min_pixels):

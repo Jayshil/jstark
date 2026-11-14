@@ -1275,6 +1275,9 @@ class SpectralExtractor:
         if segments is not None:
             segs = list(segments)
             return [(k, slice(0, min(src.seg_nint[k], block_len))) for k in segs]
+        # short exposures: shrink the blocks so that they do not overlap (an overlapping
+        # integration would be counted twice)
+        block_len = max(1, min(block_len, src.nint // nblocks))
         out = []
         for i in range(nblocks):
             c = int((i + 0.5) / nblocks * src.nint)

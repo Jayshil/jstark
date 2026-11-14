@@ -114,6 +114,7 @@ class Stage1:
         self.log = StepLog(os.path.join(outdir, f'{self.exposure}_stage1_log.json'))
         self.trace_mask = None
         self.bkg_mask = None
+        self.wing_threshold = None    # group_bkg wing_frac threshold (DN/group), set once
         self.signal_image = None
         self.saturation_map = None
         self.auto_firstgroup = None
@@ -651,7 +652,7 @@ class Stage1:
     def _group_bkg(self, model, segment=None, method='median', axis=None, nsigma=3., maxiters=3,
                    poly_order=1, per_amplifier=None, min_pixels=None, chunk=50, keep_profile=True,
                    use_source_pixels=False, readout_order=3, readout_direct=True,
-                   wing_max=None, wing_min_pixels=100):
+                   wing_max=None, wing_frac=None, wing_min_pixels=100):
         """Group-level background / 1/f subtraction (see :mod:`jstark.reduction.onef`).
 
         Parameters
@@ -672,9 +673,15 @@ class Stage1:
         wing_max : float or None
             ``method='diff'`` / ``'readout'``: also measure the offsets on
             trace pixels fainter than this (DN per group).
+        wing_frac : float or None
+            As ``wing_max``, but relative: the threshold is ``wing_frac`` times
+            the peak signal per group of the source. It is measured on the
+            first segment processed and reused for all segments
+            (``self.wing_threshold``; set it to impose a value).
         wing_min_pixels : int
-            With ``wing_max``: minimum number of wing pixels for an
-            amplifier-row without background pixels to be measured directly.
+            With ``wing_max`` / ``wing_frac``: minimum number of wing pixels
+            for an amplifier-row without background pixels to be measured
+            directly.
         """
         axis = axis or self.config.onef_axis or 'column'
         self._ensure_masks(model)
@@ -683,13 +690,21 @@ class Stage1:
         if min_pixels is None:
             min_pixels = self.config.trace_mask.get('min_pixels', 4)
         groupdq = getattr(model, 'groupdq', None)
+        if wing_max is None and wing_frac is not None and self.wing_threshold is not None:
+            wing_max = self.wing_threshold            # same threshold for every segment
         _, info = group_background(model.data, self.bkg_mask, method=method, axis=axis,
                                    groupdq=groupdq, nsigma=nsigma, maxiters=maxiters,
                                    poly_order=poly_order, amp_bounds=amps, min_pixels=min_pixels,
                                    source_mask=self.trace_mask, chunk=chunk,
                                    use_source_pixels=use_source_pixels,
                                    readout_order=readout_order, readout_direct=readout_direct,
-                                   wing_max=wing_max, wing_min_pixels=wing_min_pixels)
+                                   wing_max=wing_max, wing_frac=wing_frac,
+                                   wing_min_pixels=wing_min_pixels)
+        if wing_frac is not None and self.wing_threshold is None:
+            self.wing_threshold = info['wing_threshold']
+            if self.verbose:
+                print(f'  group_bkg: wing threshold {self.wing_threshold:.0f} DN/group '
+                      f'({wing_frac:g} x peak {info["wing_peak"]:.0f} DN/group)')
         d = self._diag(segment, 'group_bkg')
         d.update({k: v for k, v in info.items() if k not in ('median_frames', 'weights')})
         if not keep_profile:
