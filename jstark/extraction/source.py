@@ -43,6 +43,10 @@ class ExposureSource:
     badpix, median, std, cr_sigma, wavelength : ndarray
         Exposure-level maps in canonical orientation (``wavelength`` may be
         ``(norder, nspat, nspec)`` for SOSS).
+    satmap : ndarray or None
+        First consistently saturated group of every pixel (Stage 1
+        saturation map, canonical orientation; ``sat_ngroups`` = never
+        saturated), or None if Stage 1 did not save one.
     times : ndarray
         Mid-integration times (BJD_TDB - 2400000.5) of all integrations.
     """
@@ -72,6 +76,9 @@ class ExposureSource:
         self.trace_mask = c(ec.trace_mask)
         self.bkg_mask = c(ec.bkg_mask)
         self.wavelength = c(ec.wavelength)
+        # first saturated group per pixel (Stage 1), None if not available
+        self.satmap = c(getattr(ec, 'satmap', None))
+        self.sat_ngroups = getattr(ec, 'sat_ngroups', None)
         self.int_times = dict(getattr(ec, 'int_times', {}) or {})
         if 'int_mid_BJD_TDB' in self.int_times and len(self.int_times['int_mid_BJD_TDB']) == self.nint:
             self.times = np.asarray(self.int_times['int_mid_BJD_TDB'], float)

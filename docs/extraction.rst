@@ -83,8 +83,18 @@ Overview
    * Columns of an integration with more than ``max_maskfrac`` (default
      0.98) of the profile on masked pixels are set to NaN: too little light
      is left to measure (e.g. under a masked zeroth order covering the whole
-     trace). Saturated cores of bright NIRSpec traces reach ~0.95 and are
-     still measured well from the wings.
+     trace).
+   * Columns in which any aperture pixel keeps fewer than ``min_groups``
+     (default 2) usable groups before saturation are set to NaN in every
+     integration. This uses the Stage 1 saturation map (copied into the
+     ``cleaninfo`` file as ``SATMAP``, or read from
+     ``<exposure>_saturation_map.fits`` next to it). With the default,
+     columns whose core keeps only group 0 are dropped: their flux would
+     come from the wings alone, and on WASP-39 b (PRISM) their transit
+     depths were biased deep by ~7000 ppm. Partially saturated columns
+     with 2–4 usable groups are kept, but their depths are also biased
+     (by up to ~1500 ppm with optimal weights on WASP-39 b). Check
+     ``SATGRP_On`` before using them (``docs/extraction_notes.md`` §5.14).
    * ``method='box'``: aperture sum, masked pixels filled with the model.
      The box spectra are always saved as well.
    * ``method='covariance'`` (NIRCam default): generalised least squares per
@@ -130,7 +140,10 @@ Quick start
 ``<exposure>_spectra.fits`` with, per order ``n``: ``WAVE_On`` (wavelength of
 each column, micron), ``FLUX_On``, ``VAR_On`` (a variance),
 ``BOX_On``, ``BOXVAR_On``, ``MASKFRAC_On`` (fraction of the profile in the
-aperture on masked pixels, e.g. saturated cores), ``BKG_On``, ``TRACE_On``
+aperture on masked pixels, e.g. saturated cores), ``SATGRP_On`` (fewest
+usable groups before saturation of any aperture pixel, per column; equal to
+the number of groups where nothing saturates; only when a Stage 1 saturation
+map exists), ``BKG_On``, ``TRACE_On``
 (columns, trace, wavelength), the PSF model, and ``REG_On``: per-integration
 regressors ``dy`` (trace offset), ``ds`` (relative PSF width change),
 ``dx`` (shift along the dispersion), ``bkg``, ``maskfrac``, ``white``.

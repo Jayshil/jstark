@@ -531,6 +531,7 @@ class Stage1:
             hdr = fits.Header()
             hdr['MINFRAC'] = (min_frac, 'min fraction of integrations saturated')
             hdr['NINT'] = nint
+            hdr['NGROUPS'] = (ngroup, 'groups per integration (map value = never saturated)')
             fits.HDUList([fits.PrimaryHDU(self.saturation_map, header=hdr),
                           fits.ImageHDU(counts, name='SATCOUNT')]).writeto(fn, overwrite=True)
         self.log.add('compute_saturation_map', segment=None, min_frac=min_frac, n_pixels=n)

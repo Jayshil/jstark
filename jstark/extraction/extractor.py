@@ -1084,6 +1084,31 @@ class SpectralExtractor:
             W['dP'] = psf(u, col, deriv=1) * Qg
         return W
 
+    def column_saturation(self, o, aperture=None):
+        """Fewest usable groups (before saturation) of any aperture pixel, per column.
+
+        From the Stage 1 saturation map (first consistently saturated group
+        per pixel): a pixel saturating at group ``g`` keeps groups
+        ``0 .. g-1``, i.e. ``g`` usable groups; ``ngroups`` means it never
+        saturates. The aperture is the static trace ``y0 ± aperture``.
+
+        Returns
+        -------
+        ndarray of int or None
+            One value per extracted column of order ``o``; None without a
+            saturation map.
+        """
+        sm = self.src.satmap
+        if sm is None or o not in self.traces:
+            return None
+        a = self.p('extract', o)['aperture'] if aperture is None else aperture
+        tr = self.traces[o]
+        rows = np.arange(sm.shape[0])[:, None]
+        inside = np.abs(rows - tr.y0[None, :]) <= a + 0.5
+        sub = sm[:, tr.cols].astype(int)
+        ng = self.src.sat_ngroups or int(sm.max())
+        return np.where(inside, sub, ng).min(axis=0)
+
     def _extract_order(self, o, data, err, good, dy, var_bkg, aperture=None, method=None,
                        refine=None):
         """Extract order ``o`` from a background-subtracted chunk."""
@@ -1131,6 +1156,10 @@ class SpectralExtractor:
             raise ValueError(f'Unknown extraction method {method!r}')
         # (almost) all of the profile on masked pixels: nothing left to measure
         lost = res['maskfrac'] > pe.get('max_maskfrac', 1.)
+        # columns whose aperture holds pixels with too few groups before saturation
+        nsat = self.column_saturation(o, aperture)
+        if nsat is not None and pe.get('min_groups'):
+            lost = lost | (nsat < pe['min_groups'])[None, :]
         if lost.any():
             for k in ('flux', 'var', 'box', 'box_var', 'opt', 'opt_var'):
                 if k in out:
@@ -1251,6 +1280,16 @@ class SpectralExtractor:
         t0 = time.time()
         self._ready()
         self.save_model()
+        for o in self.orders:
+            nsat = self.column_saturation(o)
+            mg = self.p('extract', o).get('min_groups')
+            if nsat is not None and mg and self.verbose and (nsat < mg).any():
+                wl = self.traces[o].info.get('wavelength')
+                bad = np.flatnonzero(nsat < mg)
+                txt = (f' ({np.nanmin(wl[bad]):.3f}-{np.nanmax(wl[bad]):.3f} um)'
+                       if wl is not None else '')
+                print(f'  order {o}: {bad.size} column(s) with < {mg} usable groups in the '
+                      f'aperture set to NaN: columns {self.traces[o].cols[bad].tolist()}{txt}')
         segs = range(self.src.nseg) if segments is None else segments
         for k in segs:
             self.extract_segment(k)
@@ -1431,6 +1470,16 @@ class SpectralExtractor:
             hw.header['BUNIT'] = 'micron'
             hw.header['COMMENT'] = 'wavelength of each extracted column (at the trace)'
             hdus.append(hw)
+            nsat = self.column_saturation(o)
+            if nsat is not None:
+                hs = fits.ImageHDU(nsat.astype(np.int16), name='SATGRP' + s)
+                hs.header['NGROUPS'] = (int(self.src.sat_ngroups or nsat.max()),
+                                        'groups per integration')
+                hs.header['MINGRP'] = (int(self.p('extract', o).get('min_groups') or 0),
+                                       'columns below this are NaN')
+                hs.header['COMMENT'] = ('fewest usable groups before saturation of any '
+                                        'aperture pixel, per column')
+                hdus.append(hs)
             cols = [fits.Column(name=n, format='D', array=np.asarray(r[key], float))
                     for n, key in (('dy', 'dy'), ('ds', 'ds'), ('dy_cof', 'dy_cof'), ('chi2', 'chi2'))]
             cols.append(fits.Column(name='nrej', format='K', array=np.asarray(r['nrej'])))
@@ -1551,6 +1600,9 @@ class SpectralExtractor:
                 hw = fits.ImageHDU(parts[0], name=name)     # the same for every segment
                 hw.header['BUNIT'] = 'micron'
                 hdus.append(hw)
+            elif name.startswith('SATGRP_O'):
+                with fits.open(self.outputs[segs[0]]) as h:     # the same for every segment
+                    hdus.append(fits.ImageHDU(parts[0], header=h[name].header, name=name))
             else:
                 hdus.append(fits.ImageHDU(np.concatenate(parts), name=name))
         for o in self.orders:
@@ -1640,6 +1692,12 @@ class Spectra:
         (:meth:`SpectralExtractor.add_field_trace`): their static flux in the
         aperture of each column (already subtracted). Divide by the median
         spectrum for the dilution of each column.
+    satgrp : dict
+        Per order, if a Stage 1 saturation map was available: the fewest
+        usable groups before saturation of any aperture pixel, per column
+        (``ngroups`` = unsaturated). Columns below ``min_groups`` are NaN.
+    ngroups : int or None
+        Groups per integration.
     """
 
     def __init__(self, fname):
@@ -1654,6 +1712,7 @@ class Spectra:
             self.flux, self.err, self.box, self.box_err = {}, {}, {}, {}
             self.maskfrac, self.wavelength, self.cols, self.regressors = {}, {}, {}, {}
             self.contam, self.extra, self.field = {}, {}, {}
+            self.satgrp, self.ngroups = {}, None
             for o in self.orders:
                 s = f'_O{o}'
                 self.flux[o] = np.asarray(h['FLUX' + s].data, float)
@@ -1669,6 +1728,9 @@ class Spectra:
                     self.contam[o] = np.asarray(h['CONTAM' + s].data, float)
                 if 'FIELD' + s in h:
                     self.field[o] = np.asarray(h['FIELD' + s].data, float)
+                if 'SATGRP' + s in h:
+                    self.satgrp[o] = np.asarray(h['SATGRP' + s].data, int)
+                    self.ngroups = h['SATGRP' + s].header.get('NGROUPS')
                 tr = h['TRACE' + s].data
                 self.cols[o] = np.asarray(tr['col'])
                 self.wavelength[o] = (np.asarray(h['WAVE' + s].data, float) if 'WAVE' + s in h

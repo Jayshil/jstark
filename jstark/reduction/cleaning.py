@@ -1126,6 +1126,15 @@ class ExposureCleaner:
                               ('WAVELENGTH', self.wavelength, np.float32)):
             if arr is not None:
                 hdus.append(fits.ImageHDU(np.asarray(arr, dtype=dt), name=name))
+        # Stage 1 saturation map (first saturated group per pixel), for extraction
+        if getattr(self, 'satmap', None) is None:
+            self.satmap, self.sat_ngroups = find_saturation_map(
+                self.exposure, [os.path.dirname(os.path.abspath(self.files[0])), self.outdir])
+        if self.satmap is not None:
+            hs = fits.ImageHDU(np.asarray(self.satmap, np.int16), name='SATMAP')
+            hs.header['NGROUPS'] = (self.sat_ngroups, 'groups per integration (= never saturated)')
+            hs.header['COMMENT'] = 'first saturated group per pixel (Stage 1 saturation map)'
+            hdus.append(hs)
         # all integration times (read from the input files, or cached before they were removed)
         cols = getattr(self, '_int_times_cache', None) or self._read_int_times()
         if cols:
@@ -1181,6 +1190,10 @@ class ExposureCleaner:
             obj.trace_mask = None if 'TRACEMASK' not in h else get('TRACEMASK', bool)
             obj.bkg_mask = None if 'BKGMASK' not in h else get('BKGMASK', bool)
             obj.wavelength = get('WAVELENGTH', np.float32)
+            obj.satmap = get('SATMAP', np.int16)
+            obj.sat_ngroups = h['SATMAP'].header.get('NGROUPS') if 'SATMAP' in h else None
+            if obj.satmap is None:      # info files written before SATMAP existed
+                obj.satmap, obj.sat_ngroups = find_saturation_map(obj.exposure, [d])
             obj.int_times = {n: np.array(h['INT_TIMES'].data[n]) for n in h['INT_TIMES'].data.names} \
                 if 'INT_TIMES' in h else {}
             obj.outputs = {i: os.path.join(d, c) for i, c in enumerate(cleaned) if c}
@@ -1215,6 +1228,29 @@ class ExposureCleaner:
         mask = self.trace_mask if mask is None else mask
         f = np.concatenate([bn.nansum(cc.data[:, mask], axis=1) for _, cc in self.iter_segments()])
         return f / np.nanmedian(f)
+
+
+def find_saturation_map(exposure, dirs):
+    """Read ``<exposure>_saturation_map.fits`` (Stage 1) from the first of ``dirs`` that has it.
+
+    Returns
+    -------
+    satmap : ndarray or None
+        First consistently saturated group per pixel (detector orientation).
+    ngroups : int or None
+        Groups per integration (the map value of pixels that never saturate).
+    """
+    for d in dirs:
+        fn = os.path.join(d, f'{exposure}_saturation_map.fits')
+        if not os.path.isfile(fn):
+            continue
+        with fits.open(fn) as h:
+            smap = np.asarray(h[0].data, np.int16)
+            ng = h[0].header.get('NGROUPS')
+            if ng is None and 'SATCOUNT' in h:
+                ng = h['SATCOUNT'].shape[0]
+        return smap, (int(ng) if ng is not None else int(smap.max()))
+    return None, None
 
 
 def _plain(v):

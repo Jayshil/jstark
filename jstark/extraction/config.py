@@ -41,8 +41,12 @@ Parameters are grouped by step:
     extraction, ``method='joint'``), ``max_maskfrac`` (columns of an
     integration with a larger fraction of the profile on masked pixels get
     NaN: the remaining pixels hold too little of the light, e.g. under a
-    masked field-star contaminant; saturated cores of bright NIRSpec traces
-    reach ~0.95 and are still measured well from the wings).
+    masked field-star contaminant), ``min_groups`` (columns in which any
+    pixel of the aperture keeps fewer usable groups before saturation are
+    set to NaN in all integrations; needs the Stage 1 saturation map. The
+    default 2 removes columns whose core keeps only group 0: on WASP-39 b
+    PRISM their flux came from the wings and their transit depth was
+    biased deep by ~7000 ppm, see ``docs/extraction_notes.md`` §5.14).
 
 The values below were chosen from one-segment tests (see
 ``docs/extraction_notes.md``).
@@ -60,7 +64,7 @@ DEFAULTS = {
                 init_ints=200, ints='all', second_pass=False, pixel_correction=True, cv='phase'),
     'extract': dict(method='optimal', aperture=5., variance='mean', reject=6., reject_iters=3,
                     reject_mode='temporal', fit_background=False, refine_shift=2, joint_iters=3,
-                    max_maskfrac=0.98, cov_scale=1.),
+                    max_maskfrac=0.98, min_groups=2, cov_scale=1.),
 }
 
 MODE_DEFAULTS = {
