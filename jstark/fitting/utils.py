@@ -1,9 +1,17 @@
+"""Helpers for light-curve fitting and plotting.
+
+Orbital geometry (``t14``, ``b_to_inc``, ``inc_to_b``, ``rho_to_ar``), time
+binning (``lcbin``, from pycheops), noise versus bin size
+(``fake_allan_deviation``), corner plots, power spectra and PSD fitting of
+GP kernels (``make_psd``, ``psd_fitting_kernel``), and brightness
+temperatures from eclipse depths (``BrightnessTemperatureCalculator``).
+Moved here from ``jstark/utils.py``.
+"""
 import numpy as np
 import matplotlib.pyplot as plt
 from astropy.stats import mad_std
 from scipy.optimize import minimize
 from scipy.integrate import simpson
-from scipy.signal import medfilt
 from scipy.interpolate import interp1d
 from astropy.timeseries import LombScargle
 import astropy.constants as con
@@ -11,7 +19,6 @@ from tqdm import tqdm
 import astropy.units as u
 from pathlib import Path
 import multiprocessing
-import corner
 import os
 
 def t14(per, ar, rprs, b, ecc=0, omega=90, transit=True):
@@ -151,33 +158,6 @@ def lcbin(time, flux, binwidth=0.06859, nmin=4, time0=None,
 
     j = (n_bin >= nmin)
     return t_bin[j], f_bin[j], e_bin[j], n_bin[j]
-
-def clip_outliers(flux, clip=5, width=11, verbose=True):
-    """
-    Another function from pycheops. Courtesy of P. Maxted.
-    Remove outliers from the light curve.
-
-    Data more than clip*mad from a smoothed version of the light curve are
-    removed where mad is the mean absolute deviation from the
-    median-smoothed light curve.
-
-    :param clip: tolerance on clipping
-    :param width: width of window for median-smoothing filter
-
-    :returns: time, flux, flux_err
-
-    """
-    # medfilt pads the array to be filtered with zeros, so edge behaviour
-    # is better if we filter flux-1 rather than flux.
-    d = abs(medfilt(flux-1, width)+1-flux)
-    mad = d.mean()
-    ok = d < clip*mad
-
-    if verbose:
-        print('\nRejected {} points more than {:0.1f} x MAD = {:0.0f} '
-                'ppm from the median'.format(sum(~ok),clip,1e6*mad*clip))
-
-    return ok
 
 def rms(x):
     return np.sqrt( np.nanmean( (x - np.nanmean(x))**2 ) )
@@ -349,6 +329,7 @@ def corner_plot(samples, labels, **kwargs):
         The generated corner plot figure.
     """
 
+    import corner
     samples = np.transpose( np.vstack( samples ) )
 
     fig = corner.corner(samples, labels=labels,
@@ -572,96 +553,6 @@ def psd_fitting_kernel(times, flux, kernel, init_values, bounds=None, nos_freq_p
     return best_fit_params, kernel_psd_fit, freq_grid, psd_ls, fig, axs
 
 
-def standarize_data(input_data):
-    """
-    Standarize the dataset.
-    The function originally written by N. Espinoza
-    for TESS data analysis.
-    """
-    output_data = np.copy(input_data)
-    averages = np.nanmedian(input_data,axis=1)
-    for i in range(len(averages)):
-        sigma = mad_std(output_data[i,:])
-        output_data[i,:] = output_data[i,:] - averages[i]
-        output_data[i,:] = output_data[i,:]/sigma
-    return output_data
-
-def classic_PCA(Input_Data, standarize = True):
-    """  
-    classic_PCA function
-    Description
-    This function performs the classic Principal Component Analysis on a given dataset.
-    The function originally written by N. Espinoza
-    for TESS data analysis.
-    """
-    if standarize:
-        Data = standarize_data(Input_Data)
-    else:
-        Data = np.copy(Input_Data)
-    eigenvectors_cols,eigenvalues,eigenvectors_rows = np.linalg.svd(np.cov(Data))
-    idx = eigenvalues.argsort()
-    eigenvalues = eigenvalues[idx[::-1]]
-    eigenvectors_cols = eigenvectors_cols[:,idx[::-1]]
-    eigenvectors_rows = eigenvectors_rows[idx[::-1],:]
-    # Return: V matrix, eigenvalues and the principal components.
-    return eigenvectors_rows,eigenvalues,np.dot(eigenvectors_rows,Data)
-
-def generate_times_with_gaps(times, efficiency):
-    """This function takes the times array with a regular cadence and generate
-    another times array with data gaps in it with a given efficiency to mimick
-    CHEOPS observations. Efficiency here is the fraction of the actual time spent 
-    on the star.
-    
-    Parameters
-    ----------
-    times : numpy.ndarray
-        Regularly spaced time array
-    efficiency : float
-        Efficiency of the observations in per cent.
-        
-    Returns
-    -------
-    tim : numpy.ndarray
-        Time array with gaps in it.
-    roll : numpy.ndarray
-        The corresponding roll angle array.
-    """
-    # Generating gappy times
-    ## Computing total number of orbits in the data
-    cheops_orbit_time_day = 98.77 / (60 * 24)
-    orbit_nos = np.ptp(times) / cheops_orbit_time_day
-
-    ## Generating roll numbers
-    roll = np.linspace(0, orbit_nos*360, len(times)) + np.random.randint(0,360)
-    roll = roll % 360
-    idx_rollsort = np.argsort(roll)
-    roll_rollsort = roll[idx_rollsort]
-    tim_rollsort = times[idx_rollsort]
-
-    ## Selecting the range of roll-angles to discard
-    st_roll = np.random.choice(roll_rollsort)    # Starting roll number of discarded roll angles
-    loc_st_roll = np.where(roll_rollsort == st_roll)[0][0]
-    nos_discarded_pts = int((1 - (0.01 * efficiency)) * len(times)) # Total number of discarded points
-    idx_discarded = np.ones(len(times), dtype=bool)
-
-    if int(loc_st_roll+nos_discarded_pts) > len(times):
-        # Roll over the starting roll numbers
-        idx_discarded[loc_st_roll:] = False
-        dis_pt = len(times) - loc_st_roll
-        idx_discarded[0:nos_discarded_pts-dis_pt] = False
-    else:
-        idx_discarded[loc_st_roll:loc_st_roll + nos_discarded_pts] = False
-
-    # Let's actually discard the points now
-    tim = tim_rollsort[idx_discarded]
-    roll = roll_rollsort[idx_discarded]
-
-    # And sort them
-    idx_timsort = np.argsort(tim)
-    tim, roll = tim[idx_timsort], roll[idx_timsort]
-
-    return tim, roll
-
 def planck_func(lam, temp):
     """
     Given the wavelength and temperature
@@ -826,59 +717,3 @@ class BrightnessTemperatureCalculator:
         np.save(str(cache_path), temp_pl)
         return temp_pl
     
-def trapz2d(z, x, y):
-    """
-    Helper function to perform 2D trapezoidal integration.
-    Integrates a regularly spaced 2D grid using the composite trapezium rule.
-
-    Source: https://github.com/tiagopereira/python_tips/blob/master/code/trapz2d.py
-    My sourse: I have copied from `kelp`: https://github.com/bmorris3/kelp/blob/219a922849634d9e982cd7bd05910596dea2ef6e/kelp/core.py#L15C1-L44C48
-
-    Parameters
-    ----------
-    z : `~numpy.ndarray`
-        2D array
-    x : `~numpy.ndarray`
-        grid values for x (1D array)
-    y : `~numpy.ndarray`
-        grid values for y (1D array)
-
-    Returns
-    -------
-    t : `~numpy.ndarray`
-        Trapezoidal approximation to the integral under z
-    """
-    m = z.shape[0] - 1
-    n = z.shape[1] - 1
-    dx = x[1] - x[0]
-    dy = y[1] - y[0]
-
-    s1 = z[0, 0, :] + z[m, 0, :] + z[0, n, :] + z[m, n, :]
-    s2 = (np.sum(z[1:m, 0, :], axis=0) + np.sum(z[1:m, n, :], axis=0) +
-        np.sum(z[0, 1:n, :], axis=0) + np.sum(z[m, 1:n, :], axis=0))
-    s3 = np.sum(np.sum(z[1:m, 1:n, :], axis=0), axis=0)
-    return dx * dy * (s1 + 2 * s2 + 4 * s3) / 4
-
-def autocorrelation_function(chain):
-    """Compute the autocorrelation function for a given chain and lags.
-
-    Parameters
-    ----------
-    chain : ndarray
-        Array containing the chain values.
-
-    Returns
-    -------
-    rhos : ndarray
-        Autocorrelation values for each lag.
-    """
-    mu, variance = np.mean(chain), np.var(chain)
-    N = len(chain)
-    
-    rhos = np.zeros( len(chain) )
-    for i in range(N):
-        X0 = chain[:N-i] - mu
-        Xk = chain[i:] - mu
-        rhoi = np.sum(X0*Xk)/variance
-        rhos[i] = rhoi/(N-i)
-    return rhos

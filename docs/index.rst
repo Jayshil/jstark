@@ -9,6 +9,7 @@ This is the documentation for jstark.
 
    reduction
    extraction
+   fitting
 
 Indices and tables
 ==================

@@ -1158,6 +1158,13 @@ class SpectralExtractor:
         lost = res['maskfrac'] > pe.get('max_maskfrac', 1.)
         # columns whose aperture holds pixels with too few groups before saturation
         nsat = self.column_saturation(o, aperture)
+        if nsat is not None and pe.get('saturated_box') and method != 'box':
+            # uniform weights where the aperture saturates: optimal weights follow the
+            # number of groups per pixel and pick up the in-transit change of the PSF
+            # shape (brighter-fatter), which biases the depth (extraction_notes §5.14)
+            sat = (nsat < (self.src.sat_ngroups or nsat.max()))[None, :]
+            out['flux'] = np.where(sat, out['box'], out['flux'])
+            out['var'] = np.where(sat, out['box_var'], out['var'])
         if nsat is not None and pe.get('min_groups'):
             lost = lost | (nsat < pe['min_groups'])[None, :]
         if lost.any():
@@ -1290,6 +1297,9 @@ class SpectralExtractor:
                        if wl is not None else '')
                 print(f'  order {o}: {bad.size} column(s) with < {mg} usable groups in the '
                       f'aperture set to NaN: columns {self.traces[o].cols[bad].tolist()}{txt}')
+            if nsat is not None and self.verbose and self.p('extract', o).get('saturated_box'):
+                nb = int(((nsat < (self.src.sat_ngroups or nsat.max())) & (nsat >= (mg or 0))).sum())
+                print(f'  order {o}: {nb} saturated column(s) extracted with the box sum')
         segs = range(self.src.nseg) if segments is None else segments
         for k in segs:
             self.extract_segment(k)
@@ -1477,6 +1487,8 @@ class SpectralExtractor:
                                         'groups per integration')
                 hs.header['MINGRP'] = (int(self.p('extract', o).get('min_groups') or 0),
                                        'columns below this are NaN')
+                hs.header['SATBOX'] = (bool(self.p('extract', o).get('saturated_box')),
+                                       'saturated columns use the box sum')
                 hs.header['COMMENT'] = ('fewest usable groups before saturation of any '
                                         'aperture pixel, per column')
                 hdus.append(hs)

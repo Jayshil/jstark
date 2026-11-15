@@ -29,12 +29,24 @@ NIRCam F444W / F322W2 grism, MIRI LRS and MIRI F1500W imaging. See
     ec = ExposureCleaner('/data/NRS1/reduction', wavelength=wfile)
     info = ec.run()          # cleaned segment files + <exposure>_cleaninfo.fits
 
-Light-curve analysis
-====================
+Extraction (``jstark.extraction``)
+==================================
 
-``ApPhoto`` (aperture photometry and PLD), ``SpectroscopicLC`` (fitting of
-spectroscopic light curves with juliet) and ``julietPlots`` live in
-``jstark.jstark``.
+``SpectralExtractor`` (spline-PSF optimal extraction, segment by segment),
+``Photometry`` (aperture and PSF-weighted photometry of imaging data) and
+``ApPhoto`` (in-memory aperture photometry and PLD). See
+``docs/extraction.rst``.
+
+Light-curve fitting (``jstark.fitting``)
+========================================
+
+``LightCurves`` (one dataset: times, fluxes per channel and named
+regressors, read from jstark spectra or photometry), ``BroadbandFit``
+(joint juliet fit of the white-light or photometric light curves of several
+visits or instruments, with linear, GP and ramp systematics),
+``SpectroscopicFit`` (one joint fit per wavelength bin over all datasets
+covering it, in parallel and resumable; results as a ``Spectrum`` table)
+and ``julietPlots``. See ``docs/fitting.rst``.
 
 License
 -------

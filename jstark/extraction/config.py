@@ -46,7 +46,11 @@ Parameters are grouped by step:
     set to NaN in all integrations; needs the Stage 1 saturation map. The
     default 2 removes columns whose core keeps only group 0: on WASP-39 b
     PRISM their flux came from the wings and their transit depth was
-    biased deep by ~7000 ppm, see ``docs/extraction_notes.md`` §5.14).
+    biased deep by ~7000 ppm, see ``docs/extraction_notes.md`` §5.14),
+    ``saturated_box`` (columns in which any aperture pixel saturates use the
+    box sum instead of the optimal estimate: optimal weights follow the
+    number of groups and pick up the in-transit PSF-shape change; needs the
+    Stage 1 saturation map).
 
 The values below were chosen from one-segment tests (see
 ``docs/extraction_notes.md``).
@@ -64,7 +68,7 @@ DEFAULTS = {
                 init_ints=200, ints='all', second_pass=False, pixel_correction=True, cv='phase'),
     'extract': dict(method='optimal', aperture=5., variance='mean', reject=6., reject_iters=3,
                     reject_mode='temporal', fit_background=False, refine_shift=2, joint_iters=3,
-                    max_maskfrac=0.98, min_groups=2, cov_scale=1.),
+                    max_maskfrac=0.98, min_groups=2, cov_scale=1., saturated_box=False),
 }
 
 MODE_DEFAULTS = {

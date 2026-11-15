@@ -95,6 +95,15 @@ Overview
      with 2–4 usable groups are kept, but their depths are also biased
      (by up to ~1500 ppm with optimal weights on WASP-39 b). Check
      ``SATGRP_On`` before using them (``docs/extraction_notes.md`` §5.14).
+   * ``ex.set('extract', saturated_box=True)`` extracts every column whose
+     aperture holds a saturating pixel with the box sum, and keeps the
+     optimal estimate elsewhere. Optimal weights follow the number of
+     groups per pixel, so they pick up the in-transit change of the PSF
+     shape (brighter-fatter). On WASP-39 b (PRISM), checked against the
+     NIRISS SOSS spectrum, this removes the bias of the saturated bins
+     (+391 → −48 ppm on average) without larger errors
+     (``docs/extraction_notes.md`` §5.15). The header key ``SATBOX`` of
+     ``SATGRP_On`` records the setting.
    * ``method='box'``: aperture sum, masked pixels filled with the model.
      The box spectra are always saved as well.
    * ``method='covariance'`` (NIRCam default): generalised least squares per

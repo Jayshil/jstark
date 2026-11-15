@@ -1,32 +1,19 @@
-import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-import matplotlib.gridspec as gd
-from mpl_toolkits.axes_grid1 import make_axes_locatable
-from astropy.stats import mad_std
-from scipy.interpolate import interp1d
-import matplotlib
-import multiprocessing
-from pathlib import Path
-from glob import glob
-from tqdm import tqdm
-#from .plotstyles import *
-import pickle
-import juliet
-from .utils import *
-import warnings
+"""Plots of juliet fits: full models, phase-folded light curves, GP components,
+noise versus bin size and corner plots.
+
+``julietPlots`` was moved here from ``jstark/jstark.py``.
+"""
 import os
 
-try:
-    from photutils.aperture import CircularAnnulus, CircularAperture, ApertureStats
-    from photutils.aperture import aperture_photometry as aphot
-except:
-    print('Warning: photutils is not installed! Will not be able to use photutils based photometry.')
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gd
+from scipy.interpolate import interp1d
+import juliet
 
-try:
-    from dace_query.cheops import Cheops
-except:
-    print('It looks like DACE API is not installed! Will not be able to download CHEOPS data products.')
+from .utils import t14, inc_to_b, rho_to_ar, pipe_mad, lcbin, fake_allan_deviation, corner_plot
+
+__all__ = ['julietPlots']
 
 
 class julietPlots(object):
@@ -85,8 +72,12 @@ class julietPlots(object):
         # Saving those kwargs
         self.fit_kwargs = kwargs
 
-        # Location of the input folder
-        self.input_folder = input_folder
+        # Location of the input folder (falls back to juliet's output folder)
+        self.input_folder = input_folder if input_folder is not None else getattr(self.dataset, 'out_folder', None)
+
+        # juliet keeps these as None when no regressors were given
+        self._lm = self.dataset.lm_lc_arguments or {}
+        self._gp = self.dataset.GP_lc_arguments or {}
 
         # Number of samples
         self.nsamps = N
@@ -109,6 +100,79 @@ class julietPlots(object):
 
             # Sorting array
             self.idx_time_sort[self.dataset.inames_lc[i]] = np.argsort( self.dataset.times_lc[self.dataset.inames_lc[i]] )
+
+    def _gpx(self, instrument):
+        """First (or only) column of the GP regressor of an instrument."""
+        x = np.asarray(self._gp[instrument])
+        return x if x.ndim == 1 else x[:, 0]
+
+    def _instruments(self, instruments):
+        """List of instrument names (None: all; a single name is accepted)."""
+        if instruments is None:
+            return list(self.dataset.inames_lc)
+        if isinstance(instruments, str):
+            return [instruments]
+        return list(instruments)
+
+    def _samples(self, prefix, instrument, default):
+        """Posterior samples of an instrument parameter (``prefix_..._instrument``), its fixed
+        value, or ``default``."""
+        post = self.res.posteriors['posterior_samples']
+        n = len(prefix.split('_'))
+        for k in post:
+            parts = k.split('_')
+            if '_'.join(parts[:n]) == prefix and instrument in parts[n:]:
+                return np.asarray(post[k])
+        for k, v in self.dataset.priors.items():
+            parts = k.split('_')
+            if '_'.join(parts[:n]) == prefix and instrument in parts[n:] and v['distribution'] == 'fixed':
+                return np.atleast_1d(float(np.atleast_1d(v['hyperparameters'])[0]))
+        return np.atleast_1d(float(default))
+
+    def _nlm(self, instrument):
+        """juliet non-linear model of an instrument at the posterior medians:
+        ``(values, multiplicative)``, or ``(None, False)`` if there is none."""
+        nlf = getattr(self.dataset, 'non_linear_functions', None) or {}
+        if instrument not in nlf:
+            return None, False
+        post = self.res.posteriors['posterior_samples']
+        pv = {k: np.nanmedian(v) for k, v in post.items() if np.ndim(v) == 1}
+        for k, v in self.dataset.priors.items():
+            if v['distribution'] == 'fixed' and k not in pv:
+                pv[k] = float(np.atleast_1d(v['hyperparameters'])[0])
+        f = nlf[instrument]
+        return np.asarray(f['function'](f['regressor'], pv)), bool(f.get('multiplicative', False))
+
+    def _pmed(self, name):
+        """Posterior median of a parameter, else its fixed prior value (KeyError if neither).
+
+        Fixed priors are preferred over batman's parameter objects: with a
+        ``t_secondary`` prior, batman shifts ``params.t0`` to the conjunction
+        implied by the eclipse time, which would hide an offset eclipse."""
+        post = self.res.posteriors['posterior_samples']
+        if name in post:
+            return np.nanmedian(post[name])
+        p = self.dataset.priors[name]
+        if p['distribution'] == 'fixed':
+            return float(np.atleast_1d(p['hyperparameters'])[0])
+        raise KeyError(name)
+
+    def _planet_only_samples(self):
+        """Posterior samples with the flux offsets, dilution, linear coefficients and GP set to 0,
+        and non-linear (e.g. ramp) models made neutral, so that only uncertainties of the planet
+        model propagate to the planet-only model."""
+        post = self.res.posteriors['posterior_samples'].copy()
+        for i in post.keys():
+            if ( i[0:5] == 'mflux' ) or ( i[0:9] == 'mdilution' ) or ( i[0:5] == 'theta' ) or ( i[0:2] == 'GP' ):
+                post[i] = np.zeros(len(post[i]))
+        nlf = getattr(self.dataset, 'non_linear_functions', None) or {}
+        for f in nlf.values():
+            neutral = getattr(f['function'], 'neutral', None)
+            if callable(neutral):
+                for k, v in neutral().items():
+                    if k in post:
+                        post[k] = np.full(len(post[k]), v)
+        return post
 
     def highres_planet_models_workaround(self, instrument, times_highres, GP_reg_highres, lin_reg_highres):
         """
@@ -136,20 +200,28 @@ class julietPlots(object):
         else:
             lin_pars = None
 
-        ## Again, running juliet.load and juliet.fit
-        data_highres = juliet.load(priors=self.input_folder + '/priors.dat', t_lc=tim_highres, y_lc=fl_highres, yerr_lc=fle_highres,\
-                                   GP_regressors_lc=gp_pars, linear_regressors_lc=lin_pars, out_folder=self.input_folder)
-        res_highres = data_highres.fit(**self.fit_kwargs)
+        ## Again, running juliet.load and juliet.fit, in a scratch folder that holds a copy of the
+        ## posteriors (juliet then loads them instead of sampling, and the fit folder is untouched)
+        import glob, shutil, tempfile
+        tmp = tempfile.mkdtemp(prefix='jstark_highres_')
+        for f in glob.glob(os.path.join(self.dataset.out_folder, '*posteriors.pkl')):
+            shutil.copy(f, tmp)
+        fit_kwargs = dict(self.fit_kwargs)
+        fit_kwargs.setdefault('sampler', self.res.sampler)
+        for key in ('light_travel_delay', 'stellar_radius'):
+            if hasattr(self.res, key):
+                fit_kwargs.setdefault(key, getattr(self.res, key))
+        data_highres = juliet.load(priors=self.dataset.priors, t_lc=tim_highres, y_lc=fl_highres, yerr_lc=fle_highres,\
+                                   GP_regressors_lc=gp_pars, linear_regressors_lc=lin_pars, out_folder=tmp)
+        res_highres = data_highres.fit(**fit_kwargs)
 
-        post_samps_new = res_highres.posteriors['posterior_samples'].copy()
-        for i in post_samps_new.keys():
-            if ( i[0:5] == 'mflux' ) or ( i[0:9] == 'mdilution' ) or ( i[0:5] == 'theta' ) or ( i[0:2] == 'GP' ):
-                post_samps_new[i] = np.zeros(len(post_samps_new[i]))
+        post_samps_new = self._planet_only_samples()
 
         planet_only_models_highres = \
             res_highres.lc.evaluate(instrument, nsamples=self.nsamps, return_err=True, parameter_values=post_samps_new,\
                                     return_components=True, return_samples=True, evaluate_transit=True)
 
+        shutil.rmtree(tmp, ignore_errors=True)
         return planet_only_models_highres
         
 
@@ -191,10 +263,8 @@ class julietPlots(object):
         arrays (times, data, errors) are available in ``self.dataset``.
         """
 
-        # Computing the model for all instruments
-        if instruments is None:
-            # If instruments is None, then all instruments are selected
-            instruments = self.dataset.inames_lc
+        # Computing the model for all instruments (None: all instruments)
+        instruments = self._instruments(instruments)
         
         all_fig, all_axs1, all_axs2 = [], [], []
         for i in range(len(instruments)):
@@ -239,7 +309,7 @@ class julietPlots(object):
             ax2.errorbar(tim_ins, (fl_ins-full_model)*1e6, yerr=fle_ins*1e6, fmt='.', elinewidth=0.5, markersize=1.5, color='dodgerblue')#, alpha=0.3)
             ax2.axhline(y=0.0, c='black', ls='--', zorder=100)
             ax2.set_ylabel('Residuals [ppm]')
-            ax2.set_xlabel('Time [BJD]')
+            ax2.set_xlabel(r'Time [BJD$_\mathrm{TDB}$]')
             ax2.set_xlim(np.min(tim_ins), np.max(tim_ins))
 
             all_fig.append(fig)
@@ -247,12 +317,13 @@ class julietPlots(object):
             all_axs2.append(ax2)
 
             if save:
-                plt.savefig(self.input_folder + '/full_model_' + instruments[i] + '.png', dpi=250)
+                plt.savefig(os.path.join(self.input_folder, 'full_model_' + instruments[i] + '.png'), dpi=250)
         
         return all_fig, all_axs1, all_axs2
     
     def detrend_data(self, phmin, instruments, planet='p1'):
         """This function will generate detrended data from the raw data. It will also generate phases."""
+        instruments = self._instruments(instruments)
         
         # First, create detrended dataset and models
         ## For detrended dataset
@@ -270,13 +341,13 @@ class julietPlots(object):
             #  period and t0:
             # -----------------------------------------
             try:
-                per = np.nanmedian(self.res.posteriors['posterior_samples']['P_' + planet])
-            except:
+                per = self._pmed('P_' + planet)
+            except Exception:
                 per = self.all_mods_ins[instruments[i]]['params'].per
             
             try:
-                t0 = np.nanmedian(self.res.posteriors['posterior_samples']['t0_' + planet])
-            except:
+                t0 = self._pmed('t0_' + planet)
+            except Exception:
                 t0 = self.all_mods_ins[instruments[i]]['params'].t0
             # -----------------------------------------
 
@@ -286,15 +357,15 @@ class julietPlots(object):
             #  detrend the data
             # -----------------------------------------
             # GP model
-            if self.dataset.GP_lc_arguments != None:
-                if instruments[i] in self.dataset.GP_lc_arguments.keys():
+            if self._gp:
+                if instruments[i] in self._gp.keys():
                     gp_model = self.all_mods_ins[instruments[i]]['GP']
                 else:
                     gp_model = 0.
             else:
                 gp_model = 0.
 
-            if instruments[i] in self.dataset.lm_lc_arguments.keys():
+            if instruments[i] in self._lm.keys():
                 linear_model = self.models_all_ins[instruments[i]][-1]['lm']
             else:
                 linear_model = 0.
@@ -310,11 +381,8 @@ class julietPlots(object):
             #  => T = (y - F2) / F1
             # -----------------------------------------
 
-            mflx = self.res.posteriors['posterior_samples']['mflux_' + instruments[i]]
-            try:
-                mdil = self.res.posteriors['posterior_samples']['mdilution_' + instruments[i]]
-            except:
-                mdil = np.ones( len(mflx) )
+            mflx = self._samples('mflux', instruments[i], 0.)
+            mdil = self._samples('mdilution', instruments[i], 1.)
             
             F1 = np.nanmedian( mdil / ( 1 + (mdil * mflx) ) )
             F2 = np.nanmedian( (1 - mdil) / (1 + (mdil * mflx) ) )
@@ -322,10 +390,15 @@ class julietPlots(object):
             ## Saving F1 and F2
             self.F1[instruments[i]], self.F2[instruments[i]] = F1, F2
 
-            sigw = np.nanmedian(self.res.posteriors['posterior_samples']['sigma_w_' + instruments[i]] * 1e-6)
+            sigw = np.nanmedian(self._samples('sigma_w', instruments[i], 0.) * 1e-6)
 
             ## Here we create detrended data by subtracting GP (if any) and linear (if any) models from the raw data
-            self.detrended_data[instruments[i]] = ( self.dataset.data_lc[instruments[i]] - gp_model - linear_model - F2) / F1 
+            ## (and removing a juliet non-linear model, if any: the full model is (T*F1 + F2 + LM) * NLM + GP)
+            nlm, mult = self._nlm(instruments[i])
+            data_i = self.dataset.data_lc[instruments[i]] - gp_model
+            if nlm is not None:
+                data_i = data_i / nlm if mult else data_i - nlm
+            self.detrended_data[instruments[i]] = ( data_i - linear_model - F2) / F1 
             self.detrended_errs[instruments[i]] = np.sqrt( self.dataset.errors_lc[instruments[i]]**2 + sigw**2 )
 
             phases_instrument = juliet.utils.get_phases(self.dataset.times_lc[instruments[i]], P=per, t0=t0, phmin=phmin)
@@ -341,6 +414,7 @@ class julietPlots(object):
     def detrend_model(self, instruments, phmin, highres, planet='p1'):
         # If we want to create high-resolution model (highres=True), then we will use the same times for all instruments
         # If not, then we will use different times for different instruments
+        instruments = self._instruments(instruments)
         self.times_model, self.phases_model = {}, {}
         self.planet_only_models = {} 
         
@@ -349,13 +423,13 @@ class julietPlots(object):
         #  period and t0:
         # -----------------------------------------
         try:
-            per = np.nanmedian(self.res.posteriors['posterior_samples']['P_' + planet])
-        except:
+            per = self._pmed('P_' + planet)
+        except Exception:
             per = self.all_mods_ins[instruments[0]]['params'].per
         
         try:
-            t0 = np.nanmedian(self.res.posteriors['posterior_samples']['t0_' + planet])
-        except:
+            t0 = self._pmed('t0_' + planet)
+        except Exception:
             t0 = self.all_mods_ins[instruments[0]]['params'].t0
 
         # We also have to create a new posterior array since when we compute detrended model,
@@ -363,10 +437,7 @@ class julietPlots(object):
         # So, we will make posteriors of mflux, theta, and GP to zero, such that any uncertainties
         # in them would not propagate to model uncertainties.
 
-        post_samps_new = self.res.posteriors['posterior_samples'].copy()
-        for i in post_samps_new.keys():
-            if ( i[0:5] == 'mflux' ) or ( i[0:9] == 'mdilution' ) or ( i[0:5] == 'theta' ) or ( i[0:2] == 'GP' ):
-                post_samps_new[i] = np.zeros(len(post_samps_new[i]))
+        post_samps_new = self._planet_only_samples()
         
         if highres:
             ## First selecting the times
@@ -385,12 +456,12 @@ class julietPlots(object):
                 ### (we have to remember that everything is sorted according to GP regressors)
                 ### (while dummy time is sorted according to times)
                 ### (we will perform interpolation to arrays sorted according to time)
-                if self.dataset.GP_lc_arguments != None:
-                    if instruments[ins] in self.dataset.GP_lc_arguments.keys():
+                if self._gp:
+                    if instruments[ins] in self._gp.keys():
                         #! Try/except because it is possible that not all instruments have GP model
                         try:
                             inter_gp = interp1d(x=self.dataset.times_lc[instruments[ins]][self.idx_time_sort[instruments[ins]]],\
-                                                y=self.dataset.GP_lc_arguments[instruments[ins]][:,0][self.idx_time_sort[instruments[ins]]],\
+                                                y=self._gpx(instruments[ins])[self.idx_time_sort[instruments[ins]]],\
                                                 kind='cubic')
                             gp_reg_highres = inter_gp(x=dummy_time_highres)
 
@@ -398,7 +469,7 @@ class julietPlots(object):
                             idx_gp = np.argsort( gp_reg_highres )
                             dummy_time_highres, dummy_phs_highres = dummy_time_highres[idx_gp], dummy_phs_highres[idx_gp]
                             gp_reg_highres = gp_reg_highres[idx_gp]
-                        except:
+                        except Exception:
                             gp_reg_highres = None
                     else:
                         gp_reg_highres = None
@@ -406,16 +477,16 @@ class julietPlots(object):
                     gp_reg_highres = None
 
                 ### High resolution linear regressors
-                if instruments[ins] in self.dataset.lm_lc_arguments.keys():
+                if instruments[ins] in self._lm.keys():
                     #! Again, try/except because not all instruments might have a linear model
                     ## (Here, we don't need to sort according to time -- because the dummy_times should have now
                     ##  sorted according to GP regressors, if applicable)
                     try:
                         inter_lin = interp1d(x=self.dataset.times_lc[instruments[ins]],\
-                                             y=self.dataset.lm_lc_arguments[instruments[ins]],\
+                                             y=self._lm[instruments[ins]],\
                                              kind='cubic', axis=0)
                         lin_reg_highres = inter_lin(x=dummy_time_highres)
-                    except:
+                    except Exception:
                         lin_reg_highres = None
                 else:
                     lin_reg_highres = None
@@ -426,7 +497,7 @@ class julietPlots(object):
                         self.res.lc.evaluate(instruments[ins], nsamples=self.nsamps, return_err=True, parameter_values=post_samps_new,\
                                             return_components=True, return_samples=True, evaluate_transit=True,\
                                             t=dummy_time_highres, GPregressors=gp_reg_highres, LMregressors=lin_reg_highres)
-                except:
+                except Exception:
                     # In case when it doesn't work, I have invented a workaround
                     self.planet_only_models[instruments[ins]] = \
                         self.highres_planet_models_workaround(instrument=instruments[ins], times_highres=dummy_time_highres,\
@@ -446,7 +517,7 @@ class julietPlots(object):
                 self.phases_model[instruments[ins]] = juliet.utils.get_phases(t=self.dataset.times_lc[instruments[ins]], P=per, t0=t0, phmin=phmin)
 
     
-    def phase_folded_lc(self, phmin=0.8, instruments=None, planet='p1', highres=False, nrandom=50, quantile_models=True, one_plot=None, figsize=(16/1.5, 9/1.5), pycheops_binning=False, nos_bin_tra=20, nos_bin_pc=30):
+    def phase_folded_lc(self, phmin=0.8, instruments=None, planet='p1', highres=False, nrandom=50, quantile_models=True, one_plot=None, figsize=(16/1.5, 9/1.5), pycheops_binning=False, nos_bin_tra=20, nos_bin_pc=30, window=1.):
         """Plot phase-folded light curves and models for the fitted dataset.
 
         This method computes detrended data and planetary models by
@@ -496,6 +567,9 @@ class julietPlots(object):
             Number of total binned data points in transit plot. Default is 20.
         nos_bin_pc : int, optional
             Number of total binned data points in phase curve plot. Default is 30.
+        window : float, optional
+            Half-width of the transit/eclipse panels in units of the transit
+            duration T14 (binning uses ``window + 0.1``). Default ``1.0``.
 
         Returns
         -------
@@ -513,13 +587,9 @@ class julietPlots(object):
         # Also, if all instruments are provided, this will make one common plot
         # Otherwise, one plot per instrument
         # However, sometimes we want to force one plot, so we have the option one_plot
+        instruments = self._instruments(instruments)
         if one_plot is None:
-            one_plot = True
-            if instruments != None:
-                if len(instruments) != len(self.dataset.inames_lc):
-                    one_plot = False
-            else:
-                instruments = self.dataset.inames_lc
+            one_plot = len(instruments) == len(self.dataset.inames_lc)
 
         # -------------------------------------------
         #               Compute t14
@@ -530,41 +600,50 @@ class julietPlots(object):
 
         ### Orbital period
         try:
-            per = np.nanmedian(self.res.posteriors['posterior_samples']['P_' + planet])
-        except:
+            per = self._pmed('P_' + planet)
+        except Exception:
             per = self.all_mods_ins[instruments[0]]['params'].per
         
         ### Rp/R*
         try:
-            rprs = np.nanmedian(self.res.posteriors['posterior_samples']['p_' + planet])
-        except:
+            rprs = self._pmed('p_' + planet)
+        except Exception:
             rprs = self.all_mods_ins[instruments[0]]['params'].rp
 
         ### a/R*
         if 'rho' in self.res.model_parameters:
             ### This would mean that we have fitted for rho. We can convert rho to a/*
             try:
-                rho = np.nanmedian(self.res.posteriors['posterior_samples']['rho'])
+                rho = self._pmed('rho')
                 ar = rho_to_ar(rho, per)
-            except:
+            except Exception:
                 ar = self.all_mods_ins[instruments[0]]['params'].a
         else:
             ### That means that we directly fit for a/R*
             try:
-                ar = np.nanmedian(self.res.posteriors['posterior_samples']['a_' + planet])
-            except:
+                ar = self._pmed('a_' + planet)
+            except Exception:
                 ar = self.all_mods_ins[instruments[0]]['params'].a
         
         ### b
         try:
-            b = np.nanmedian(self.res.posteriors['posterior_samples']['b_' + planet])
-        except:
+            b = self._pmed('b_' + planet)
+        except Exception:
             inc = self.all_mods_ins[instruments[0]]['params'].inc
             b = inc_to_b(inc=inc, ar=ar, ecc=self.all_mods_ins[instruments[0]]['params'].ecc,\
                                omega=self.all_mods_ins[instruments[0]]['params'].w)
         t14_dur = t14(per=per, ar=ar, rprs=rprs, b=b, ecc=self.all_mods_ins[instruments[0]]['params'].ecc,\
                         omega=self.all_mods_ins[instruments[0]]['params'].w)
         t14_phs = t14_dur / per
+
+        ### Phase of the eclipse centre (0.5 unless an eclipse time was fitted, e.g. eccentric orbits)
+        ecl_ph = 0.5
+        try:
+            tsec = self._pmed('t_secondary_' + planet)
+            t0_ref = self._pmed('t0_' + planet)
+            ecl_ph = ((tsec - t0_ref) / per) % 1.
+        except KeyError:
+            pass
 
         # -------------------------------------------
         #     Computing detrended data and model
@@ -735,9 +814,9 @@ class julietPlots(object):
             # Limits
             ## Maximum of the transit model would always be 1. (or, 0 in case we have phase curve model, and we decided to use ppm)
             if transit or phasecurve:
-                ax1.set_xlim(-0.7*t14_phs, 0.7*t14_phs)
+                ax1.set_xlim(-window*t14_phs, window*t14_phs)
             else:
-                ax1.set_xlim(0.5-0.7*t14_phs, 0.5+0.7*t14_phs)
+                ax1.set_xlim(ecl_ph-window*t14_phs, ecl_ph+window*t14_phs)
             
             if transit:
                 ax1.set_ylim([np.min(detrend_model)-0.2*np.ptp(detrend_model), 1+0.2*np.ptp(detrend_model)])
@@ -754,9 +833,9 @@ class julietPlots(object):
 
             # Limits (x-limit same as the top axis; for y-lim, we will set 3-sigma from median)
             if transit or phasecurve:
-                ax2.set_xlim(-0.7*t14_phs, 0.7*t14_phs)
+                ax2.set_xlim(-window*t14_phs, window*t14_phs)
             else:
-                ax2.set_xlim(0.5-0.7*t14_phs, 0.5+0.7*t14_phs)
+                ax2.set_xlim(ecl_ph-window*t14_phs, ecl_ph+window*t14_phs)
 
             # -------------------------------------------
             #        Binned data: For TRANSIT
@@ -764,9 +843,9 @@ class julietPlots(object):
             ## We do binned data here: ONLY if we don't have one plot
             if not one_plot:
                 if transit or phasecurve:
-                    idx_transits = ( phs > -0.8*t14_phs ) & ( phs < 0.8*t14_phs )
+                    idx_transits = ( phs > -(window+0.1)*t14_phs ) & ( phs < (window+0.1)*t14_phs )
                 else:
-                    idx_transits = ( phs > 0.5-0.8*t14_phs ) & ( phs < 0.5+0.8*t14_phs )
+                    idx_transits = ( phs > ecl_ph-(window+0.1)*t14_phs ) & ( phs < ecl_ph+(window+0.1)*t14_phs )
                 
                 if not pycheops_binning:
                     nbin = int( np.sum(idx_transits) / nos_bin_tra )
@@ -921,9 +1000,9 @@ class julietPlots(object):
             # Now, we want to decide nbin (number of data points to bin)
             # We would like to have different binning for transit and phase curve -- so first selecting nbin for transit/occultation
             if transit or phasecurve:
-                idx_transits = ( bin_phs > -0.8*t14_phs ) & ( bin_phs < 0.8*t14_phs )
+                idx_transits = ( bin_phs > -(window+0.1)*t14_phs ) & ( bin_phs < (window+0.1)*t14_phs )
             else:
-                idx_transits = ( bin_phs > 0.5-0.8*t14_phs ) & ( bin_phs < 0.5+0.8*t14_phs )
+                idx_transits = ( bin_phs > ecl_ph-(window+0.1)*t14_phs ) & ( bin_phs < ecl_ph+(window+0.1)*t14_phs )
             
             if not pycheops_binning:
                 nbin = int( np.sum(idx_transits) / nos_bin_tra )
@@ -1095,11 +1174,7 @@ class julietPlots(object):
         """
 
         # Let's first gather the names of all instruments (we will always do one plot per instrument)
-        if instruments != None:
-            if len(instruments) != len(self.dataset.inames_lc):
-                one_plot = False
-        else:
-            instruments = self.dataset.inames_lc
+        instruments = self._instruments(instruments)
 
         ## All stuff we can save
         figs_all, axs_all = [], []
@@ -1266,7 +1341,7 @@ class julietPlots(object):
 
         fig = corner_plot(samples=posteriors, labels=labels, titles=titles)
         if save:
-            plt.savefig(self.input_folder + '/corner_plot.png', dpi=250)
+            plt.savefig(os.path.join(self.input_folder, 'corner_plot.png'), dpi=250)
 
         return fig
     
@@ -1321,13 +1396,14 @@ class julietPlots(object):
         #         List of all instruments
         # -------------------------------------------
         ## If instruments=None, we will generate one plot per instruments for all instruments for which GP fitting is done
-        if instruments != None:
+        if instruments is not None:
+            instruments = self._instruments(instruments)
             ## Let's check if the provided instruments indeed have GP fitting
             for ins in range(len(instruments)):
-                if instruments[ins] not in self.dataset.GP_lc_arguments.keys():
+                if instruments[ins] not in self._gp.keys():
                     raise ValueError('GP fitting is not found for instrument ' + instruments[ins])
         else:
-            instruments = [i for i in self.dataset.GP_lc_arguments.keys()]
+            instruments = [i for i in self._gp.keys()]
         
         # -------------------------------------------
         #     Computing detrended data and model
@@ -1349,7 +1425,7 @@ class julietPlots(object):
             # We will keep it that way -- everything sorted according GP regressors
 
             ## -- We also need to compute linear model, if there is any
-            if instruments[i] in self.dataset.lm_lc_arguments.keys():
+            if instruments[i] in self._lm.keys():
                 linear_model = self.models_all_ins[instruments[i]][-1]['lm']
             else:
                 linear_model = 0.
@@ -1357,15 +1433,18 @@ class julietPlots(object):
             # -------------------------------------------
             #   GP data: i.e., data fitted to GP model
             # -------------------------------------------
-            self.gp_data[instruments[i]] = self.dataset.data_lc[instruments[i]] - ( self.F1[instruments[i]] * self.planet_only_models[instruments[i]][1] ) -\
-                                           self.F2[instruments[i]] - linear_model
+            nlm, mult = self._nlm(instruments[i])
+            deterministic = ( self.F1[instruments[i]] * self.planet_only_models[instruments[i]][1] ) + self.F2[instruments[i]] + linear_model
+            if nlm is not None:
+                deterministic = deterministic * nlm if mult else deterministic + nlm
+            self.gp_data[instruments[i]] = self.dataset.data_lc[instruments[i]] - deterministic
             
             # -------------------------------------------
             #  And GP model -- we need to compute them
             # -------------------------------------------
             
             if not highres:
-                gp_model_regressor[instruments[i]] = np.copy( self.dataset.GP_lc_arguments[instruments[i]][:, 0] )
+                gp_model_regressor[instruments[i]] = np.copy( self._gpx(instruments[i]) )
                 gp_med_model[instruments[i]] = self.all_mods_ins[instruments[i]]['GP']
                 if not robust_errors:
                     gp_up68[instruments[i]], gp_lo68[instruments[i]] = self.all_mods_ins[instruments[i]]['GP_uerror'], self.all_mods_ins[instruments[i]]['GP_lerror']
@@ -1376,8 +1455,8 @@ class julietPlots(object):
 
             else:
                 # High-resolution GP regressor per instrument
-                predict_time = np.linspace( np.min(self.dataset.GP_lc_arguments[instruments[i]][:, 0]),\
-                                            np.max(self.dataset.GP_lc_arguments[instruments[i]][:, 0]), 10000 )
+                predict_time = np.linspace( np.min(self._gpx(instruments[i])),\
+                                            np.max(self._gpx(instruments[i])), 10000 )
                 
                 # ------ For highres models, we always need to compute models from ``compute_gp_model`` function
                 gp_quantiles = self.compute_gp_model(instrument=instruments[i], highres=True, pred_time=predict_time, parameter_vector=parameter_vector)
@@ -1416,7 +1495,7 @@ class julietPlots(object):
             # Plotting the "raw" data
             errorbars = self.detrended_errs[instruments[i]]*1e6 if plot_errorbars else None
             alp = 0.3 if plot_errorbars else 0.8
-            axs.errorbar(self.dataset.GP_lc_arguments[instruments[i]][:,0], self.gp_data[instruments[i]]*1e6, yerr=errorbars, fmt='.', elinewidth=0.3, markersize=1.5, alpha=alp, color='dodgerblue', zorder=1)
+            axs.errorbar(self._gpx(instruments[i]), self.gp_data[instruments[i]]*1e6, yerr=errorbars, fmt='.', elinewidth=0.3, markersize=1.5, alpha=alp, color='dodgerblue', zorder=1)
             
             # ------------------------------------------
             #    Now, we can plot the bin data and
@@ -1430,11 +1509,11 @@ class julietPlots(object):
                 # First bin-data
                 if not pycheops_binning:
                     nbin = int( len( self.gp_data[instruments[i]] ) / nos_bin )
-                    bin_tim, bin_fl, bin_fle = juliet.utils.bin_data(x=self.dataset.GP_lc_arguments[instruments[i]][:,0], y=self.gp_data[instruments[i]]*1e6, yerr=self.detrended_errs[instruments[i]]*1e6, n_bin=nbin)
+                    bin_tim, bin_fl, bin_fle = juliet.utils.bin_data(x=self._gpx(instruments[i]), y=self.gp_data[instruments[i]]*1e6, yerr=self.detrended_errs[instruments[i]]*1e6, n_bin=nbin)
 
                 else:
-                    binwid = np.ptp( self.dataset.GP_lc_arguments[instruments[i]][:,0] ) / nos_bin
-                    bin_tim, bin_fl, bin_fle, _ = lcbin(time=self.dataset.GP_lc_arguments[instruments[i]][:,0], flux=self.gp_data[instruments[i]]*1e6, binwidth=binwid)
+                    binwid = np.ptp( self._gpx(instruments[i]) ) / nos_bin
+                    bin_tim, bin_fl, bin_fle, _ = lcbin(time=self._gpx(instruments[i]), flux=self.gp_data[instruments[i]]*1e6, binwidth=binwid)
                 axs.errorbar(bin_tim, bin_fl, yerr=bin_fle, fmt='o', c='navy', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
                     
                 # And now models
@@ -1449,7 +1528,7 @@ class julietPlots(object):
                 axs.set_xlabel(xlabel)
                 axs.set_ylabel('Relative flux [ppm]')
 
-                axs.set_xlim([ np.min(self.dataset.GP_lc_arguments[instruments[i]][:,0]), np.max(self.dataset.GP_lc_arguments[instruments[i]][:,0]) ])
+                axs.set_xlim([ np.min(self._gpx(instruments[i])), np.max(self._gpx(instruments[i])) ])
                 axs.set_ylim([ np.nanmedian(bin_fl)-10*pipe_mad(bin_fl), np.nanmedian(bin_fl)+10*pipe_mad(bin_fl) ])
 
                 # Saving fig, axs to the list
@@ -1457,7 +1536,7 @@ class julietPlots(object):
                 axs_all.append(axs)
             else:
                 # Saving data to the big list
-                bin_gp_reg, bin_resids = np.hstack( (bin_gp_reg, self.dataset.GP_lc_arguments[instruments[i]][:,0]) ), np.hstack( (bin_resids, self.gp_data[instruments[i]]*1e6) )
+                bin_gp_reg, bin_resids = np.hstack( (bin_gp_reg, self._gpx(instruments[i])) ), np.hstack( (bin_resids, self.gp_data[instruments[i]]*1e6) )
                 bin_errors = np.hstack( (bin_errors, self.detrended_errs[instruments[i]]*1e6) )
                 # Saving models to the list
                 all_regressors_for_plotting = np.hstack( (all_regressors_for_plotting, gp_model_regressor[instruments[i]]) )
@@ -1532,7 +1611,7 @@ class julietPlots(object):
         if times is None:
             # When time is None, means that we haven't provided any data, so we need to extract it from self.
             ## Extracting times (GP regressors) from self.dataset object
-            times = self.dataset.GP_lc_arguments[instrument][:,0]
+            times = self._gpx(instrument)
             ## Similarly, extracting GP data and errors from self
             resids, errors = self.gp_data[instrument], self.detrended_errs[instrument]
             
@@ -1546,7 +1625,7 @@ class julietPlots(object):
         else:
             # We don't need any data in this case, since everything is provided, 
             # but we still need a name of an instrument to access GP object
-            instrument = [i for i in self.dataset.GP_lc_arguments.keys()][0]
+            instrument = [i for i in self._gp.keys()][0]
 
         if parameter_vector is not None:
             self.dataset.lc_options[instrument]['noise_model'].GP.set_parameter_vector(parameter_vector)
@@ -1562,808 +1641,3 @@ class julietPlots(object):
         gp_quantiles[1, :], gp_quantiles[2, :] = gp_mean + gp_std, gp_mean - gp_std
 
         return gp_quantiles
-    
-class SpectroscopicLC(object):
-    """Analyze and fit multi-wavelength time-series spectroscopic data.
-
-    This class provides tools for handling spectroscopic light curves where
-    flux is measured as a function of both time and wavelength. It supports
-    binning spectral data into channels, fitting individual wavelength bins
-    using ``juliet``, parallel processing of multiple channels, and
-    visualization of spectral transit/eclipse signatures and systematics.
-
-    Parameters
-    ----------
-    times : ndarray
-        1D array of time stamps (in BJD or similar) with shape (N_frames,).
-    lc : ndarray
-        2D array of flux measurements with shape (N_frames, N_wavelengths).
-        Each row is a time frame; each column is a wavelength bin.
-    lc_errs : ndarray
-        2D array of flux uncertainties with the same shape as ``lc``.
-    wavelengths : ndarray
-        1D array of wavelength values (in microns or other units) corresponding
-        to each column of ``lc``. Shape is (N_wavelengths,).
-    gp_pars : dict or None, optional
-        Dictionary mapping instrument names to arrays of Gaussian Process (GP)
-        regressor values (e.g., time, roll angle). Used when fitting with GP
-        systematics. Default is ``None``.
-    lin_pars : dict or None, optional
-        Dictionary mapping instrument names to 2D arrays of linear regressor
-        values (shape: N_frames x N_regressors). Used for linear detrending.
-        Default is ``None``.
-    priors : callable or None, optional
-        A callable that accepts a channel name (string) and returns a juliet-format priors 
-        for that channel. Required for fitting
-        via :meth:`analyse_lc_parallel`. Default is ``None``.
-    pout : str, optional
-        Output directory for saving results, intermediate data, and pickled
-        light curves. Default is the current working directory.
-
-    Attributes
-    ----------
-    times : ndarray
-        Input time array.
-    lc : ndarray
-        Input 2D light-curve array.
-    lc_errs : ndarray
-        Input 2D error array.
-    wavelengths : ndarray
-        Input wavelength array.
-    gp_pars, lin_pars : dict or None
-        Input systematics parameters.
-    priors : callable or None
-        Input priors function.
-    pout : str
-        Output directory.
-    col_st, col_end : ndarray
-        Start and end column indices for each binned channel (populated by
-        :meth:`col_spec`).
-    spectral_lcs_dict : dict
-        Dictionary containing binned spectral light curves and metadata,
-        populated by :meth:`generating_lightcurves`. Keys include 'lc', 'err',
-        'wave', and 'wave_bin'.
-    wav, wav_bin : ndarray
-        Wavelength array and half-widths for each bin (populated by
-        :meth:`plot_parameter_spectrum`).
-    pars_med, pars_up, pars_lo : ndarray
-        Median and upper/lower credible interval bounds on fitted parameters
-        as a function of wavelength (populated by :meth:`plot_parameter_spectrum`).
-    qua_white : tuple
-        Quantiles (median, upper, lower) of the white-light parameter
-        (populated by :meth:`plot_parameter_spectrum`).
-
-    Main methods
-    ------------
-    generating_lightcurves(ch_nos=None)
-        Extract and optionally bin spectral light curves into channels.
-    bin_lightcurve(unbinned_lc, unbinned_lc_err)
-        Inverse-variance weighted binning of light curves along wavelength direction.
-    white_light_lc()
-        Compute the white-light (all-wavelength) light curve.
-    analyse_lc_parallel(nthreads, ch_nos=None, juliet_fit_kwargs={})
-        End-to-end parallel analysis: bin, organize, and fit all channels.
-    plot_parameter_spectrum(parameter, bins=None, post_size=10000, ...)
-        Plot fitted parameter values as a function of wavelength.
-    plot2Ddata(cmap='plasma')
-        2D heatmap of spectral light curves vs time.
-    plot2D_data_model_resids(cmap='plasma', detrend=False, ...)
-        Side-by-side 2D heatmaps of data, model, and residuals.
-    joint_fake_allan_deviation(binmax=10, method='pipe', timeunit=None)
-        Combined noise vs binning plot across all channels.
-
-    Notes
-    -----
-    - All fitting is performed using the ``juliet`` package (Espinoza et al. 2019).
-    - Parallel processing uses Python's ``multiprocessing.Pool``.
-    - Results are saved as pickled dictionaries and ASCII text files to ``pout``.
-    - Methods check for existing output files and skip re-computation if files
-      are already present (useful for resuming interrupted analyses).
-
-    Examples
-    --------
-    Create and analyze a spectroscopic dataset:
-
-    >>> import numpy as np
-    >>> times = np.linspace(2459000, 2459001, 100)
-    >>> wavelengths = np.linspace(1.1, 1.7, 50)
-    >>> lc = np.random.normal(1.0, 0.01, (100, 50))
-    >>> lc_errs = np.full_like(lc, 0.005)
-
-    >>> def get_priors(ch_name):
-    ...     return juliet.utils.priors()
-
-    >>> spec = SpectroscopicLC(times, lc, lc_errs, wavelengths,
-    ...                        priors=get_priors, pout='./results')
-    >>> spec.analyse_lc_parallel(nthreads=4, ch_nos=10)
-    >>> fig, ax = spec.plot_parameter_spectrum('p_p1', bins=10, plot_white=True)
-    """
-    def __init__(self, times, lc, lc_errs, wavelengths, gp_pars=None, lin_pars=None, priors=None, pout=os.getcwd()):
-        # Dimensions of lc should be (nframes, ncols)
-        self.times = times
-        self.lc = lc
-        self.lc_errs = lc_errs
-        self.wavelengths = wavelengths
-        self.gp_pars = gp_pars
-        self.lin_pars = lin_pars
-        self.priors = priors
-        self.pout = pout
-
-    def col_spec(self, ch_nos):
-        """Given a number of total number of channels, this function gives an array containing
-        start and end column for each channel"""
-        if ch_nos != 1:
-            col_in_1_ch = round(self.lc.shape[1]/ch_nos)
-            self.col_st = np.arange(0, self.lc.shape[1]-col_in_1_ch, col_in_1_ch, dtype=int)
-            self.col_end = np.arange(0+col_in_1_ch, self.lc.shape[1], col_in_1_ch, dtype=int)
-        else:
-            self.col_st, self.col_end = np.array([0]), np.array([self.lc.shape[1]])
-        
-        if self.col_end[-1] != self.lc.shape[1]:
-            self.col_st = np.hstack((self.col_st, self.col_end[-1]))
-            self.col_end = np.hstack((self.col_end, self.lc.shape[1]))
-
-    def generating_lightcurves(self, ch_nos=None):
-        """Extract and optionally bin spectral light curves into channels.
-
-        This method either bins the original light curve into ``ch_nos`` channels
-        (using inverse-variance weighting) or uses the original wavelength resolution.
-        Results are saved as a pickled dictionary and stored in
-        ``self.spectral_lcs_dict``.
-
-        If a pickle file for the requested binning already exists, it is loaded
-        instead of recomputing.
-
-        Parameters
-        ----------
-        ch_nos : int or None, optional
-            Number of channels to bin the light curve into. If ``None``, use
-            native wavelength resolution (no binning). Default is ``None``.
-
-        Returns
-        -------
-        None
-            Results are stored in ``self.spectral_lcs_dict`` with keys:
-
-            - 'lc' : ndarray
-                Binned light curves (shape: N_frames x N_channels).
-            - 'err' : ndarray
-                Binned flux errors (same shape as 'lc').
-            - 'wave' : ndarray
-                Central wavelength of each bin.
-            - 'wave_bin' : ndarray
-                Half-width (or full width) of each wavelength bin.
-
-        Notes
-        -----
-        The output is pickled to
-        ``pout/spectroscopic_lc_ch_<ch_nos>.pkl`` for future loading.
-        """
-        if ch_nos == None:
-            fname = self.pout + '/spectroscopic_lc_ch_' + str(self.lc.shape[1]) + '.pkl'
-        else:
-            fname = self.pout + '/spectroscopic_lc_ch_' + str(ch_nos) + '.pkl'
-
-        if not Path(fname).exists():
-            # Columns
-            if ch_nos != None:
-                self.col_spec(ch_nos)
-                # Creating spectral lc array
-                spec_lc, spec_err_lc = np.zeros( ( self.lc.shape[0], len(self.col_st) ) ), np.zeros( ( self.lc.shape[0], len(self.col_st) ) )
-                wavs, wav_bin_size = np.zeros( len(self.col_st) ), np.zeros( len(self.col_st) )
-                for i in range(len(self.col_st)):
-                    spec_lc[:,i], spec_err_lc[:,i] = self.bin_lightcurve( self.lc[:, self.col_st[i]:self.col_end[i]], \
-                                                                          self.lc_errs[:, self.col_st[i]:self.col_end[i]] )
-                    if self.col_end[i] != self.lc.shape[1]:
-                        wavs[i] = ( self.wavelengths[self.col_st[i]] + self.wavelengths[self.col_end[i]] )/2
-                        wav_bin_size[i] = np.abs( self.wavelengths[self.col_st[i]] - self.wavelengths[self.col_end[i]] )
-                    else:
-                        wavs[i] = ( self.wavelengths[self.col_st[i]] + self.wavelengths[self.col_end[i]-1] )/2
-                        wav_bin_size[i] = np.abs( self.wavelengths[self.col_st[i]] - self.wavelengths[self.col_end[i]-1] )
-            else:
-                spec_lc, spec_err_lc = self.lc, self.lc_errs
-                wavs, wav_bin_size = self.wavelengths, np.append(np.diff(self.wavelengths), np.diff(self.wavelengths)[-1])
-
-            # Save the light curves
-            self.spectral_lcs_dict = {}
-            self.spectral_lcs_dict['lc'], self.spectral_lcs_dict['err'] = spec_lc, spec_err_lc
-            self.spectral_lcs_dict['wave'], self.spectral_lcs_dict['wave_bin'] = wavs, wav_bin_size
-
-            if ch_nos == None:
-                pickle.dump(self.spectral_lcs_dict, open(self.pout + '/spectroscopic_lc_ch_' + str(self.lc.shape[1]) + '.pkl','wb'))
-            else:
-                pickle.dump(self.spectral_lcs_dict, open(self.pout + '/spectroscopic_lc_ch_' + str(ch_nos) + '.pkl','wb'))
-        else:
-            print('>>>> --- The spectroscopic lightcurves already exists...')
-            print('         Loading them...')
-            self.spectral_lcs_dict = pickle.load( open(fname, 'rb') )
-
-    
-    def bin_lightcurve(self, unbinned_lc, unbinned_lc_err):
-        """Perform inverse-variance weighted binning of a light curve.
-
-        Each output bin is the weighted average of input values, where weights
-        are the inverse squares of the input uncertainties. Output uncertainties
-        are computed by propagating input uncertainties through the weighted
-        average formula.
-
-        Parameters
-        ----------
-        unbinned_lc : ndarray
-            2D array of unbinned flux values (shape: N_frames x N_wavelengths).
-        unbinned_lc_err : ndarray
-            2D array of flux uncertainties (same shape as ``unbinned_lc``).
-
-        Returns
-        -------
-        bin_lc : ndarray
-            1D array of binned flux values (shape: N_frames,).
-        bin_lc_err : ndarray
-            1D array of binned flux uncertainties (same shape as ``bin_lc``).
-        """
-        # shape of both arrays are: (nframes, ncols)
-        weights = 1 / unbinned_lc_err**2
-        bin_lc = np.nansum(unbinned_lc * weights, axis=1) / np.nansum(weights, axis=1)
-        bin_lc_err = ( 1 / np.nansum(weights, axis=1) ) * np.sqrt( np.nansum( (weights**2) * (unbinned_lc_err**2), axis=1 ) )
-
-        return bin_lc, bin_lc_err
-    
-    def white_light_lc(self):
-        """Compute the white-light (all-wavelength) light curve.
-
-        Bins the entire 2D light curve (all wavelengths combined) into a single
-        1D time-series using inverse-variance weighting.
-
-        Returns
-        -------
-        white_lc : ndarray
-            1D array of white-light flux values.
-        white_lc_err : ndarray
-            1D array of white-light flux uncertainties.
-        """
-        return self.bin_lightcurve(unbinned_lc=self.lc, unbinned_lc_err=self.lc_errs)
-    
-    # MultiProcessing helper function (does the actual fitting)
-    def fit_lc(self, lightcurves, ch_name):
-        """Inteernal helper function for multiprocessing.
-        This function fits lightcurve for one spectroscopic channel"""
-        print('---------------------------------')
-        print('Working on Channel: ' + ch_name)
-        print('')
-        # Output folder
-        pout = self.pout + '/' + ch_name
-        f15 = Path(pout + '/_dynesty_DNS_posteriors.pkl')
-        f16 = Path(pout + '/model_resids.dat')
-        f17 = Path(pout + '/posteriors.dat')
-        if f15.exists() and f16.exists() and f17.exists():
-            print('>>>> --- The result files already exists...')
-            print('         Continuing to the next channel...')
-            res = np.zeros(10)
-        else:
-            # Extracting the data
-            tim9, fl9, fle9 = lightcurves['times'], lightcurves['lc'], lightcurves['err']
-            
-            # Removing Nan values
-            tim7, fl7, fle7 = tim9[~np.isnan(fl9)], fl9[~np.isnan(fl9)], fle9[~np.isnan(fl9)]
-
-            # Outlier removal
-            #msk2 = utl.outlier_removal(tim7, fl7, fle7, clip=10, msk1=False)
-            #tim7, fl7, fle7 = tim7[msk2], fl7[msk2], fle7[msk2]
-
-            # Normalizing the lightcurve
-            tim7, fl7, fle7 = tim7, fl7/np.median(fl7), fle7/np.median(fl7)
-
-            # Making data such that juliet can understand
-            tim, fl, fle = {}, {}, {}
-            tim[ch_name], fl[ch_name], fle[ch_name] = tim7, fl7, fle7
-
-
-            if type( lightcurves['lins'] ) == type( None ):
-                lin_pars = None
-            else:
-                lin_pars = {}
-                lin_pars[ch_name] = lightcurves['lins']
-
-            if type( lightcurves['gp'] ) == type( None ):
-                gp_pars = None
-            else:
-                gp_pars = {}
-                gp_pars[ch_name] = lightcurves['gp']
-
-            # Fitting
-            dataset = juliet.load(priors=self.priors(ch_name), t_lc=tim, y_lc=fl, yerr_lc=fle, linear_regressors_lc=lin_pars, GP_regressors_lc=gp_pars, out_folder=pout)
-            res = dataset.fit(sampler = 'dynamic_dynesty', **self.juliet_fit_kwargs)#, nthreads=8)
-
-            # Some plots
-            model = res.lc.evaluate(ch_name)
-            residuals = fl[ch_name]-model
-
-            data12 = np.vstack((model, residuals))
-            np.savetxt(pout + '/model_resids.dat', np.transpose(data12))
-
-            print('>>>> --- Done!!')
-        return res
-    
-    # Function that does the multiprocessing
-    def multi_fit_lcs(self, lightcurves, nthreads=4):
-        input_data = [(lightcurves[lc], lc) for lc in lightcurves]
-            
-        with multiprocessing.Pool(nthreads) as p:
-            result_list = p.starmap(self.fit_lc, input_data)
-                    
-        return np.array(result_list)
-    
-    def analyse_lc_parallel(self, nthreads, ch_nos=None, juliet_fit_kwargs={}):
-        """End-to-end parallel analysis: bin, organize, and fit lightcurves from all channels.
-
-        This high-level wrapper orchestrates the full analysis pipeline:
-        1. Bins the spectral light curve into channels via :meth:`generating_lightcurves`
-        2. Organizes the data into a format suitable for fitting
-        3. Calls :meth:`multi_fit_lcs` to fit all channels in parallel
-
-        Parameters
-        ----------
-        nthreads : int
-            Number of parallel threads to use for fitting.
-        ch_nos : int or None, optional
-            Number of wavelength channels to bin into. If ``None``, use native
-            wavelength resolution. Default is ``None``.
-        juliet_fit_kwargs : dict, optional
-            Keyword arguments to forward to ``juliet.dataset.fit(...)``,
-            such as ``sampler='dynamic_dynesty'``, ``nthreads=8``, etc.
-            Default is an empty dictionary.
-
-        Returns
-        -------
-        None
-            Results are written to ``pout`` and its subdirectories.
-
-        Notes
-        -----
-        Requires that ``self.priors`` is a callable that returns a priors
-        for each channel name.
-        """
-        # Setting juliet_fit_kwargs
-        self.juliet_fit_kwargs = juliet_fit_kwargs
-
-        # Generating the data
-        ## Bin the data, if necessary
-        self.generating_lightcurves(ch_nos=ch_nos)
-
-        # Storing all lightcurves in a big dictionary
-        all_lightcurve_data = {}
-        for i in range( self.spectral_lcs_dict['lc'].shape[1] ):
-            # Storing all lightcurves in a big dictionary
-            all_lightcurve_data['CH' + str(i)] = {}
-            
-            ## And now storing the actual lightcurve data
-            all_lightcurve_data['CH' + str(i)]['times'] = self.times
-            all_lightcurve_data['CH' + str(i)]['lc'] = self.spectral_lcs_dict['lc'][:,i]
-            all_lightcurve_data['CH' + str(i)]['err'] = self.spectral_lcs_dict['err'][:,i]
-
-            ## Storing linear and GP parameters, if provided (None, otherwise)
-            all_lightcurve_data['CH' + str(i)]['lins'] = self.lin_pars
-            all_lightcurve_data['CH' + str(i)]['gp'] = self.gp_pars
-        
-        # Now, analysing them
-        _ = self.multi_fit_lcs(all_lightcurve_data, nthreads=nthreads)
-
-    def plot_parameter_spectrum(self, parameter, bins=None, post_size=10000, bin_method='mean', ppm=False, plot_white=False):
-        """Plot a fitted parameter as a function of wavelength (a spectrum).
-
-        Loads posterior samples for a parameter from all fitted channels,
-        optionally re-bins them in the wavelength direction, and plots
-        median with credible intervals as a function of wavelength.
-
-        Parameters
-        ----------
-        parameter : str
-            Name of the parameter to plot (e.g., 'p_p1', 'fp_p1', 'C1_p1').
-            Should match the parameter naming convention used by juliet.
-        bins : int or None, optional
-            Number of wavelength bins to use for the output spectrum. If ``None``
-            or equal to the native number of channels, no re-binning is performed.
-            Default is ``None``.
-        post_size : int, optional
-            Number of posterior samples to draw from each channel. Default is 10000.
-        bin_method : {'mean', 'median', 'weighted_average'}, optional
-            Method for combining posteriors across wavelength bins.
-            Default is ``'mean'``.
-        ppm : bool, optional
-            If ``True``, scale parameter values to ppm (multiply by 1e6).
-            Useful for small parameters like occultation depths. Default is ``False``.
-        plot_white : bool, optional
-            If ``True``, overplot the white-light (all-wavelength) parameter
-            value as a horizontal band with credible interval. Default is ``False``.
-
-        Returns
-        -------
-        fig : matplotlib.figure.Figure
-            The created figure.
-        axs : matplotlib.axes.Axes
-            The plot axes.
-
-        Notes
-        -----
-        Posterior samples are loaded from files named like
-        ``pout/CH<i>/*_posteriors.pkl``.
-        """
-        ## First, let's put all posteriros in a big 2D array
-        all_posteriors = []
-        for i in range( self.spectral_lcs_dict['lc'].shape[1] ):
-            fname = glob( self.pout + '/CH' + str(i) + '/*_posteriors.pkl' )[0]
-            post = pickle.load( open(fname, 'rb') )
-            all_posteriors.append( np.random.choice( post['posterior_samples'][parameter + '_CH' + str(i)], size=post_size ) )
-        posteriors = np.transpose( np.vstack( all_posteriors ) )
-
-        ## Calculating the white light parameter value
-        if bin_method == 'mean':
-            white_post = np.mean( posteriors, axis=1 )
-        elif bin_method == 'median':
-            white_post = np.median( posteriors, axis=1 )
-        elif bin_method == 'weighted_average':
-            white_post = np.average( posteriors, axis=1, weights=1/np.std(posteriors, axis=0)**2 )
-        else:
-            raise ValueError('>>> --- bin_method not recognized. Please use mean, median or weighted_average.')
-        
-        ### Quantiles
-        self.qua_white = juliet.utils.get_quantiles( white_post )
-
-        if ( bins == self.spectral_lcs_dict['lc'].shape[1] ) or ( bins == None ):
-            ## Wavelengths
-            self.wav, self.wav_bin = self.spectral_lcs_dict['wave'], self.spectral_lcs_dict['wave_bin']/2
-            
-            ## If bin size is the same as the column size, then we don't perform any binning
-            self.pars_med, self.pars_up, self.pars_lo = np.zeros( self.spectral_lcs_dict['lc'].shape[1] ), np.zeros( self.spectral_lcs_dict['lc'].shape[1] ), np.zeros( self.spectral_lcs_dict['lc'].shape[1] )
-            for i in range( self.spectral_lcs_dict['lc'].shape[1] ):
-                ## And, appending parameter values
-                qua = juliet.utils.get_quantiles( posteriors[:,i] )
-                self.pars_med[i], self.pars_up[i], self.pars_lo[i] = qua[0], qua[1] - qua[0], qua[0] - qua[2]
-
-        else:
-            ## Wavelengths
-            native_wav, native_wav_bin = self.spectral_lcs_dict['wave'], self.spectral_lcs_dict['wave_bin']
-
-            # Column location, for low resolution eclipse spectrum
-            col_in_1_ch = round( len(native_wav) / bins )
-            col_st = np.arange(0, len(native_wav)-col_in_1_ch, col_in_1_ch, dtype=int)
-            col_end = np.arange(0+col_in_1_ch, len(native_wav), col_in_1_ch, dtype=int)
-            if col_end[-1] != len(native_wav):
-                col_st = np.hstack(( col_st, col_end[-1] ))
-                col_end = np.hstack(( col_end, len(native_wav) ))
-
-            # For binning the spectrum
-            self.pars_med, self.pars_up, self.pars_lo = np.zeros( len(col_st) ), np.zeros( len(col_st) ), np.zeros( len(col_st) )
-            self.wav, self.wav_bin = np.zeros( len(col_st) ), np.zeros( len(col_end) )
-            # And performing actual binning
-            for i in range(len(col_st)):
-                ## Calculating the median of the posteriors in the bin
-                if bin_method == 'mean':
-                    fp12 = np.mean( posteriors[:,col_st[i]:col_end[i]], axis=1 )
-                elif bin_method == 'median':
-                    fp12 = np.median( posteriors[:,col_st[i]:col_end[i]], axis=1 )
-                elif bin_method == 'weighted_average':
-                    fp12 = np.average( posteriors[:,col_st[i]:col_end[i]], axis=1, weights=1/np.std( posteriors[:,col_st[i]:col_end[i]], axis=0 )**2 )
-                else:
-                    raise ValueError('>>> --- bin_method not recognized. Please use mean, median or weighted_average.')
-                
-                qua_fp12 = juliet.utils.get_quantiles(fp12)
-                self.pars_med[i], self.pars_up[i], self.pars_lo[i] = qua_fp12[0], qua_fp12[1]-qua_fp12[0], qua_fp12[0]-qua_fp12[2]
-                # For wavelength bins
-                if col_end[i] != len(native_wav):
-                    self.wav[i] = ( native_wav[col_st[i]] + native_wav[col_end[i]] ) / 2
-                    self.wav_bin[i] = np.abs( native_wav[col_st[i]] - native_wav[col_end[i]] ) / 2
-                else:
-                    self.wav[i] = ( native_wav[col_st[i]] + native_wav[col_end[i]-1] ) / 2
-                    self.wav_bin[i] = np.abs( native_wav[col_st[i]] - native_wav[col_end[i]-1] ) / 2
-        
-
-        # ---------------------------------------
-        #.    Now, plotting the spectrum
-        # ---------------------------------------
-        if ppm:
-            self.pars_med *= 1e6
-            self.pars_up *= 1e6
-            self.pars_lo *= 1e6
-            self.qua_white = ( self.qua_white[0]*1e6, self.qua_white[1]*1e6, self.qua_white[2]*1e6 )
-
-        fig, axs = plt.subplots()
-        axs.errorbar(self.wav, self.pars_med, yerr=[self.pars_lo, self.pars_up], xerr=self.wav_bin, fmt='o', c='orangered', mfc='white', elinewidth=1.5, capthick=1.5, capsize=3.)
-
-        if plot_white:
-            wav12 = np.linspace( min(self.wav)-max(self.wav_bin)*2, max(self.wav)+max(self.wav_bin)*2, 1000 )
-            axs.axhline(self.qua_white[0], color='cornflowerblue', ls='-', zorder=10)
-            axs.fill_between(wav12, self.qua_white[2], self.qua_white[1], color='cornflowerblue', alpha=0.3)
-
-        axs.set_xlim( min(self.wav)-max(self.wav_bin)*1.5, max(self.wav)+max(self.wav_bin)*1.5 )
-        
-        axs.set_xlabel('Wavelength')
-        axs.set_ylabel(parameter)
-        axs.set_title(f'Spectral {parameter} spectrum')
-        
-        return fig, axs
-    
-    def plot2Ddata(self, cmap='plasma'):
-        """Create a 2D heatmap of spectral light curves (flux vs time) vs wavelength.
-
-        Parameters
-        ----------
-        cmap : str, optional
-            Matplotlib colormap name. Default is ``'plasma'``.
-
-        Returns
-        -------
-        fig : matplotlib.figure.Figure
-            The created figure.
-        ax1 : matplotlib.axes.Axes
-            The plot axes.
-        im1 : matplotlib.image.AxesImage
-            The image object.
-        cbar : matplotlib.colorbar.Colorbar
-            The colorbar object.
-        """
-        # Adjusting the times to time since beginning in hours
-        tim = ( self.times - self.times[0] ) * 24
-
-        ## Preparing the data
-        norm_lcs = np.copy( self.lc )
-
-        fig, ax1 = plt.subplots( figsize=(7, 7) )
-        # Data
-        im1 = ax1.imshow(norm_lcs.T, interpolation='none', cmap=cmap, aspect = 'auto', extent=[tim[0], tim[-1], self.wavelengths[-1], self.wavelengths[0]])
-        im1.set_clim( [ np.nanmedian(norm_lcs) - 5*mad_std(norm_lcs), np.nanmedian(norm_lcs) + 5*mad_std(norm_lcs) ] )
-        plt.ylabel(r'Wavelength [$\mu$m]')
-        plt.xlabel('Time from beginning [h]')
-
-        # Colorbar:
-        divider = make_axes_locatable(ax1)
-        cax = divider.append_axes("right", size="5%", pad=0.05)
-
-        cbar = fig.colorbar(im1, shrink = 0.08, cax=cax)
-        cbar.ax.get_yaxis().labelpad = 20
-        cbar.ax.set_ylabel('Relative flux', rotation=270)#, fontsize = 15)
-
-        return fig, ax1, im1, cbar
-    
-    def plot2D_data_model_resids(self, cmap='plasma', detrend=False, binwidth=None, ppm=False, **kwargs):
-        """Create side-by-side 2D heatmaps of data, model, and residuals.
-
-        Loads the fitted models and residuals from all channels and creates
-        three synchronized heatmaps showing the full spectro-temporal evolution
-        of the data, fit quality, and systematics.
-
-        Parameters
-        ----------
-        cmap : str, optional
-            Matplotlib colormap name. Default is ``'plasma'``.
-        detrend : bool, optional
-            If ``True``, load and plot detrended data (subtracting GP and
-            linear systematics). Requires additional ``juliet`` processing
-            and may be slow. If ``False``, plot raw data. Default is ``False``.
-        binwidth : float or None, optional
-            Time binwidth (in days) for additional temporal binning of the
-            data/model/residuals. If ``None``, no binning is performed.
-            Default is ``None``.
-        ppm : bool, optional
-            If ``True``, express data and model in ppm relative to unity.
-            Residuals are always in ppm. Default is ``False``.
-        **kwargs : dict
-            Forwarded to the ``julietPlots`` constructor when ``detrend=True``
-            (e.g., ``N=1000`` for the number of posterior samples).
-
-        Returns
-        -------
-        fig : matplotlib.figure.Figure
-            The created figure with three subplots.
-        axs : ndarray
-            Array of three Axes objects (data, model, residuals).
-        im_list : list
-            List of three AxesImage objects (useful for colorbars).
-        """
-        # binwidth = None means that you should not perform any binning (in time)
-        # We don't perform any binning in wavelength direction -- please do that before fitting the light curves
-        # Detrend = True detrends the data and plot detrended model instead.
-        data = np.zeros( ( len(self.spectral_lcs_dict['wave']), len(self.times) ) )
-        models = np.zeros( data.shape )
-        resids = np.zeros( data.shape )
-
-        ## Loading the wavelengths
-        waves = self.spectral_lcs_dict['wave']
-
-        min_mod, max_mod = 1e10, -1e10
-        for c in range( self.spectral_lcs_dict['lc'].shape[1] ):
-            if not detrend:
-                ## First, we need data
-                tim, fl = np.loadtxt( self.pout + '/CH' + str(c) + '/lc.dat', usecols=(0,1), unpack=True )
-                ## And the model and residuals
-                model, resid = np.loadtxt( self.pout + '/CH' + str(c) + '/model_resids.dat', usecols=(0,1), unpack=True )
-            else:
-                ## Well, if detrend = True, then we need to detrend the data (that can take a while)
-                data = julietPlots(input_folder=self.pout + '/CH' + str(c), **kwargs)
-                ## We now need to detrend the data and the calculate the detrended model
-                data.detrend_data(phmin=0.8, instruments='CH' + str(c))
-                data.detrend_model(phmin=0.8, instruments='CH' + str(c), highres=False)
-
-                # Time data
-                ## Array that sort any array according to time
-                idx_time = np.argsort( data.dataset.times_lc['CH' + str(c)] )
-                tim = data.dataset.times_lc['CH' + str(c)][idx_time]
-                resid = ( data.dataset.data_lc['CH' + str(c)] - data.models_all_ins['CH' + str(c)][1] )[idx_time]
-
-                ## Detrended dataset
-                fl = data.detrended_data['CH' + str(c)][idx_time]
-
-                ## Detrended model
-                model = data.planet_only_models['CH' + str(c)][1][idx_time]
-
-            if ppm:
-                fl, model = ( fl - 1. ) * 1e6, ( model - 1. ) * 1e6
-            ## Residuals are always in ppm
-            resid = resid * 1e6
-
-            if binwidth is not None:
-                _, fl, _, _ = lcbin(time=tim, flux=fl, binwidth=binwidth)
-                _, model, _, _ = lcbin(time=tim, flux=model, binwidth=binwidth)
-                _, resid, _, _ = lcbin(time=tim, flux=resid, binwidth=binwidth)
-
-            # And putting them in a big array
-            data[c, :], models[c, :], resids[c, :] = fl, model, resid
-            
-            ## Calculating the minimum and maximum values of the model
-            if np.nanmin(model) < min_mod:
-                min_mod = np.nanmin(model)
-            if np.nanmax(model) > max_mod:
-                max_mod = np.nanmax(model)
-
-        # And, finally, the plotting
-        # Convering time to hours
-        tim = ( tim - tim[0] ) * 24
-        
-        # Colorbars
-        cmin1, cmax1 = min_mod-0.005*min_mod, max_mod+0.005*max_mod
-        norm1 = matplotlib.colors.Normalize(vmin=cmin1, vmax=cmax1, clip=True)
-        mapper1 = cm.ScalarMappable(norm=norm1, cmap=cmap)
-        mapper1.set_array([])
-
-        cmin2, cmax2 = np.nanmedian(resids)-3*mad_std(resids), np.nanmedian(resids)+3*mad_std(resids)
-        norm2 = matplotlib.colors.Normalize(vmin=cmin2, vmax=cmax2, clip=True)
-        mapper2 = cm.ScalarMappable(norm=norm2, cmap=cmap)
-        mapper2.set_array([])
-
-        # And plotting it
-        fig, axs = plt.subplots(nrows=1, ncols=3, figsize=(15,5), sharex=True, sharey=True)
-
-        ## First box: plotting the data 
-        im1 = axs[0].imshow(data, aspect='auto', cmap=cmap, interpolation='none', extent=[tim[0], tim[-1], waves[-1], waves[0]])
-        im1.set_clim([cmin1, cmax1])
-        
-        ## Second box: plotting the model
-        im2 = axs[1].imshow(models, aspect='auto', cmap=cmap, interpolation='none', extent=[tim[0], tim[-1], waves[-1], waves[0]])
-        im2.set_clim([cmin1, cmax1])
-
-        ## First colorbar
-        cbar1 = plt.colorbar(mapper1, ax=np.array([axs[0],axs[1]]))#, location='top')
-        if ppm:
-            cbar1.set_label('Relative flux [ppm]', rotation=270, labelpad=20)
-        else:
-            cbar1.set_label('Relative flux', rotation=270, labelpad=20)
-        cbar1.set_ticks(ticks=np.linspace(cmin1, cmax1, 7))
-        cbar1.set_ticklabels(ticklabels=[ "{:.3f}".format( i ) for i in np.linspace(cmin1, cmax1, 7) ] )
-
-        im3 = axs[2].imshow(resids, aspect='auto', cmap=cmap, interpolation='none', extent=[tim[0], tim[-1], waves[-1], waves[0]])
-        im3.set_clim([cmin2, cmax2])
-        cbar2 = plt.colorbar(mapper2, ax=axs[2])#, location='top')
-        cbar2.set_label('Residuals [ppm]', rotation=270, labelpad=20)
-
-        cbar2.set_ticks( ticks=np.linspace(cmin2, cmax2, 7) )
-        cbar2.set_ticklabels(ticklabels=[ "{:d}".format( int(i) ) for i in np.linspace(cmin2, cmax2, 7) ] )
-
-        fig.supxlabel('Time since beginning [hr]', fontsize=15)
-        axs[0].set_ylabel(r'Wavelength [$\mu$m]')
-
-        if detrend:
-            axs[0].set_title('Detrended data')
-        else:
-            axs[0].set_title('Data')
-        axs[1].set_title('Model')
-        axs[2].set_title('Residuals')
-
-        return fig, axs, [im1, im2, im3]
-    
-    def joint_fake_allan_deviation(self, binmax=10, method='pipe', timeunit=None):
-        """Plot combined noise-vs-binning curves across all spectroscopic channels.
-
-        Computes the "Allan deviation" (actually the MAD-based noise as a
-        function of binning) for each channel's residuals and overlays all
-        curves on a single plot. Also shows the white-noise expectation curve.
-
-        Parameters
-        ----------
-        binmax : int, optional
-            Maximum number of bins to test. Default is 10.
-        method : {'pipe', 'std', 'rms', 'astropy'}, optional
-            Noise estimator to use (passed to :func:`utils.fake_allan_deviation`).
-            Default is ``'pipe'`` (MAD-based).
-        timeunit : {'d', 'hr', 'min'} or None, optional
-            Time unit for the secondary x-axis. If ``None``, chosen automatically
-            based on data span. Default is ``None``.
-
-        Returns
-        -------
-        fig : matplotlib.figure.Figure
-            The created figure.
-        axs : matplotlib.axes.Axes
-            The plot axes (with primary x-axis for bin size and secondary
-            x-axis for time period).
-        """
-        # Creating a figure outside of the loop
-        fig, axs = plt.subplots()
-        
-        ## Looping over all channels
-        for c in tqdm(range( self.spectral_lcs_dict['lc'].shape[1] )):
-            times = np.loadtxt( self.pout + '/CH' + str(c) + '/lc.dat', usecols=0, unpack=True )
-            resids = np.loadtxt( self.pout + '/CH' + str(c) + '/model_resids.dat', usecols=1, unpack=True )
-            _, _, binsize, noise, white_noise_expec = fake_allan_deviation(times=times, residuals=resids, binmax=binmax, method=method, timeunit=timeunit, plot=False)
-
-            ## And plotting it over the main plot
-            ## First plotting the computed noise
-            if c == 0:
-                label1, label2 = 'Computed noise', 'White-noise expectation'
-            else:
-                label1, label2 = None, None
-            axs.plot(binsize, noise, color='dodgerblue', lw=0.7, label=label1, zorder=10)
-            ## Now plotting the white-noise expectation
-            axs.plot(binsize, white_noise_expec, color='orangered', lw=1., label=label2, zorder=20)
-
-        # Converting binsize to time units
-        time_binsize = binsize * np.nanmedian( np.diff(times) )
-
-        # First, let's estimate the time units we need from times array:
-        if timeunit is None:
-            if np.ptp(time_binsize) >= 1.:
-                ## If times duration is greater than 2 hours, we use days
-                time_unit_multiplication_factor = 1.     # Units are already in days
-                time_unit_label = 'Time period [d]'
-            elif ( np.ptp(time_binsize) > 5/24 ) and ( np.ptp(time_binsize) < 1. ):
-                ## If times duration is greater than 2 hours, but less than 2 days, we use hours
-                time_unit_multiplication_factor = 24.    # Converting days to hours
-                time_unit_label = 'Time period [hr]'
-            else:
-                ## If times duration is less than 2 hours, we use minutes
-                time_unit_multiplication_factor = 24 * 60
-                time_unit_label = 'Time period [min]'
-        else:
-            if timeunit == 'd':
-                time_unit_multiplication_factor = 1.
-                time_unit_label = 'Time period [d]'
-            elif timeunit == 'hr':
-                time_unit_multiplication_factor = 24.
-                time_unit_label = 'Time period [hr]'
-            elif timeunit == 'min':
-                time_unit_multiplication_factor = 24 * 60
-                time_unit_label = 'Time period [min]'
-            else:
-                raise ValueError("timeunit should be one of 'd', 'hr', or 'min'.")
-
-        # The following two functions will convert binsize to time (in minutes) and vice versa
-        def bin2time(binsize):
-            return binsize * np.nanmedian(np.diff(times)) * time_unit_multiplication_factor
-
-        def time2bin(bintime):
-            return bintime / ( np.nanmedian(np.diff(times)) * time_unit_multiplication_factor )
-
-        ## Adding secondary x-axis for time
-        secax = axs.secondary_xaxis('top', functions=(bin2time, time2bin))
-        secax.set_xlabel(time_unit_label, labelpad=10)
-
-        axs.set_xlim([ np.min(binsize), np.max(binsize) ])
-
-        axs.set_xscale('log')
-        axs.set_yscale('log')
-
-        axs.set_xlabel('Bin size [Number of points]')
-        axs.set_ylabel('Noise estimate [ppm]')
-
-        axs.legend()
-
-        return fig, axs
