@@ -1624,6 +1624,11 @@ class SpectralExtractor:
             wl = tr.info.get('wavelength')
             cols.append(fits.Column(name='wavelength', format='D',
                                     array=wl if wl is not None else np.full(tr.ncol, np.nan)))
+            if int(self.src.header.get('NOUTPUTS') or 1) > 1 and not self.src.transpose:
+                # readout amplifier of each column (for per-amplifier common modes)
+                from .covariance import amplifier_groups
+                cols.append(fits.Column(name='amp', format='I',
+                                        array=amplifier_groups(self.src, tr.cols)))
             hdus.append(fits.BinTableHDU.from_columns(cols, name=f'TRACE_O{o}'))
             if o in self.psfs:
                 hdus += self.psfs[o].to_hdus(f'_O{o}')
@@ -1696,6 +1701,9 @@ class Spectra:
         Mid-integration BJD_TDB - 2400000.5.
     flux, err, box, box_err, maskfrac, wavelength, cols, regressors : dict
         Per order.
+    amp : dict
+        Per order, for detectors read through several amplifiers (NIRCam):
+        the amplifier (0, 1, ...) of each column.
     contam : dict
         Per order (joint multi-order extraction only): flux of the other
         orders' models inside the aperture relative to the order's own.
@@ -1724,7 +1732,7 @@ class Spectra:
             self.flux, self.err, self.box, self.box_err = {}, {}, {}, {}
             self.maskfrac, self.wavelength, self.cols, self.regressors = {}, {}, {}, {}
             self.contam, self.extra, self.field = {}, {}, {}
-            self.satgrp, self.ngroups = {}, None
+            self.satgrp, self.ngroups, self.amp = {}, None, {}
             for o in self.orders:
                 s = f'_O{o}'
                 self.flux[o] = np.asarray(h['FLUX' + s].data, float)
@@ -1745,6 +1753,8 @@ class Spectra:
                     self.ngroups = h['SATGRP' + s].header.get('NGROUPS')
                 tr = h['TRACE' + s].data
                 self.cols[o] = np.asarray(tr['col'])
+                if 'amp' in tr.names:
+                    self.amp[o] = np.asarray(tr['amp'], int)
                 self.wavelength[o] = (np.asarray(h['WAVE' + s].data, float) if 'WAVE' + s in h
                                       else np.asarray(tr['wavelength']))
                 reg = h['REG' + s].data

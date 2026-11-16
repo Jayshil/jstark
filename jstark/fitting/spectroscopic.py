@@ -20,7 +20,7 @@ import warnings
 import numpy as np
 from astropy.table import Table
 
-from .fit import BroadbandFit
+from .fit import BroadbandFit, _as_list, _per_dataset
 from .lightcurve import as_lightcurves, check_name
 from .priors import normalise_priors
 
@@ -149,6 +149,23 @@ class SpectroscopicFit:
         detector or next to saturated columns.
     linear, gp, ramp, gp_kernel, ld_laws, nuisance, standardise, clip, max_nan_frac
         As in :class:`BroadbandFit`, used for every bin (dicts per dataset).
+    common_mode : BroadbandFit, dict or None
+        Common-mode correction (off by default). A finished
+        :class:`BroadbandFit` (its datasets of the same names are used;
+        :meth:`BroadbandFit.common_mode`), or ``{name: BroadbandFit or
+        (times, cm)}`` per dataset. Datasets without one are fitted as
+        they are. Per channel group (e.g. NIRCam amplifiers): a fit of the
+        white light of each group (datasets ``A1``, ``A2``, ... or
+        ``<name>A1``, ...: :meth:`LightCurves.split`) gives every channel
+        the common mode of its group
+        (:meth:`BroadbandFit.channel_common_mode`); ``cm`` may also be
+        ``(nint, nchan)``.
+    cm_mode : {'divide', 'regressor'}
+        ``'divide'``: every channel is divided by the common mode before
+        binning; ``'regressor'``: the common mode becomes the linear
+        regressor ``cm`` of every bin (free coefficient per bin, so the
+        correction may scale with wavelength). The integrations missing in
+        the white-light fit are dropped.
 
     Examples
     --------
@@ -169,7 +186,7 @@ class SpectroscopicFit:
     def __init__(self, datasets, priors=None, out_folder='spectroscopic', edges=None, nbins=None,
                  min_cover=0.5, linear=None, gp=None, ramp=None, gp_kernel='matern',
                  ld_laws='quadratic', nuisance=None, standardise=True, clip=None,
-                 max_nan_frac=0.5, verbose=True):
+                 max_nan_frac=0.5, common_mode=None, cm_mode='divide', verbose=True):
         if not datasets:
             raise ValueError('No datasets given.')
         self.datasets = {}
@@ -189,6 +206,14 @@ class SpectroscopicFit:
         self.min_cover = float(min_cover)
         self.max_nan_frac = max_nan_frac
         self.verbose = verbose
+        if cm_mode not in ('divide', 'regressor'):
+            raise ValueError("cm_mode must be 'divide' or 'regressor'.")
+        self.cm_mode = cm_mode
+        self.common_mode = self._apply_common_mode(common_mode)
+        if self.common_mode and cm_mode == 'regressor':
+            lin = _per_dataset(linear, self.names, 'linear')
+            linear = {n: _as_list(v) + (['cm'] if n in self.common_mode else [])
+                      for n, v in lin.items()}
         self.options = dict(linear=linear, gp=gp, ramp=ramp, gp_kernel=gp_kernel, ld_laws=ld_laws,
                             nuisance=nuisance, standardise=standardise, clip=clip,
                             max_nan_frac=max_nan_frac)
@@ -198,6 +223,43 @@ class SpectroscopicFit:
             n = sum(1 for b in self.bins if b['datasets'])
             print(f'{len(self.bins)} bins, {n} covered by at least one dataset '
                   f'({self.edges[0, 0]:.4g}-{self.edges[-1, 1]:.4g} um); datasets {self.names}')
+
+    def _apply_common_mode(self, source):
+        """Correct the datasets by their common mode; returns ``{name: (times, cm)}``."""
+        if source is None:
+            return {}
+        out = {}
+        for n in self.names:
+            s = source.get(n) if isinstance(source, dict) else source
+            if s is None:
+                warnings.warn(f'No common mode given for dataset {n}; fitted without one.')
+                continue
+            if isinstance(s, BroadbandFit):
+                lc0 = self.datasets[n]
+                pre = None
+                if n not in s.names and lc0.groups is not None:
+                    labels = np.unique(lc0.groups[lc0.groups >= 0])
+                    pre = next((p for p in (f'{n}A', 'A')
+                                if all(f'{p}{g + 1}' in s.names for g in labels)), None)
+                if pre is not None:
+                    t, cm = s.channel_common_mode(lc0, prefix=pre)
+                elif n in s.names:
+                    t, cm = s.common_mode(n)
+                else:
+                    warnings.warn(f'The common-mode fit has no dataset {n}; fitted without one.')
+                    continue
+            else:
+                t, cm = s
+            t, cm = np.asarray(t, float), np.asarray(cm, float)
+            lc = self.datasets[n].apply_common_mode(t, cm, mode=self.cm_mode)
+            self.datasets[n] = lc
+            out[n] = (t, cm)
+            if self.verbose:
+                miss = lc.meta['common_mode']['n_missing']
+                kind = 'per channel group' if np.ndim(cm) == 2 else 'white light'
+                print(f'{n}: common mode ({self.cm_mode}, {kind}) from {t.size} integrations'
+                      + (f'; {miss} integrations without one are dropped' if miss else ''))
+        return out
 
     # ------------------------------------------------------------------
     # Bins
@@ -236,11 +298,8 @@ class SpectroscopicFit:
         """``{name: LightCurves}`` (one channel each) of bin ``i``."""
         b = self.bins[i]
         out = {}
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')     # per-channel regressors are not carried over
-            for n in b['datasets']:
-                out[n] = self.datasets[n].bin(edges=[b['lo'], b['hi']],
-                                              max_nan_frac=self.max_nan_frac)
+        for n in b['datasets']:
+            out[n] = self.datasets[n].bin(edges=[b['lo'], b['hi']], max_nan_frac=self.max_nan_frac)
         return out
 
     def bin_fit(self, i):
@@ -280,8 +339,14 @@ class SpectroscopicFit:
 
     def _write_json(self, sampler, fit_kwargs):
         os.makedirs(self.out_folder, exist_ok=True)
+        if self.common_mode:
+            np.savez(os.path.join(self.out_folder, 'common_mode.npz'),
+                     **{f'{n}__{k}': v for n, (t, cm) in self.common_mode.items()
+                        for k, v in (('t', t), ('cm', cm))})
         rec = dict(datasets=self.names, sampler=sampler, min_cover=self.min_cover,
                    fit_kwargs={k: repr(v) for k, v in fit_kwargs.items()},
+                   common_mode=dict(mode=self.cm_mode, datasets=list(self.common_mode))
+                   if self.common_mode else None,
                    options={k: v for k, v in self.options.items() if k != 'nuisance'},
                    bins=[{k: b[k] for k in ('index', 'lo', 'hi', 'wave', 'datasets', 'cover')}
                          | {'folder': os.path.basename(b['folder'])} for b in self.bins])

@@ -83,10 +83,14 @@ class LightCurves:
         Default dataset name.
     meta : dict or None
         Free-form information (mode, file, ...).
+    groups : array ``(nchan,)`` of int or None
+        A group label (>= 0) per channel, e.g. the readout amplifier of each
+        column (read from NIRCam spectra). Used by :meth:`split` and for
+        per-group common modes; -1 means no group.
     """
 
     def __init__(self, times, flux, err, wavelength=None, wave_edges=None, regressors=None,
-                 index=None, name=None, meta=None):
+                 index=None, name=None, meta=None, groups=None):
         t = np.asarray(times, float).ravel()
         f = np.asarray(flux, float)
         e = np.asarray(err, float)
@@ -114,6 +118,11 @@ class LightCurves:
             raise ValueError('index must have one entry per integration.')
         self.name = name
         self.meta = dict(meta or {})
+        if groups is not None:
+            groups = np.asarray(groups, int).ravel()
+            if groups.size != nch:
+                raise ValueError(f'{groups.size} group labels for {nch} channels.')
+        self.groups = groups
         self.regressors, self.channel_regressors = {}, {}
         for k, v in (regressors or {}).items():
             self.add_regressor(k, v)
@@ -127,7 +136,8 @@ class LightCurves:
 
         ``method='optimal'`` uses the main extraction (``FLUX_O<n>``),
         ``'box'`` the box extraction. All per-integration regressors of the
-        extraction (``dy``, ``ds``, ``dx``, ``chi2``, ...) are kept.
+        extraction (``dy``, ``ds``, ``dx``, ``chi2``, ...) are kept. For
+        NIRCam the readout amplifier of each column becomes :attr:`groups`.
         """
         from ..extraction.extractor import Spectra
         s = Spectra(fname)
@@ -148,7 +158,7 @@ class LightCurves:
         meta = dict(mode=s.mode, order=o, method=method, file=fname, cols=s.cols[o],
                     satgrp=s.satgrp.get(o), ngroups=s.ngroups, contam=s.contam.get(o))
         return cls(s.bjd, f, e, wavelength=s.wavelength[o], regressors=regs, index=s.gidx,
-                   name=name, meta=meta)
+                   name=name, meta=meta, groups=s.amp.get(o))
 
     @classmethod
     def from_photometry(cls, fname, method='psf', pld=None, wavelength=None, name=None):
@@ -262,6 +272,8 @@ class LightCurves:
             return np.stack([(ph == k).astype(float) for k in (1, 2, 3)], axis=1), \
                 ['phase4a', 'phase4b', 'phase4c']
         if name in self.channel_regressors:
+            if channel is None and self.nchan == 1:
+                channel = 0
             if channel is None:
                 raise ValueError(f'{name!r} is a per-channel regressor; give a channel.')
             return self.channel_regressors[name][:, channel][:, None], [name]
@@ -354,7 +366,8 @@ class LightCurves:
         lc = LightCurves(self.times, self.flux[:, keep], self.err[:, keep],
                          wavelength=self.wavelength[keep], wave_edges=self.wave_edges[keep],
                          regressors=dict(self.regressors), index=self.index, name=self.name,
-                         meta=dict(self.meta, channels=np.flatnonzero(keep).tolist()))
+                         meta=dict(self.meta, channels=np.flatnonzero(keep).tolist()),
+                         groups=None if self.groups is None else self.groups[keep])
         for k, v in self.channel_regressors.items():
             lc.add_regressor(k, v[:, keep], per_channel=True)
         return lc
@@ -375,7 +388,10 @@ class LightCurves:
             One channel per bin (empty bins are dropped). Bin wavelengths are
             the mean wavelength of the summed channels; ``wave_edges`` are
             the given edges (or the outer channel edges with ``nbins``).
-            Per-channel regressors are not carried over.
+            Per-channel regressors become the mean over the bin's channels,
+            weighted by their median flux (so a per-channel common mode
+            becomes that of the summed light curve). A bin's group is the
+            group of its channels, or -1 if they belong to several.
         """
         good = self.good_channels(max_nan_frac)
         if edges is not None:
@@ -389,6 +405,8 @@ class LightCurves:
             idx = np.full(self.nchan, -1)
             idx[gidx] = (np.arange(gidx.size) * nb) // gidx.size
         f, e, wl, we, keep = [], [], [], [], []
+        creg = {k: [] for k in self.channel_regressors}
+        grp = []
         for b in range(nb):
             sel = (idx == b) & good
             if not sel.any():
@@ -401,14 +419,23 @@ class LightCurves:
             else:
                 we.append((np.nanmin(self.wave_edges[sel, 0]), np.nanmax(self.wave_edges[sel, 1])))
             keep.append(np.flatnonzero(sel))
+            if creg:
+                wt = np.nan_to_num(np.nanmedian(self.flux[:, sel], axis=0))
+                wt = wt / wt.sum() if wt.sum() > 0 else np.full(wt.size, 1. / wt.size)
+                for k, v in self.channel_regressors.items():
+                    creg[k].append(v[:, sel] @ wt)
+            if self.groups is not None:
+                g = np.unique(self.groups[sel])
+                grp.append(int(g[0]) if g.size == 1 else -1)
         if not f:
             raise ValueError('All bins are empty.')
-        if self.channel_regressors:
-            warnings.warn('Per-channel regressors are not carried over to binned light curves.')
         meta = dict(self.meta, binned_from=[k.tolist() for k in keep])
-        return LightCurves(self.times, np.stack(f, 1), np.stack(e, 1), wavelength=wl,
-                           wave_edges=we, regressors=dict(self.regressors), index=self.index,
-                           name=self.name, meta=meta)
+        lc = LightCurves(self.times, np.stack(f, 1), np.stack(e, 1), wavelength=wl,
+                         wave_edges=we, regressors=dict(self.regressors), index=self.index,
+                         name=self.name, meta=meta, groups=grp if self.groups is not None else None)
+        for k, v in creg.items():
+            lc.add_regressor(k, np.stack(v, 1), per_channel=True)
+        return lc
 
     # ------------------------------------------------------------------
     # Selecting integrations
@@ -423,10 +450,99 @@ class LightCurves:
         lc = LightCurves(self.times[keep], self.flux[keep], self.err[keep],
                          wavelength=self.wavelength, wave_edges=self.wave_edges,
                          regressors={k: v[keep] for k, v in self.regressors.items()},
-                         index=self.index[keep], name=self.name, meta=dict(self.meta))
+                         index=self.index[keep], name=self.name, meta=dict(self.meta),
+                         groups=self.groups)
         for k, v in self.channel_regressors.items():
             lc.add_regressor(k, v[keep], per_channel=True)
         return lc
+
+    def match_series(self, times, values, tol=None):
+        """Values of a time series at this dataset's integrations (NaN where it has none).
+
+        ``times`` are matched to :attr:`times` within ``tol`` (default a
+        tenth of the median time step), so a series from a fit that dropped
+        integrations (trimmed, clipped, excluded) lines up correctly.
+        """
+        ts = np.asarray(times, float)
+        v = np.asarray(values, float)
+        if ts.shape[0] != v.shape[0]:
+            raise ValueError('times and values do not match.')
+        if tol is None:
+            dt = np.diff(np.sort(self.times))
+            dt = dt[dt > 0]
+            tol = 0.1 * (np.median(dt) if dt.size else 1e-6)
+        o = np.argsort(ts)
+        ts, v = ts[o], v[o]
+        out = np.full((self.nint,) + v.shape[1:], np.nan)
+        if not ts.size:
+            return out
+        j = np.clip(np.searchsorted(ts, self.times), 1, ts.size - 1) if ts.size > 1 \
+            else np.zeros(self.nint, int)
+        if ts.size > 1:
+            j = np.where(np.abs(ts[j - 1] - self.times) < np.abs(ts[j] - self.times), j - 1, j)
+        ok = np.abs(ts[j] - self.times) <= tol
+        out[ok] = v[j[ok]]
+        return out
+
+    def apply_common_mode(self, times, values, mode='divide', name='cm'):
+        """New object corrected by (or regressing on) a common-mode time series.
+
+        Parameters
+        ----------
+        times, values : array
+            The common mode (e.g. from :meth:`BroadbandFit.common_mode`),
+            normalised to a median of 1; matched by time
+            (:meth:`match_series`). ``values`` is ``(n,)`` (one for all
+            channels) or ``(n, nchan)`` (one per channel, e.g. from
+            :meth:`BroadbandFit.channel_common_mode`).
+        mode : {'divide', 'regressor'}
+            ``'divide'``: every channel (flux and error) is divided by it;
+            ``'regressor'``: it is stored as the regressor ``name`` (list it
+            in ``linear`` to use it; per channel if ``values`` is 2D).
+            Integrations without a value are NaN (divide) or have a NaN
+            regressor; fits drop them either way.
+        """
+        cm = self.match_series(times, values)
+        if cm.ndim == 2 and cm.shape[1] != self.nchan:
+            raise ValueError(f'The common mode has {cm.shape[1]} channels, the data {self.nchan}.')
+        cm2 = cm[:, None] if cm.ndim == 1 else cm
+        if mode == 'divide':
+            lc = LightCurves(self.times, self.flux / cm2, self.err / cm2,
+                             wavelength=self.wavelength, wave_edges=self.wave_edges,
+                             regressors=dict(self.regressors), index=self.index, name=self.name,
+                             meta=dict(self.meta), groups=self.groups)
+            for k, v in self.channel_regressors.items():
+                lc.add_regressor(k, v, per_channel=True)
+        elif mode == 'regressor':
+            lc = self.subset(np.ones(self.nint, bool))
+            lc.add_regressor(name, cm, per_channel=cm.ndim == 2)
+        else:
+            raise ValueError("mode must be 'divide' or 'regressor'.")
+        lc.meta['common_mode'] = dict(mode=mode,
+                                      n_missing=int(np.sum(~np.all(np.isfinite(cm2), axis=1))))
+        return lc
+
+    def split(self, groups=None, prefix='A'):
+        """One dataset per channel group (e.g. per readout amplifier).
+
+        ``groups``: a label per channel (default :attr:`groups`). Returns
+        ``{f'{prefix}{g + 1}': LightCurves}`` for every label ``g >= 0``
+        (``'A1'`` ... ``'A4'`` for the four NIRCam amplifiers), e.g. to fit
+        the white light of each amplifier for
+        :meth:`BroadbandFit.channel_common_mode`.
+        """
+        g = self.groups if groups is None else np.asarray(groups, int).ravel()
+        if g is None:
+            raise ValueError('This dataset has no channel groups; give groups=.')
+        if g.size != self.nchan:
+            raise ValueError(f'{g.size} group labels for {self.nchan} channels.')
+        out = {}
+        for k in np.unique(g[g >= 0]):
+            name = check_name(f'{prefix}{k + 1}')
+            lc = self.select_channels(channels=np.flatnonzero(g == k))
+            lc.name = name
+            out[name] = lc
+        return out
 
     def exclude(self, ints=None, time_range=None):
         """Remove integrations.

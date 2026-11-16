@@ -46,7 +46,10 @@ Useful methods (each returns a new object):
   of the white light.
 * ``add_regressor(name, values)``: any array ``(nint,)`` or ``(nint, k)``;
   ``per_channel=True`` for an array ``(nint, nchan)`` with one column per
-  channel.
+  channel (``bin`` averages it over the summed channels, weighted by their
+  flux).
+* ``split()``: one dataset per channel group (NIRCam: per readout
+  amplifier, ``A1`` ... ``A4``).
 
 Built-in regressors: ``time`` (days from the middle of the dataset),
 ``time2``, ``time3`` and ``phase4`` (three indicator columns for
@@ -219,6 +222,96 @@ two SOSS orders fall into their own bins by wavelength.
                           linear=['time', 'dy'], ramp=1)
     spec = sf.run(nproc=12)          # in a script: under if __name__ == '__main__':
     spec.plot(white=bb)
+
+``channel_priors(fix=...)`` takes name prefixes that end at an underscore:
+``'GP'`` carries every GP hyperparameter, ``'GP_rho'`` only the Matern
+timescale, ``'ramptau'`` the ramp timescale, ``'GP_rho_V1'`` one parameter
+of one dataset. Fixing the GP timescale from the white light and leaving
+the amplitude free in each bin (added automatically when you give none) is
+the usual way to model red noise shared by all wavelengths:
+
+.. code-block:: python
+
+    bb = BroadbandFit(lcs, priors=pri, out_folder='white', gp='time')
+    bb.fit(nthreads=8)
+    pri_ch = bb.channel_priors(fix=('P', 't0', 'a', 'b', 'ecc', 'omega', 'GP_rho'))
+    pri_ch['p_p1'] = ('uniform', [0.05, 0.25])
+    sf = SpectroscopicFit(lcs, priors=pri_ch, out_folder='spectrum', nbins=60, gp='time')
+
+With ``mode='normal'`` the white-light posteriors become normal priors
+instead of fixed values. ``planet='p1'`` restricts the planet parameters to
+one planet; dataset parameters (GP, ramp, ...) are kept.
+
+Common-mode correction (off by default). The common mode of a dataset is
+its white light divided by the white-light planet model
+(:meth:`~jstark.fitting.BroadbandFit.common_mode`): the systematics shared
+by all wavelengths, plus the white-light noise. It is matched to the
+spectroscopic integrations by time; integrations the white-light fit did
+not use are dropped.
+
+.. code-block:: python
+
+    sf = SpectroscopicFit(lcs, priors=pri_ch, out_folder='spectrum_cm', nbins=60,
+                          common_mode=bb, cm_mode='divide')      # or 'regressor'
+
+* ``cm_mode='divide'``: every channel is divided by the common mode before
+  binning (the usual approach).
+* ``cm_mode='regressor'``: the common mode is the linear regressor ``cm``
+  of every bin, with a free coefficient per bin, so the correction may
+  scale with wavelength.
+* ``common_mode`` may also be ``{name: BroadbandFit or (times, cm)}`` per
+  dataset; datasets without one are fitted as they are.
+
+**Per amplifier (NIRCam).** The 1/f noise left after Stage 1 is mostly
+shared by the columns of one readout amplifier (512 columns, ~0.5 µm of
+the F322W2 or F444W spectrum) and differs between amplifiers, so one
+white-light common mode cannot remove it. NIRCam spectra record the
+amplifier of each column (:attr:`LightCurves.groups`);
+:meth:`~jstark.fitting.LightCurves.split` gives one dataset per amplifier
+(``A1`` ... ``A4``). Fit their white lights jointly, each with its own depth
+and limb darkening (a common planet model would leave the difference in
+depth between amplifiers in the common mode and shift whole amplifiers in
+the spectrum), and pass that fit as the common mode: every channel is then
+corrected by the common mode of its own amplifier, and bins may straddle
+amplifier boundaries.
+
+.. code-block:: python
+
+    lc = LightCurves.from_spectra('<exposure>_nrcalong_spectra.fits', name='NRC')
+    amps = lc.split()                                   # {'A1': ..., 'A4': ...}
+    pri_amp = dict(orbit, **{f'p_p1_{a}': ('uniform', [0.05, 0.25]) for a in amps},
+                   **{f'{q}_{a}': ('uniform', [0, 1]) for a in amps for q in ('q1', 'q2')})
+    bb = BroadbandFit(amps, priors=pri_amp, out_folder='white_amps', linear=['time', 'phase4'])
+    bb.fit(nthreads=8)
+    sf = SpectroscopicFit({'NRC': lc}, priors=pri_ch, out_folder='spectrum_cm', edges=edges,
+                          linear=['time', 'phase4'], common_mode=bb, cm_mode='divide')
+
+The level of each amplifier's part of the spectrum then comes from that
+amplifier's white-light depth (the first consequence below, per amplifier).
+For several visits name the amplifier datasets ``<visit>A1`` ...
+(``lc.split(prefix='V1A')``). :meth:`BroadbandFit.channel_common_mode`
+returns the per-channel common mode ``(times, (nint, nchan))`` directly.
+
+Two consequences to keep in mind:
+
+* The spectrum keeps its shape but takes its level from the white light.
+  An error in the white-light depth (e.g. from systematics the white-light
+  model does not describe) shifts every bin by the same amount.
+* Each bin is part of the white light, so dividing by the common mode also
+  removes a share of the bin's own noise (about the bin's fraction of the
+  white light). Its residuals then look slightly too quiet. This is
+  negligible for many bins (1% of the white light per bin for 100 bins),
+  but not for a handful of wide bins.
+
+When it helps: the depths hardly change (the bin's share of the
+white-light transit is replaced by the fitted one, which agrees with it);
+what changes is the noise left in the bins. On WASP-39 b (PRISM, SOSS and
+NIRCam at R = 100) depths moved by a few ppm and errors by under 2%: the
+shared noise is small next to each bin's own. With a few wide bins on
+NIRCam, the residuals without a common mode were red (beta ~2.2, errors
+too small) and the common mode made them white (errors then ~25% smaller,
+but relative to the white-light level). Check ``sf.diagnostics()`` (beta)
+without it first.
 
 Bins:
 

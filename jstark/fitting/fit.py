@@ -10,6 +10,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import warnings
 
 import numpy as np
@@ -515,6 +516,53 @@ class BroadbandFit:
             out['index'] = idx
         return out
 
+    def common_mode(self, name, nsamples=500):
+        """Common-mode time series of one dataset: the data divided by the planet model.
+
+        This is the white light without its transit (or eclipse): the
+        systematics shared by all wavelengths plus the white-light noise,
+        normalised to a median of 1. Pass it to :class:`SpectroscopicFit`
+        (``common_mode=``) or :meth:`LightCurves.apply_common_mode`.
+
+        Returns
+        -------
+        times, cm : ndarray
+            Sorted in time (the integrations used in this fit).
+        """
+        r = self.residuals(name, nsamples=nsamples, components=True)
+        cm = r['y'] / r['planet']
+        return r['t'], cm / np.nanmedian(cm)
+
+    def channel_common_mode(self, lc, prefix='A', nsamples=500):
+        """Per-channel common mode of ``lc`` from per-group white-light fits.
+
+        This fit must hold one dataset per channel group of ``lc``, named as
+        :meth:`LightCurves.split` names them (``f'{prefix}{g + 1}'``), e.g.
+        the white light of each NIRCam amplifier, each with its own depth
+        and limb darkening. Every channel gets the common mode of its group.
+
+        Returns
+        -------
+        times, cm : ndarray
+            ``lc.times`` and ``(nint, nchan)``; NaN in integrations a group
+            fit did not use. Pass ``{name: (times, cm)}`` as
+            ``SpectroscopicFit(common_mode=...)``.
+        """
+        if lc.groups is None:
+            raise ValueError('lc has no channel groups (LightCurves.groups).')
+        labels = np.unique(lc.groups[lc.groups >= 0])
+        missing = [f'{prefix}{g + 1}' for g in labels if f'{prefix}{g + 1}' not in self.names]
+        if missing:
+            raise ValueError(f'No dataset {missing} in this fit (datasets {self.names}).')
+        cm = np.full((lc.nint, lc.nchan), np.nan)
+        for g in labels:
+            t, c = self.common_mode(f'{prefix}{g + 1}', nsamples=nsamples)
+            cm[:, lc.groups == g] = lc.match_series(t, c)[:, None]
+        if np.any(lc.groups < 0):
+            warnings.warn(f'{int(np.sum(lc.groups < 0))} channels without a group get no '
+                          'common mode (NaN: left out of the bins).')
+        return lc.times.copy(), cm
+
     def save_residuals(self, fname=None, nsamples=500):
         """Save data, model, planet model and residuals of every dataset (``.npz``).
 
@@ -574,14 +622,19 @@ class BroadbandFit:
         Parameters
         ----------
         fix : sequence of str
-            Parameter types to carry over (default: the orbit and geometry,
-            ``P``, ``t0``, ``a``/``rho``, ``b``/``inc``, eccentricity terms
-            and per-transit times).
+            Parameters to carry over, as name prefixes ending at an
+            underscore (default: the orbit and geometry, ``P``, ``t0``,
+            ``a``/``rho``, ``b``/``inc``, eccentricity terms and per-transit
+            times). ``'GP'`` takes every GP hyperparameter, ``'GP_rho'``
+            only the Matern timescale (the amplitude stays as you give it
+            per bin), ``'ramptau'`` the ramp timescale, ``'GP_rho_V1'``
+            one parameter of one dataset.
         mode : {'fixed', 'normal'}
             ``'fixed'``: fix each to its posterior median; ``'normal'``:
             normal priors with the posterior median and standard deviation.
         planet : str or None
-            Only this planet (e.g. ``'p1'``); default all.
+            Only this planet's parameters (e.g. ``'p1'``); default all.
+            Dataset parameters (GP, ramp, ...) are not affected.
 
         Returns
         -------
@@ -591,10 +644,13 @@ class BroadbandFit:
         self._require()
         if mode not in ('fixed', 'normal'):
             raise ValueError("mode must be 'fixed' or 'normal'.")
+        fix = (fix,) if isinstance(fix, str) else tuple(fix)
         out = {}
         for k, p in self.priors.items():
-            parts = k.split('_')
-            if parts[0] not in fix or (planet and planet not in parts and k != 'rho'):
+            if not any(k == f or k.startswith(f + '_') for f in fix):
+                continue
+            tags = [x for x in k.split('_')[1:] if re.fullmatch(r'p\d+', x)]
+            if planet and tags and planet not in tags:
                 continue
             v = self.values(k)
             if k in self.posteriors:
