@@ -10,6 +10,9 @@ Main classes
 SpectralExtractor
     Trace, background, PSF and extraction of every order of a spectroscopic
     exposure; writes one spectra file per segment and a combined file.
+VisitExtractor
+    The exposures of one visit; by default one PSF model fitted jointly from
+    all of them (``shared_psf=True``), each exposure extracted separately.
 Spectra
     The combined extracted spectra (white light, binned light curves).
 Photometry
@@ -26,9 +29,9 @@ subtracts field-star traces (:mod:`jstark.extraction.contamination`).
 from .source import ExposureSource  # noqa: F401
 from .trace import Trace, find_trace  # noqa: F401
 from .psf import SplinePSF  # noqa: F401
-from .extractor import SpectralExtractor, Spectra  # noqa: F401
+from .extractor import SpectralExtractor, VisitExtractor, Spectra  # noqa: F401
 from .metrics import p2p_sigma, p2p_noise  # noqa: F401
 from .photometry import Photometry, PhotometryResult, ApPhoto  # noqa: F401
 
-__all__ = ['SpectralExtractor', 'Spectra', 'Photometry', 'PhotometryResult', 'ApPhoto',
+__all__ = ['SpectralExtractor', 'VisitExtractor', 'Spectra', 'Photometry', 'PhotometryResult', 'ApPhoto',
            'ExposureSource', 'Trace', 'SplinePSF']

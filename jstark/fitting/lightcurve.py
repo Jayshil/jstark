@@ -566,6 +566,172 @@ class LightCurves:
                                                        n=int(drop.sum())))
         return lc
 
+    @classmethod
+    def concatenate(cls, lcs, name=None, common_channels=False):
+        """Join consecutive exposures of one visit into one dataset.
+
+        For a time series split into several exposures (e.g. the WASP-43 b
+        MIRI phase curve, three exposures), which must share one baseline:
+        fitting them as separate datasets would give each its own flux
+        offset, which trades off against a phase curve.
+
+        Parameters
+        ----------
+        lcs : list of LightCurves
+            In time order, with the same channels (wavelengths).
+        name : str or None
+            Dataset name (default: that of the first).
+        common_channels : bool
+            Keep only the channels whose wavelengths (to 1e-6 um) are in
+            every exposure, e.g. when each exposure's extraction kept a
+            slightly different column range. Otherwise the channels must
+            match exactly.
+
+        Returns
+        -------
+        LightCurves
+            ``index`` continues across exposures (exposure ``k`` starts after
+            the last integration number of ``k - 1``), so :meth:`exclude`
+            uses visit-wide integration numbers. Regressors present in every
+            exposure are kept; the 2D regressor ``expstep`` (one column per
+            exposure after the first, 1 inside that exposure) is added, so
+            ``linear=['expstep']`` fits a flux step per exposure.
+            ``meta['exposures']`` lists the integration-number range of each.
+        """
+        lcs = list(lcs)
+        if len(lcs) < 2:
+            raise ValueError('Give at least two exposures.')
+        if common_channels:
+            keys = [set(np.round(lc.wavelength, 6)) for lc in lcs]
+            common = set.intersection(*keys)
+            if not common:
+                raise ValueError('The exposures have no channel in common.')
+            lcs = [lc.select_channels(channels=np.flatnonzero(np.isin(np.round(lc.wavelength, 6),
+                                                                      list(common))))
+                   for lc in lcs]
+        ref = lcs[0]
+        for lc in lcs[1:]:
+            if lc.nchan != ref.nchan or not np.allclose(lc.wavelength, ref.wavelength,
+                                                        equal_nan=True):
+                raise ValueError('The exposures do not have the same channels.')
+        idx, off, ranges = [], 0, []
+        for lc in lcs:
+            i = np.asarray(lc.index) - np.min(lc.index) + off
+            idx.append(i)
+            ranges.append((int(i.min()), int(i.max()) + 1))
+            off = int(i.max()) + 1
+        keys = [k for k in ref.regressors if all(k in lc.regressors for lc in lcs)]
+        ckeys = [k for k in ref.channel_regressors if all(k in lc.channel_regressors for lc in lcs)]
+        step = np.zeros((sum(lc.nint for lc in lcs), len(lcs) - 1))
+        n0 = 0
+        for k, lc in enumerate(lcs):
+            if k:
+                step[n0:n0 + lc.nint, k - 1] = 1.
+            n0 += lc.nint
+        regs = {k: np.concatenate([lc.regressors[k] for lc in lcs]) for k in keys}
+        regs['expstep'] = step
+        out = cls(np.concatenate([lc.times for lc in lcs]),
+                  np.concatenate([lc.flux for lc in lcs]), np.concatenate([lc.err for lc in lcs]),
+                  wavelength=ref.wavelength, wave_edges=ref.wave_edges, regressors=regs,
+                  index=np.concatenate(idx), name=name or ref.name,
+                  meta=dict(ref.meta, exposures=ranges,
+                            files=[lc.meta.get('file') for lc in lcs]),
+                  groups=ref.groups)
+        for k in ckeys:
+            out.add_regressor(k, np.concatenate([lc.channel_regressors[k] for lc in lcs]),
+                              per_channel=True)
+        if np.any(np.diff(out.times) <= 0):
+            warnings.warn('The exposures overlap or are not in time order.')
+        return out
+
+    def bin_time(self, n=None, dt=None, max_gap=3., max_nan_frac=0.5):
+        """Average consecutive integrations (time binning).
+
+        Parameters
+        ----------
+        n : int or None
+            Integrations per bin.
+        dt : float or None
+            Bin width in days (used if ``n`` is None), e.g. ``5 / 1440``.
+        max_gap : float
+            A bin never spans a gap longer than ``max_gap`` times the median
+            cadence (a new bin starts after it).
+        max_nan_frac : float
+            A channel is NaN in a bin when more than this fraction of its
+            integrations are NaN.
+
+        Returns
+        -------
+        LightCurves
+            Times, flux and regressors are means over the bin; errors are
+            ``sqrt(sum err^2) / N``; ``index`` is the first integration of
+            the bin (so :meth:`exclude` by integration number still works,
+            but ``phase4`` does not). ``meta['bin_time']`` holds ``n``,
+            ``dt``, the number of bins and the median bin span in days
+            (``exptime``, for supersampling the model).
+
+        Notes
+        -----
+        Binning smears the transit and eclipse ingress and egress; with bins
+        that are not short compared with them, supersample the model
+        (``BroadbandFit(supersample=...)``).
+        """
+        if n is None and dt is None:
+            raise ValueError('Give n (integrations per bin) or dt (days).')
+        o = np.argsort(self.times, kind='stable')
+        t = self.times[o]
+        cad = np.median(np.diff(t)) if t.size > 1 else 1.
+        new = np.r_[True, np.diff(t) > max_gap * cad]
+        seg = np.cumsum(new) - 1
+        lab = np.empty(t.size, int)
+        nxt = 0
+        for s in np.unique(seg):
+            j = np.flatnonzero(seg == s)
+            k = (np.arange(j.size) // int(n)) if n is not None \
+                else np.floor((t[j] - t[j[0]]) / dt).astype(int)
+            _, k = np.unique(k, return_inverse=True)
+            lab[j] = nxt + k
+            nxt += k.max() + 1
+        nb = nxt
+
+        def mean(x):
+            x = np.asarray(x, float)[o]
+            out = np.full((nb,) + x.shape[1:], np.nan)
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)
+                for b in range(nb):
+                    out[b] = np.nanmean(x[lab == b], axis=0)
+            return out
+
+        f = self.flux[o]
+        e = self.err[o]
+        flux = np.full((nb, self.nchan), np.nan)
+        err = np.full((nb, self.nchan), np.nan)
+        times = np.empty(nb)
+        index = np.empty(nb, self.index.dtype)
+        span = np.empty(nb)
+        for b in range(nb):
+            s = lab == b
+            ok = np.isfinite(f[s]) & np.isfinite(e[s])
+            cnt = ok.sum(0)
+            with np.errstate(invalid='ignore', divide='ignore'):
+                flux[b] = np.where(ok, f[s], 0.).sum(0) / cnt
+                err[b] = np.sqrt(np.where(ok, e[s] ** 2, 0.).sum(0)) / cnt
+            bad = cnt < (1. - max_nan_frac) * s.sum()
+            flux[b, bad] = err[b, bad] = np.nan
+            times[b] = t[s].mean()
+            index[b] = self.index[o][s][0]
+            span[b] = t[s][-1] - t[s][0] + cad
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', RuntimeWarning)
+            lc = LightCurves(times, flux, err, wavelength=self.wavelength, wave_edges=self.wave_edges,
+                             regressors={k: mean(v) for k, v in self.regressors.items()},
+                             index=index, name=self.name, meta=dict(self.meta), groups=self.groups)
+            for k, v in self.channel_regressors.items():
+                lc.add_regressor(k, mean(v), per_channel=True)
+        lc.meta['bin_time'] = dict(n=n, dt=dt, nbins=int(nb), exptime=float(np.median(span)))
+        return lc
+
     def outliers(self, nsigma=5., window=31, channel=None):
         """Mask of outlying integrations in the white light (or one channel).
 

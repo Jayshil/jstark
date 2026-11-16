@@ -12,7 +12,15 @@ dataset needs and you did not give:
   one-sigma change of the regressor);
 * GP hyperparameters for the chosen kernel, when the dataset has a GP;
 * ``ramp[k]amp_<ds>`` uniform(-0.1, 0.1) and ``ramp[k]tau_<ds>`` log-uniform
-  (2 cadences, duration) for each exponential ramp term.
+  (2 cadences, duration) for each exponential ramp term;
+* ``C2``/``D2`` fixed to 0 when you give a Cowan & Agol phase curve
+  (``C1``, ``D1``) without them: the first-order model (juliet always
+  evaluates the second-order terms).
+
+Phase curves (juliet's Cowan & Agol 2008 model, :func:`check_phase_curves`):
+juliet applies them only to datasets that also get a transit model
+(limb-darkening priors), and looks ``C1``-``D2`` up with the instrument
+suffix of the ``fp`` prior, so ``C1_p1_MIRI`` needs ``fp_p1_MIRI``.
 
 Limb darkening is **never** added. In juliet a dataset gets a transit model
 only if a ``q1``/``u1``/``c1`` prior names it, so eclipse-only data need
@@ -28,7 +36,7 @@ import warnings
 import numpy as np
 
 __all__ = ['normalise_priors', 'build_priors', 'model_report', 'GP_KERNELS', 'covers',
-           'priors_to_text']
+           'priors_to_text', 'check_phase_curves']
 
 # juliet kernel variables (celerite kernels take a 1D regressor)
 GP_KERNELS = {
@@ -185,9 +193,13 @@ def build_priors(priors, datasets, nuisance=None, verbose=True):
                 for v in GP_KERNELS[kern]:
                     if v not in have:
                         add(f'GP_{v}_{ds}', d[v])
+    for k in [k for k in out if k.split('_')[0] == 'C1']:
+        sfx = k[len('C1'):]
+        for c in ('C2', 'D2'):
+            add(c + sfx, ('fixed', 0.0))
     # Parameters that name no fitted dataset are a typo (juliet would fail later)
     if verbose and added:
-        print(f'Added {len(added)} nuisance priors: ' + ', '.join(added))
+        print(f'Added {len(added)} priors: ' + ', '.join(added))
     return out, added
 
 
@@ -212,7 +224,53 @@ def model_report(priors, names):
                           '(or a shared q1_..._' + ds + ') if it contains a transit.')
         if not (ld or fp or pc):
             warnings.warn(f'Dataset {ds}: no transit, eclipse or phase-curve model (systematics only).')
+    check_phase_curves(priors, names, rep)
     return rep
+
+
+def _applies(key, prefix, ds):
+    """Planet parameter ``key`` of type ``prefix`` applies to dataset ``ds``."""
+    parts = key.split('_')
+    return parts[0] == prefix and (len(parts) == 2 or ds in parts[2:])
+
+
+def check_phase_curves(priors, names, report=None):
+    """Raise if juliet would ignore or fail on the phase-curve priors.
+
+    * A phase curve (``C1``/``D1`` or ``phaseoffset``) on a dataset without
+      limb-darkening priors: juliet evaluates phase curves only together
+      with a transit, and would silently fit a plain eclipse.
+    * A phase curve needs an eclipse depth ``fp``; for Cowan & Agol the
+      ``C1``, ``D1``, ``C2``, ``D2`` names must carry the same instrument
+      suffix as that ``fp`` prior (juliet looks them up that way).
+    """
+    report = report or {}
+    for ds in names:
+        pcs = [k for k in priors if any(_applies(k, c, ds) for c in ('C1', 'D1', 'phaseoffset'))]
+        if not pcs:
+            continue
+        ld = report.get(ds, {}).get('ld')
+        if ld is None:
+            ld = any(covers(priors, c, ds) for c in ('q1', 'u1', 'c1'))
+        if not ld:
+            raise ValueError(f'Dataset {ds}: phase-curve priors {pcs} but no limb-darkening prior '
+                             f'names {ds}. juliet computes phase curves only with a transit model '
+                             f'and would silently fit a plain eclipse; add q1/q2 for {ds} (fixed '
+                             'values are fine if the transit is not covered).')
+        fps = [k for k in priors if _applies(k, 'fp', ds)]
+        if not fps:
+            raise ValueError(f'Dataset {ds}: phase-curve priors {pcs} need an eclipse depth '
+                             f'prior (fp_p1 or fp_p1_{ds}).')
+        for pl in sorted({k.split('_')[1] for k in pcs if k.split('_')[0] in ('C1', 'D1')}):
+            fpk = [k for k in fps if k.split('_')[1] == pl]
+            if not fpk:
+                raise ValueError(f'Dataset {ds}: Cowan & Agol priors for {pl} but no fp_{pl}.')
+            sfx = fpk[0][len('fp'):]
+            missing = [c + sfx for c in ('C1', 'D1') if c + sfx not in priors]
+            if missing:
+                raise ValueError(f'Dataset {ds}: juliet reads the Cowan & Agol terms with the '
+                                 f'suffix of {fpk[0]}, so it needs {missing} (got '
+                                 f'{[k for k in pcs if k.split("_")[1] == pl]}).')
 
 
 def priors_to_text(priors):

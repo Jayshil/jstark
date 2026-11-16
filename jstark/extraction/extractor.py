@@ -40,7 +40,7 @@ from .source import ExposureSource
 from .trace import (Trace, find_trace, trace_from_reference, fill_bad, window, edge_weights,
                     cof_offsets, reference_cof, _gather, _sample_spatial)
 
-__all__ = ['SpectralExtractor', 'Spectra']
+__all__ = ['SpectralExtractor', 'VisitExtractor', 'Spectra']
 
 
 class SpectralExtractor:
@@ -75,6 +75,7 @@ class SpectralExtractor:
         self.verbose = verbose
         self.log = StepLog(os.path.join(self.outdir, f'{self.src.exposure}_extract_log.json'))
         self.traces, self.psfs = {}, {}
+        self.psf_exposures = []      # exposures whose integrations fitted the PSF (shared)
         self.var_mean = None
         self.qmap = None
         self.cov = {}
@@ -121,10 +122,10 @@ class SpectralExtractor:
         else:
             self.order_params.setdefault(order, {}).setdefault(step, {}).update(kwargs)
         if step in ('columns', 'trace'):
-            self.traces, self.psfs = {}, {}
+            self.traces, self.psfs, self.psf_exposures = {}, {}, []
             self.field_model = None
         if step == 'psf':
-            self.psfs = {}
+            self.psfs, self.psf_exposures = {}, []
         if step in ('background', 'columns', 'trace'):
             self.bkg_mask = None
         return self
@@ -212,7 +213,7 @@ class SpectralExtractor:
             self.log.add('find_trace', order=o, columns=[int(tr.cols[0]), int(tr.cols[-1]) + 1],
                          halfwidth=hw, rms=tr.info['rms'])
         self.bkg_mask = None
-        self.psfs = {}
+        self.psfs, self.psf_exposures = {}, []
         return self.traces
 
     # ------------------------------------------------------------------
@@ -360,8 +361,17 @@ class SpectralExtractor:
         f = num / np.where(den > 0, den, np.inf)
         return f[T['grp']]
 
-    def fit_psf(self, verbose=None):
+    def fit_psf(self, verbose=None, others=None):
         """Fit the spline PSF (and the pixel-response map) of every order.
+
+        ``others``: further :class:`SpectralExtractor` objects of the same
+        visit (other exposures). Their integrations are added to the same
+        fit, so all exposures share one PSF and one pixel-response map; each
+        keeps its own trace, background, centre-of-flux offsets and variance
+        map. A PSF fitted per exposure differs between exposures by its
+        noise, which rescales the optimal flux (2.5 ppt steps between the
+        exposures of the WASP-43 b MIRI/LRS phase curve). Use
+        :class:`VisitExtractor` rather than calling this directly.
 
         1. A first fit, in memory, on ``init_ints`` integrations spread over
            the exposure, with iterative outlier rejection. With
@@ -391,7 +401,11 @@ class SpectralExtractor:
         """
         verbose = self.verbose if verbose is None else verbose
         t0 = time.time()
-        self._ensure_background_region()
+        members = [self] + [m for m in (others or []) if m is not self]
+        for m in members:
+            m._ensure_background_region()
+        if len(members) > 1:
+            self._check_joint(members)
         src = self.src
         nspat, nspec = src.shape
         multi = len(self.orders) > 1
@@ -421,29 +435,32 @@ class SpectralExtractor:
             if fmask is not None:
                 m = fmask if m is None else m | fmask
             return m
-        # ---- 1. first fit on a sample, in memory
-        sample = src.sample_ints(p0['init_ints'])
-        chunk = self._chunk()
+        # ---- 1. first fit on a sample, in memory (init_ints shared between the exposures)
+        samples = self._split_ints(members, p0['init_ints'])
+        nsample = sum(len(s) for s in samples)
         zscale = {}
         ndec = max(3 if multi else 1, 4 if fields else 1)
         for dec in range(ndec):
             tabs = {o: [] for o in self.orders}
             nloc = 0
-            for a in range(0, len(sample), chunk):
-                d, e, g, gi = src.read_ints(sample[a:a + chunk])
-                prep = self._prepare(d, e, g)          # subtracts the current field model
-                if dec > 0 and multi:
-                    self.psfs, self.qmap = models, qmap.reshape(nspat, nspec)
-                    dsub = self._decontaminate(d, e, g, prep)
-                for o in self.orders:
-                    if dec > 0:
-                        T = self._psf_table(o, dsub[o] if multi else d, e, g, gi, prep[o]['dy'],
-                                            exclude=fmask)
-                    else:
-                        T = self._psf_table(o, d, e, g, gi, prep[o]['dy'], exclude=q_exclude(o))
-                    T['grp'] = T['grp'] + nloc * self.traces[o].ncol
-                    tabs[o].append(T)
-                nloc += len(gi)
+            for mem, sample in zip(members, samples):
+                chunk = mem._chunk()
+                for a in range(0, len(sample), chunk):
+                    d, e, g, gi = mem.src.read_ints(sample[a:a + chunk])
+                    prep = mem._prepare(d, e, g)       # subtracts the current field model
+                    if dec > 0 and multi:
+                        mem.psfs, mem.qmap = models, qmap.reshape(nspat, nspec)
+                        dsub = mem._decontaminate(d, e, g, prep)
+                    for o in self.orders:
+                        if dec > 0:
+                            T = mem._psf_table(o, dsub[o] if multi else d, e, g, gi,
+                                               prep[o]['dy'], exclude=fmask)
+                        else:
+                            T = mem._psf_table(o, d, e, g, gi, prep[o]['dy'],
+                                               exclude=q_exclude(o))
+                        T['grp'] = T['grp'] + nloc * self.traces[o].ncol
+                        tabs[o].append(T)
+                    nloc += len(gi)
             for o in self.orders:
                 T = {k: np.concatenate([t[k] for t in tabs[o]])
                      for k in ('u', 'col', 'y', 'w', 'par', 'key', 'grp')}
@@ -473,7 +490,8 @@ class SpectralExtractor:
                     keep = new
                 zscale[o] = sc
                 if verbose and dec == ndec - 1:
-                    print(f'  order {o}: first PSF from {len(sample)} integrations; residual scale '
+                    print(f'  order {o}: first PSF from {nsample} integrations'
+                          f'{f" of {len(members)} exposures" if len(members) > 1 else ""}; residual scale '
                           f'{sc:.2f} sigma; {100 * (1 - keep.mean()):.3f}% of pixels rejected')
             del tabs
             if fields:
@@ -489,65 +507,116 @@ class SpectralExtractor:
             qnum, qden = np.zeros(nspat * nspec), np.zeros(nspat * nspec)
             nrej = {o: 0 for o in self.orders}
             ntot = {o: 0 for o in self.orders}
-            self._vsum = np.zeros(src.shape)
-            self._vcnt = np.zeros(src.shape)
             ref = init if ipass == 0 else {o: copy.deepcopy(models[o]) for o in self.orders}
-            for d, e, g, gi in self._iter_psf_ints(p0['ints']):
-                prep = self._prepare(d, e, g)
-                self._accumulate_var(e, g)
-                if multi:
-                    self.psfs, self.qmap = ref, q_sample.reshape(nspat, nspec)
-                    dsub = self._decontaminate(d, e, g, prep)
-                for o in self.orders:
-                    T = self._psf_table(o, dsub[o] if multi else d, e, g, gi, prep[o]['dy'],
-                                        exclude=fmask)
-                    Q = q_sample[T['key']]
-                    S = ref[o](T['u'], T['col'], normalise=False)
-                    f = self._group_flux(T, S, Q, np.ones(len(S), bool))
-                    z = (T['y'] - f * S * Q) * np.sqrt(T['w'])
-                    ok = np.abs(z) < pp[o]['clip'] * zscale[o]
-                    f = self._group_flux(T, S, Q, ok)
-                    sums[o].add(T['u'][ok], T['col'][ok], (T['y'] / Q)[ok], (T['w'] * Q * Q)[ok],
-                                T['par'][ok])
-                    if pixcorr:
-                        mm = f * S
-                        qx = q_exclude(o)
-                        qok = ok if qx is None else ok & ~qx.ravel()[T['key']]
-                        w = np.where(qok, T['w'], 0.)
-                        qnum += np.bincount(T['key'], w * T['y'] * mm, nspat * nspec)
-                        qden += np.bincount(T['key'], w * mm * mm, nspat * nspec)
-                    nrej[o] += int((~ok).sum())
-                    ntot[o] += len(ok)
+            if isinstance(p0['ints'], str) and p0['ints'] == 'all':
+                mints = ['all'] * len(members)
+            else:
+                mints = [len(s) for s in self._split_ints(members, p0['ints'])]
+            nint_used = 0
+            for mem, mi in zip(members, mints):
+                mem._vsum = np.zeros(mem.src.shape)
+                mem._vcnt = np.zeros(mem.src.shape)
+                for d, e, g, gi in mem._iter_psf_ints(mi):
+                    prep = mem._prepare(d, e, g)
+                    mem._accumulate_var(e, g)
+                    if multi:
+                        mem.psfs, mem.qmap = ref, q_sample.reshape(nspat, nspec)
+                        dsub = mem._decontaminate(d, e, g, prep)
+                    for o in self.orders:
+                        T = mem._psf_table(o, dsub[o] if multi else d, e, g, gi, prep[o]['dy'],
+                                           exclude=fmask)
+                        r = self._stream_add(T, ref[o], q_sample, zscale[o], pp[o]['clip'],
+                                             sums[o], q_exclude(o) if pixcorr else None,
+                                             (qnum, qden) if pixcorr else None)
+                        nrej[o] += r[0]
+                        ntot[o] += r[1]
+                nint_used += mem._nint_used
             for o in self.orders:
                 models[o].fit(sums[o], smooth=pp[o]['smooth'], cv=self._cv(o), ridge=ridge)
                 models[o].fit_info['rejected_frac'] = nrej[o] / max(ntot[o], 1)
                 if verbose:
                     fi = models[o].fit_info
                     print(f'  order {o}: PSF pass {ipass + 1}: {fi["npix"]} pixels from '
-                          f'{self._nint_used} integrations, '
+                          f'{nint_used} integrations'
+                          f'{f" of {len(members)} exposures" if len(members) > 1 else ""}, '
                           f'{models[o].ncoef} coefficients, smoothing (u, x) = '
                           f'({fi["smooth"][0]:.0e}, {fi["smooth"][1]:.0e}), reduced chi2 '
                           f'{fi["chi2_red"]:.3f}, rejected {100 * fi["rejected_frac"]:.3f}%')
             if pixcorr:
                 q_sample = self._finish_q(q_sample, qnum, qden)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            self.var_mean = np.where(self._vcnt > 0, self._vsum / self._vcnt, np.inf)
-        self.qmap = q_sample.reshape(nspat, nspec)
-        self.psfs = models
+        exposures = [m.src.exposure for m in members]
+        for mem in members:
+            with np.errstate(divide='ignore', invalid='ignore'):
+                mem.var_mean = np.where(mem._vcnt > 0, mem._vsum / mem._vcnt, np.inf)
+            mem.qmap = q_sample.reshape(nspat, nspec).copy()
+            mem.psfs = models if mem is self else {o: copy.deepcopy(models[o]) for o in self.orders}
+            mem.psf_exposures = exposures if len(members) > 1 else []
         if fields:
             # final field model with the final PSF
             self._fit_field_model(niter=2, wide=False, verbose=verbose)
-        for o in self.orders:
-            fi = models[o].fit_info
-            self.log.add('fit_psf', order=o, params=pp[o], npix=fi['npix'], smooth=fi['smooth'],
-                         chi2_red=fi['chi2_red'], rejected_frac=fi['rejected_frac'],
-                         cv=fi.get('cv'))
+        for mem in members:
+            for o in self.orders:
+                fi = models[o].fit_info
+                mem.log.add('fit_psf', order=o, params=pp[o], npix=fi['npix'], smooth=fi['smooth'],
+                            chi2_red=fi['chi2_red'], rejected_frac=fi['rejected_frac'],
+                            cv=fi.get('cv'), exposures=exposures)
         if verbose:
             if pixcorr:
                 inq = self.qmap != 1
                 print(f'  pixel-response map: {inq.sum()} pixels, rms {np.std(self.qmap[inq]):.4f}')
             print(f'fit_psf done in {time.time() - t0:.0f} s')
         return self.psfs
+
+    def _stream_add(self, T, ref, q_sample, zscale, clip, sums, qx, qsums):
+        """Add a chunk's pixel table to the PSF normal sums (and the ``Q`` sums).
+
+        Pixels deviating from the reference model ``ref`` by more than
+        ``clip * zscale`` are rejected. Returns ``(rejected, total)``.
+        """
+        Q = q_sample[T['key']]
+        S = ref(T['u'], T['col'], normalise=False)
+        f = self._group_flux(T, S, Q, np.ones(len(S), bool))
+        z = (T['y'] - f * S * Q) * np.sqrt(T['w'])
+        ok = np.abs(z) < clip * zscale
+        f = self._group_flux(T, S, Q, ok)
+        sums.add(T['u'][ok], T['col'][ok], (T['y'] / Q)[ok], (T['w'] * Q * Q)[ok], T['par'][ok])
+        if qsums is not None:
+            qnum, qden = qsums
+            n = len(qnum)
+            mm = f * S
+            qok = ok if qx is None else ok & ~qx.ravel()[T['key']]
+            w = np.where(qok, T['w'], 0.)
+            qnum += np.bincount(T['key'], w * T['y'] * mm, n)
+            qden += np.bincount(T['key'], w * mm * mm, n)
+        return int((~ok).sum()), len(ok)
+
+    @staticmethod
+    def _split_ints(members, n):
+        """Integrations of each exposure for a sample of ``n`` spread over all of them."""
+        nints = np.array([m.src.nint for m in members], float)
+        share = np.maximum(1, np.round(int(n) * nints / nints.sum())).astype(int)
+        return [m.src.sample_ints(k) for m, k in zip(members, share)]
+
+    def _check_joint(self, members):
+        """The exposures of a joint PSF fit must share mode, frame, orders, columns, parameters."""
+        for m in members[1:]:
+            name = m.src.exposure
+            if m.mode != self.mode or tuple(m.src.shape) != tuple(self.src.shape):
+                raise ValueError(f'{name}: mode/frame ({m.mode}, {m.src.shape}) differ from '
+                                 f'{self.src.exposure} ({self.mode}, {self.src.shape}).')
+            if list(m.orders) != list(self.orders):
+                raise ValueError(f'{name}: orders {m.orders} differ from {self.orders}.')
+            if bool(m.src.transpose) != bool(self.src.transpose):
+                raise ValueError(f'{name}: detector orientation differs.')
+            for o in self.orders:
+                if not np.array_equal(m.traces[o].cols, self.traces[o].cols):
+                    raise ValueError(f'{name}: order {o} columns differ from {self.src.exposure}; '
+                                     'use VisitExtractor.find_trace (aligns the columns).')
+                if m.p('psf', o) != self.p('psf', o):
+                    raise ValueError(f'{name}: order {o} PSF parameters differ.')
+        if any(m.field_traces for m in members):
+            raise NotImplementedError('A shared PSF with field-star traces is not supported; '
+                                      'fit the PSF per exposure (shared_psf=False).')
 
     def _cv(self, o):
         """Cross-validation scheme of the PSF smoothing for order ``o``."""
@@ -1534,6 +1603,7 @@ class SpectralExtractor:
             hdus.append(fits.ImageHDU(self.field_model.astype(np.float32), name='FIELD'))
         par = json.dumps({'params': self.params, 'order_params': {str(k): v for k, v in
                                                                   self.order_params.items()},
+                          'psf_exposures': list(self.psf_exposures),
                           'contaminants': self.contaminants,
                           'field_traces': [{k: (v.tolist() if isinstance(v, np.ndarray) else v)
                                             for k, v in ft.items()} for ft in self.field_traces]})
@@ -1566,6 +1636,7 @@ class SpectralExtractor:
             self.contam_mask = np.asarray(h['CONTAM'].data, bool) if 'CONTAM' in h else None
             self.field_model = np.asarray(h['FIELD'].data, np.float32) if 'FIELD' in h else None
         self.contaminants = par.get('contaminants', [])
+        self.psf_exposures = list(par.get('psf_exposures', []))
         self.field_traces = [{k: (np.asarray(v) if k in ('flux', 'cols') else
                                   (tuple(v) if k == 'columns' and v is not None else v))
                               for k, v in ft.items()} for ft in par.get('field_traces', [])]
@@ -1639,6 +1710,7 @@ class SpectralExtractor:
                 hdus.append(hf)
         par = json.dumps({'params': self.params,
                           'order_params': {str(k): v for k, v in self.order_params.items()},
+                          'psf_exposures': list(self.psf_exposures),
                           'optimisation': None if self.optimisation is None else
                           {k: (v.tolist() if isinstance(v, np.ndarray) else v)
                            for k, v in self.optimisation.items()}})
@@ -1649,6 +1721,113 @@ class SpectralExtractor:
             print(f'Saved spectra to {fname}')
         self.log.add('combine', file=fname, segments=segs)
         return Spectra(fname)
+
+
+class VisitExtractor:
+    """Extract the exposures of one visit, by default with one shared PSF model.
+
+    A visit can be split into several exposures (e.g. the WASP-43 b
+    MIRI/LRS phase curve: three exposures of 3072 integrations). With
+    ``shared_psf=True`` (default) the PSF and the pixel-response map are
+    fitted once from the integrations of all exposures
+    (:meth:`SpectralExtractor.fit_psf` with ``others``). A PSF fitted per
+    exposure differs between exposures by its own noise, and the optimal
+    flux scales with it: on WASP-43 b this made 2.5 ppt flux steps between
+    exposures (0.5 ppt, the same as the box flux, with one PSF).
+
+    Each exposure keeps its own trace (with the columns of the first
+    exposure), background, centre-of-flux offsets, variance map and output
+    (``<exposure>_spectra.fits``); exposures are never stitched.
+    ``shared_psf=False`` fits one PSF per exposure (each exposure then as
+    with its own :class:`SpectralExtractor`).
+
+    Typical use::
+
+        vx = VisitExtractor([info1, info2, info3])   # <exposure>_cleaninfo.fits
+        vx.set('psf', ints=300)                      # any parameter, every exposure
+        vx.find_trace()
+        vx.fit_psf()                                 # one PSF from all exposures
+        spectra = vx.run(keep_segments=False)        # one Spectra per exposure
+
+    ``vx[i]`` is the :class:`SpectralExtractor` of exposure ``i``.
+    """
+
+    def __init__(self, infos, shared_psf=True, outdir=None, orders=None, max_mem_gb=2.,
+                 verbose=True):
+        if isinstance(infos, str) or not hasattr(infos, '__iter__'):
+            raise TypeError('infos must be a list of <exposure>_cleaninfo.fits files '
+                            '(or ExposureCleaner objects), one per exposure.')
+        infos = list(infos)
+        if not infos:
+            raise ValueError('No exposure given.')
+        self.extractors = [SpectralExtractor(i, outdir=outdir, orders=orders,
+                                             max_mem_gb=max_mem_gb, verbose=verbose)
+                           for i in infos]
+        names = self.exposures
+        if len(set(names)) != len(names):
+            raise ValueError(f'The same exposure is given twice: {names}.')
+        self.shared_psf = bool(shared_psf)
+        self.verbose = verbose
+
+    def __len__(self):
+        return len(self.extractors)
+
+    def __getitem__(self, i):
+        return self.extractors[i]
+
+    def __iter__(self):
+        return iter(self.extractors)
+
+    @property
+    def exposures(self):
+        return [ex.src.exposure for ex in self.extractors]
+
+    def set(self, step, order=None, **kwargs):
+        """:meth:`SpectralExtractor.set` for every exposure."""
+        for ex in self.extractors:
+            ex.set(step, order=order, **kwargs)
+        return self
+
+    def show(self):
+        print(f'VisitExtractor: {len(self)} exposure(s), shared_psf={self.shared_psf}: '
+              + ', '.join(self.exposures))
+        self.extractors[0].show()
+
+    def find_trace(self):
+        """Trace of every exposure; with a shared PSF, on the columns of the first."""
+        first = self.extractors[0]
+        first.find_trace()
+        for ex in self.extractors[1:]:
+            if self.shared_psf:
+                for o in first.orders:
+                    c = first.traces[o].cols
+                    ex.set('columns', order=o, columns=(int(c[0]), int(c[-1]) + 1))
+            ex.find_trace()
+            if self.shared_psf:
+                for o in first.orders:
+                    if not np.array_equal(ex.traces[o].cols, first.traces[o].cols):
+                        raise ValueError(f'{ex.src.exposure}: order {o} columns '
+                                         f'{ex.traces[o].cols[0]}-{ex.traces[o].cols[-1]} differ '
+                                         f'from {first.src.exposure} '
+                                         f'({first.traces[o].cols[0]}-{first.traces[o].cols[-1]}).')
+        return [ex.traces for ex in self.extractors]
+
+    def fit_psf(self, verbose=None):
+        """One PSF from all exposures (``shared_psf=True``) or one per exposure."""
+        if any(not ex.traces for ex in self.extractors):
+            self.find_trace()
+        if self.shared_psf and len(self) > 1:
+            self.extractors[0].fit_psf(verbose=verbose, others=self.extractors[1:])
+        else:
+            for ex in self.extractors:
+                ex.fit_psf(verbose=verbose)
+        return [ex.psfs for ex in self.extractors]
+
+    def run(self, combine=True, keep_segments=True):
+        """Extract every exposure (:meth:`SpectralExtractor.run`); list of results."""
+        if any(not ex.psfs for ex in self.extractors):
+            self.fit_psf()
+        return [ex.run(combine=combine, keep_segments=keep_segments) for ex in self.extractors]
 
 
 def _fill_along_dispersion(img, bad, good):

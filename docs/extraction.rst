@@ -165,6 +165,41 @@ run can be resumed with
 For quick tests, ``ex.set('psf', ints=300)`` fits the PSF on 300 integrations
 spread over the exposure and ``ex.run(segments=[0])`` extracts one segment.
 
+Visits with several exposures
+-----------------------------
+
+A visit can be split into several exposures (e.g. the WASP-43 b MIRI/LRS
+phase curve: three exposures of 3072 integrations).
+:class:`~jstark.extraction.VisitExtractor` extracts them together:
+
+.. code-block:: python
+
+    from jstark.extraction import VisitExtractor
+
+    vx = VisitExtractor([info1, info2, info3])   # <exposure>_cleaninfo.fits, one per exposure
+    vx.set('psf', knot_col=20)                   # any parameter, applied to every exposure
+    vx.find_trace()                              # columns of the first exposure for all
+    vx.fit_psf()                                 # one PSF from the integrations of all exposures
+    spectra = vx.run(keep_segments=False)        # one <exposure>_spectra.fits per exposure
+
+By default (``shared_psf=True``) the PSF and the pixel-response map are
+fitted once, from the integrations of all exposures. Each exposure keeps its
+own trace, background, centre-of-flux offsets, variance map and output file;
+exposures are never stitched (join them at the light-curve level with
+:meth:`~jstark.fitting.LightCurves.concatenate`). ``vx[i]`` is the
+:class:`~jstark.extraction.SpectralExtractor` of exposure ``i``; the
+exposures that fitted the PSF are listed in ``psf_exposures`` (also in the
+extraction model and the ``PARAMS`` of the spectra file).
+
+Why: a PSF fitted per exposure differs between exposures by its own noise,
+and the optimal flux scales with the profile. On WASP-43 b this gave flux
+steps of -2.5 and +0.4 ppt between the exposures, which a phase-curve fit
+absorbs (nightside 243 ppm instead of ~1600). With one PSF per visit the
+steps are -0.48 and +0.12 ppt, the same as in the box flux, and no step
+term is needed. ``VisitExtractor(..., shared_psf=False)`` fits one PSF per
+exposure (the old behaviour; each exposure as with its own
+``SpectralExtractor``).
+
 White light from the saved spectra
 ----------------------------------
 

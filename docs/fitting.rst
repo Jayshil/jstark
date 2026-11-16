@@ -195,6 +195,69 @@ Example: several eclipses observed with MIRI
 The ``Rp/R*`` prior without limb darkening triggers the warning above; that
 is intended here (no transit in eclipse data).
 
+Phase curves
+------------
+
+jstark uses juliet's Cowan & Agol (2008) model. The planet flux relative to
+the star is
+
+.. math::
+
+    F(t) = f_p + C_1(\cos\omega t - 1) + D_1\sin\omega t
+           + C_2(\cos 2\omega t - 1) + D_2\sin 2\omega t,
+    \qquad \omega t = 2\pi (t - t_\mathrm{sec}) / P,
+
+hidden during the eclipse (juliet multiplies it by the normalised eclipse
+model) and multiplied by the transit model. ``fp`` is the planet flux at the
+eclipse. Give ``fp_p1``, ``C1_p1`` and ``D1_p1`` priors; if you leave out
+``C2``/``D2`` they are fixed to 0 (first-order model; juliet always
+evaluates the second-order terms). Rules that jstark checks before fitting:
+
+* juliet computes phase curves **only for datasets with a transit model**
+  (limb-darkening priors). Without them it would silently fit a plain
+  eclipse, so jstark raises an error. If the transit is not covered, give
+  fixed ``q1``/``q2``.
+* the ``C1`` ... ``D2`` names carry the instrument suffix of the ``fp``
+  prior (``fp_p1_LRS`` -> ``C1_p1_LRS``), because juliet reads them that way.
+* juliet needs the eclipse time: either give no ``t_secondary`` prior and
+  fit with ``light_travel_delay=True, stellar_radius=<R*/Rsun>`` (juliet
+  then computes the eclipse time from ``P``, ``t0``, ``ecc``, ``omega`` and
+  the light-travel time), or give a ``t_secondary_p1`` prior to fit it.
+
+.. code-block:: python
+
+    lc = LightCurves.from_spectra(spec).select_channels(wave_range=(5., 10.5))
+    lc = lc.exclude(ints=[(0, 779)])
+    pri = {'P_p1': ('fixed', P), 't0_p1': ('normal', [T0, 0.01]),
+           'a_p1': ('uniform', [3., 7.]), 'b_p1': ('uniform', [0., 1.]),
+           'p_p1': ('uniform', [0.1, 0.2]), 'ecc_p1': ('fixed', 0.), 'omega_p1': ('fixed', 90.),
+           'q1_LRS': ('uniform', [0., 1.]), 'q2_LRS': ('uniform', [0., 1.]),
+           't_secondary_p1': ('normal', [T0 + P / 2, 0.007]),
+           'fp_p1': ('uniform', [0., 0.012]),
+           'C1_p1': ('uniform', [-0.01, 0.01]), 'D1_p1': ('uniform', [-0.01, 0.01])}
+    fit = BroadbandFit({'LRS': lc}, priors=pri, out_folder='white_pc',
+                       linear=['time', 'dy', 'ds'], ramp=1, clip={'nsigma': 5})
+    fit.fit(nthreads=8)
+    # or: no 't_secondary_p1' prior and fit.fit(light_travel_delay=True, stellar_radius=0.667)
+    fit.summary()            # + fnight, fmax, fmin, pcamp (ppm), pcoffset, pcoffmin (deg)
+    fit.phase_curve('_p1')   # posterior samples of the same quantities
+    fit.plots().phase_folded_lc()
+
+Derived quantities (``summary``, :func:`jstark.fitting.utils.phase_curve_quantities`):
+the nightside flux ``fnight`` (at the transit, ``fp - 2 C1``), the maximum
+and minimum planet flux, the peak-to-peak amplitude ``pcamp``, and the
+phase offsets of the maximum before the eclipse (``pcoffset``) and of the
+minimum before the transit (``pcoffmin``), in degrees, positive = eastward.
+In a :class:`SpectroscopicFit` they become spectrum columns
+(``fnight_p1_ppm``, ...); ``channel_priors()`` also fixes ``t_secondary`` when it was fitted.
+
+**Time binning (off by default).** ``BroadbandFit(..., bin_time=n)`` (and
+``SpectroscopicFit``) averages ``n`` consecutive integrations before
+fitting (:meth:`LightCurves.bin_time`; bins never span gaps). Long bins smear
+ingress and egress: add ``supersample=k`` to evaluate the planet model on
+``k`` sub-exposures per bin. Note that ``sigma_w`` is a jitter per fitted
+point, so its value changes with binning.
+
 Spectroscopic fits
 ------------------
 

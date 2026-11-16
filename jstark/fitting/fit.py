@@ -17,7 +17,7 @@ import numpy as np
 
 from .lightcurve import as_lightcurves, check_name
 from .priors import build_priors, model_report, normalise_priors, priors_to_text
-from .utils import b_to_inc, rho_to_ar
+from .utils import b_to_inc, rho_to_ar, phase_curve_quantities
 from ..extraction.metrics import p2p_sigma
 
 __all__ = ['BroadbandFit', 'ExpRamp', 'red_noise_beta', 'JULIET_FILES']
@@ -30,7 +30,7 @@ JSTARK_FILES = ('jstark_fit.json', 'jstark_summary.ecsv', 'jstark_diagnostics.ec
                 'jstark_residuals.npz')
 
 _PLANET_GEOMETRY = ('P', 't0', 'a', 'rho', 'b', 'inc', 'ecc', 'omega', 'secosomega',
-                    'sesinomega', 'esinomega', 'ecosomega', 'dt', 'T')
+                    'sesinomega', 'esinomega', 'ecosomega', 'dt', 'T', 't_secondary')
 
 
 def _per_dataset(value, names, what):
@@ -41,6 +41,15 @@ def _per_dataset(value, names, what):
             raise ValueError(f'{what}: unknown dataset(s) {sorted(unknown)}; datasets are {names}.')
         return {n: value.get(n) for n in names}
     return {n: value for n in names}
+
+
+def _supersample_kwargs(ss):
+    """juliet.load keywords for ``{name: (n, exptime)}``."""
+    if not ss:
+        return {}
+    names = list(ss)
+    return dict(lc_instrument_supersamp=names, lc_n_supersamp=[ss[n][0] for n in names],
+                lc_exptime_supersamp=[ss[n][1] for n in names])
 
 
 def _as_list(v):
@@ -148,6 +157,16 @@ class BroadbandFit:
     max_nan_frac : float
         Channels NaN in more than this fraction of the integrations are left
         out of the white light.
+    bin_time : int, dict or None
+        Off by default. Average this many consecutive integrations before
+        fitting (:meth:`LightCurves.bin_time`; after ``clip``), for every
+        dataset or ``{name: n}``. For a bin width in time, bin the
+        :class:`LightCurves` yourself (``bin_time(dt=...)``).
+    supersample : int, dict or None
+        Off by default. Evaluate the planet model on this many
+        sub-exposures per point (juliet's supersampling), for every dataset
+        or ``{name: n}``; the exposure time is the bin span of time-binned
+        data, else the median cadence. Use it with long bins.
 
     Examples
     --------
@@ -159,18 +178,31 @@ class BroadbandFit:
 
     def __init__(self, datasets, priors=None, out_folder='broadband', linear=None, gp=None,
                  ramp=None, gp_kernel='matern', ld_laws='quadratic', nuisance=None,
-                 standardise=True, clip=None, max_nan_frac=0.5, verbose=True):
+                 standardise=True, clip=None, max_nan_frac=0.5, bin_time=None, supersample=None,
+                 verbose=True):
         if not datasets:
             raise ValueError('No datasets given.')
         self.datasets = {}
+        bt = _per_dataset(bin_time, list(datasets), 'bin_time')
         for name, obj in datasets.items():
             check_name(name)
             lc = as_lightcurves(obj, name=name)
             if clip:
                 lc = lc.clip(verbose=verbose, **clip)
+            if bt[name]:
+                lc = lc.bin_time(n=int(bt[name]))
             self.datasets[name] = lc
         names = list(self.datasets)
         self.names = names
+        self.supersample = {}
+        for n, k in _per_dataset(supersample, names, 'supersample').items():
+            if k and int(k) > 1:
+                lc = self.datasets[n]
+                exp = lc.meta.get('bin_time', {}).get('exptime')
+                if exp is None:
+                    dt = np.diff(np.sort(lc.times))
+                    exp = float(np.median(dt[dt > 0]))
+                self.supersample[n] = (int(k), float(exp))
         self.linear = {n: _as_list(v) for n, v in _per_dataset(linear, names, 'linear').items()}
         self.gp = {n: _as_list(v) for n, v in _per_dataset(gp, names, 'gp').items()}
         self.gp_kernel = _per_dataset(gp_kernel, names, 'gp_kernel')
@@ -257,6 +289,8 @@ class BroadbandFit:
         h.update(priors_to_text(self.priors).encode())
         h.update(str(self._ld_string()).encode())
         h.update(json.dumps(self.ramp, sort_keys=True).encode())
+        if getattr(self, 'supersample', None):
+            h.update(json.dumps(self.supersample, sort_keys=True).encode())
         return h.hexdigest()
 
     def _juliet_files(self):
@@ -291,6 +325,7 @@ class BroadbandFit:
         rec = dict(fingerprint=self.fingerprint(), sampler=sampler,
                    fit_kwargs={k: repr(v) for k, v in fit_kwargs.items()},
                    ld_laws=self._ld_string(), added_priors=self.added, ramp=self.ramp,
+                   supersample=self.supersample,
                    datasets={n: dict(n_fit=int(self.data[n]['t'].size),
                                      n_input=int(self.data[n]['nint_input']),
                                      linear=self.data[n]['labels'],
@@ -324,7 +359,8 @@ class BroadbandFit:
         self.dataset = juliet.load(priors=self.priors, t_lc=t, y_lc=y, yerr_lc=e,
                                    linear_regressors_lc=lin, GP_regressors_lc=gp,
                                    out_folder=self.out_folder, ld_laws=self._ld_string(),
-                                   non_linear_functions=nlf, verbose=False)
+                                   non_linear_functions=nlf, verbose=False,
+                                   **_supersample_kwargs(self.supersample))
         return self.dataset
 
     def fit(self, sampler='dynamic_dynesty', overwrite=False, **fit_kwargs):
@@ -349,6 +385,7 @@ class BroadbandFit:
         -------
         juliet.fit
         """
+        self._check_eclipse_timing(fit_kwargs)
         self._check_folder(overwrite)
         self.load_juliet()
         self._write_json(sampler, fit_kwargs)
@@ -359,6 +396,20 @@ class BroadbandFit:
         except Exception as exc:  # the fit itself is saved by juliet; do not lose it
             warnings.warn(f'Could not write the summary: {exc}')
         return self.results
+
+    def _check_eclipse_timing(self, fit_kwargs):
+        """juliet reads ``t_secondary_p<n>`` for eclipses only when ``light_travel_delay``
+        is off; with ``light_travel_delay=True, stellar_radius=...`` it computes the
+        eclipse time from the orbit, so no ``t_secondary`` prior is needed."""
+        if fit_kwargs.get('light_travel_delay'):
+            return
+        planets = sorted({k.split('_')[1] for k in self.priors if k.split('_')[0] == 'fp'})
+        missing = [f't_secondary_{pl}' for pl in planets if f't_secondary_{pl}' not in self.priors]
+        if missing:
+            raise ValueError(f'Eclipse fit without {missing}: either fit with '
+                             'light_travel_delay=True, stellar_radius=<R*/Rsun> (juliet then '
+                             'computes the eclipse time from P, t0, ecc, omega), or give a '
+                             f'{missing[0]} prior (e.g. normal around t0 + P/2).')
 
     @classmethod
     def load(cls, out_folder, verbose=False):
@@ -388,8 +439,10 @@ class BroadbandFit:
                     tn = tl[inst == n]
                     nlf[n] = dict(function=ExpRamp(n, k), regressor=tn - tn.min(),
                                   multiplicative=True)
+        self.supersample = {k: tuple(v) for k, v in rec.get('supersample', {}).items()}
         self.dataset = juliet.load(input_folder=out_folder, ld_laws=rec.get('ld_laws', 'quadratic'),
-                                   non_linear_functions=nlf, verbose=False)
+                                   non_linear_functions=nlf, verbose=False,
+                                   **_supersample_kwargs(self.supersample))
         # juliet (2.2.10) keeps the functions but does not switch them on when reading a folder
         for n in nlf:
             self.dataset.nlm_lc_boolean[n] = True
@@ -426,7 +479,13 @@ class BroadbandFit:
         """Table of parameters: fitted (median and 68% interval), fixed and derived.
 
         Derived quantities: transit depth ``(Rp/R*)^2``, eclipse depth in
-        ppm, ``a/R*`` from ``rho`` and the inclination from ``b``.
+        ppm, ``a/R*`` from ``rho`` and the inclination from ``b``; for a
+        Cowan & Agol phase curve (:meth:`phase_curve`) the nightside flux
+        ``fnight`` (at the transit; the dayside flux at the eclipse is
+        ``fp``), the maximum and minimum planet flux, the peak-to-peak
+        amplitude ``pcamp`` (all in ppm) and the phase offsets of the
+        maximum before the eclipse and of the minimum before the transit
+        (``pcoffset``, ``pcoffmin``, degrees; positive = eastward).
         Saved to ``<out_folder>/jstark_summary.ecsv``.
         """
         from astropy.table import Table
@@ -472,6 +531,7 @@ class BroadbandFit:
                 inc = b_to_inc(b, a, ecc=0. if ecc is None else ecc,
                                omega=90. if om is None else om)
                 rows.append((f'inc_{pl}', *q(inc), 'derived'))
+        rows += self._phase_curve_rows(q)
         tab = Table(rows=rows, names=('name', 'median', 'err_plus', 'err_minus', 'kind'),
                     dtype=(str, float, float, float, str))
         lnz = self.results.posteriors.get('lnZ')
@@ -482,6 +542,38 @@ class BroadbandFit:
         if save:
             tab.write(os.path.join(self.out_folder, 'jstark_summary.ecsv'), overwrite=True)
         return tab
+
+    def phase_curve(self, suffix='_p1'):
+        """Posterior samples of the Cowan & Agol phase-curve quantities.
+
+        ``suffix`` is the part after ``C1`` in the prior names (``'_p1'``,
+        or ``'_p1_MIRI'`` for a per-dataset phase curve). Returns the dict
+        of :func:`jstark.fitting.utils.phase_curve_quantities` (relative
+        flux; offsets in degrees, positive = maximum before the eclipse),
+        or None if this fit has no such phase curve.
+        """
+        vals = [self.values(c + suffix) for c in ('fp', 'C1', 'D1', 'C2', 'D2')]
+        if vals[0] is None or vals[1] is None or vals[2] is None:
+            return None
+        vals = [np.zeros(1) if v is None else v for v in vals]
+        n = max(np.size(v) for v in vals)
+        vals = [np.broadcast_to(v, (n,)) if np.size(v) in (1, n) else v[:n] for v in vals]
+        return phase_curve_quantities(*vals)
+
+    def _phase_curve_rows(self, q):
+        """Derived rows for every Cowan & Agol phase curve of the fit."""
+        rows = []
+        names = set(self.posteriors) | set(self.priors)
+        for sfx in sorted({k[len('C1'):] for k in names if k.split('_')[0] == 'C1'}):
+            pc = self.phase_curve(sfx)
+            if pc is None or np.size(pc['fnight']) < 2:
+                continue
+            for k, label in (('fnight', 'fnight'), ('fmax', 'fmax'), ('fmin', 'fmin'),
+                             ('amp', 'pcamp')):
+                rows.append((f'{label}{sfx}_ppm', *q(pc[k] * 1e6), 'derived'))
+            rows.append((f'pcoffset{sfx}_deg', *q(pc['offset']), 'derived'))
+            rows.append((f'pcoffmin{sfx}_deg', *q(pc['offset_min']), 'derived'))
+        return rows
 
     def residuals(self, name, nsamples=1000, components=False):
         """Data, median model and residuals of one dataset (sorted in time).

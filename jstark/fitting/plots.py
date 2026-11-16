@@ -16,6 +16,31 @@ from .utils import t14, inc_to_b, rho_to_ar, pipe_mad, lcbin, fake_allan_deviati
 __all__ = ['julietPlots']
 
 
+def _bin_data(x, y, n_bin, yerr=None):
+    """``juliet.utils.bin_data`` that survives few points.
+
+    juliet's version loops with step ``n_bin`` (0 raises) and averages
+    ``x[i:i + n_bin - 1]`` (empty for ``n_bin = 1``). Empty input (e.g. no
+    data in the transit window of a phase curve that misses the transit)
+    gives empty arrays.
+    """
+    x = np.asarray(x)
+    if x.size == 0:
+        return np.array([]), np.array([]), np.array([])
+    return juliet.utils.bin_data(x=x, y=y, n_bin=max(2, int(n_bin)), yerr=yerr)
+
+
+def _robust_ylim(ax, v, k=5.):
+    """y-limits of median +- k robust sigma of ``v``; left alone if ``v`` has no finite values."""
+    v = np.asarray(v, float)
+    v = v[np.isfinite(v)]
+    if v.size < 2:
+        return
+    m, s = np.median(v), pipe_mad(v)
+    if np.isfinite(s) and s > 0:
+        ax.set_ylim(m - k * s, m + k * s)
+
+
 class julietPlots(object):
     """Plotting helper for results produced by a `juliet` analysis.
 
@@ -643,7 +668,11 @@ class julietPlots(object):
             t0_ref = self._pmed('t0_' + planet)
             ecl_ph = ((tsec - t0_ref) / per) % 1.
         except KeyError:
-            pass
+            # light_travel_delay=True: juliet computes t_secondary from the orbit
+            prm = self.all_mods_ins[instruments[0]]['params']
+            tsec = getattr(prm, 't_secondary', None)
+            if tsec is not None and np.isfinite(tsec):
+                ecl_ph = ((tsec - prm.t0) / prm.per) % 1.
 
         # -------------------------------------------
         #     Computing detrended data and model
@@ -850,12 +879,12 @@ class julietPlots(object):
                 if not pycheops_binning:
                     nbin = int( np.sum(idx_transits) / nos_bin_tra )
 
-                    bin_phs_tra, bin_fl_tra, bin_fle_tra = juliet.utils.bin_data(x=phs[idx_transits], y=detrend_data[idx_transits]*ppt, n_bin=nbin, yerr=detrend_errs[idx_transits]*ppt)
+                    bin_phs_tra, bin_fl_tra, bin_fle_tra = _bin_data(x=phs[idx_transits], y=detrend_data[idx_transits]*ppt, n_bin=nbin, yerr=detrend_errs[idx_transits]*ppt)
                     if phasecurve or eclipse:
-                        _, bin_res_tra, bin_reserr_tra = juliet.utils.bin_data(x=phs[idx_transits], y=residuals[idx_transits]*ppt*1e6, n_bin=nbin, yerr=detrend_errs[idx_transits]*ppt)
+                        _, bin_res_tra, bin_reserr_tra = _bin_data(x=phs[idx_transits], y=residuals[idx_transits]*ppt*1e6, n_bin=nbin, yerr=detrend_errs[idx_transits]*ppt)
                     else:
                         # When transit only, we haven't multiplied the errorbars with 1e6 yet; so we need to do it again
-                        _, bin_res_tra, bin_reserr_tra = juliet.utils.bin_data(x=phs[idx_transits], y=residuals[idx_transits]*1e6, n_bin=nbin, yerr=detrend_errs[idx_transits]*1e6)
+                        _, bin_res_tra, bin_reserr_tra = _bin_data(x=phs[idx_transits], y=residuals[idx_transits]*1e6, n_bin=nbin, yerr=detrend_errs[idx_transits]*1e6)
                 else:
                     binwid = np.ptp( phs[idx_transits] ) / nos_bin_tra
 
@@ -871,7 +900,7 @@ class julietPlots(object):
                 ax2.errorbar(bin_phs_tra, bin_res_tra, yerr=bin_reserr_tra, fmt='o', c='navy', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
 
                 # Setting y-lim on residuals based on binned residuals
-                ax2.set_ylim(np.nanmedian(bin_res_tra)-5*pipe_mad(bin_res_tra), np.nanmedian(bin_res_tra)+5*pipe_mad(bin_res_tra))
+                _robust_ylim(ax2, bin_res_tra)
 
             # -------------------------------------------
             #         If phase curve modelling,
@@ -916,8 +945,8 @@ class julietPlots(object):
                 ## We do binned data here: ONLY if we don't have one plot
                 if not one_plot:
                     if not pycheops_binning:
-                        bin_phs_pc, bin_fl_pc, bin_fle_pc = juliet.utils.bin_data(x=phs, y=detrend_data, n_bin=int( len(phs)/nos_bin_pc ), yerr=detrend_errs)
-                        _, bin_res_pc, bin_reserr_pc = juliet.utils.bin_data(x=phs, y=residuals*1e6, n_bin=int( len(phs)/nos_bin_pc ), yerr=detrend_errs)
+                        bin_phs_pc, bin_fl_pc, bin_fle_pc = _bin_data(x=phs, y=detrend_data, n_bin=int( len(phs)/nos_bin_pc ), yerr=detrend_errs)
+                        _, bin_res_pc, bin_reserr_pc = _bin_data(x=phs, y=residuals*1e6, n_bin=int( len(phs)/nos_bin_pc ), yerr=detrend_errs)
                     else:
                         bin_phs_pc, bin_fl_pc, bin_fle_pc, _ = lcbin(time=phs, flux=detrend_data, binwidth=1/nos_bin_pc)
                         _, bin_res_pc, bin_reserr_pc, _ = lcbin(time=phs, flux=residuals*1e6, binwidth=1/nos_bin_pc)
@@ -926,7 +955,7 @@ class julietPlots(object):
                     ax3.errorbar(bin_phs_pc, bin_fl_pc, yerr=bin_fle_pc, fmt='o', c='navy', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
                     ax4.errorbar(bin_phs_pc, bin_res_pc, yerr=bin_reserr_pc, fmt='o', c='navy', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
 
-                    ax4.set_ylim(np.nanmedian(bin_res_pc)-5*pipe_mad(bin_res_pc), np.nanmedian(bin_res_pc)+5*pipe_mad(bin_res_pc))
+                    _robust_ylim(ax4, bin_res_pc)
 
             if not one_plot:
                 # ---------------------------------------------------
@@ -1008,12 +1037,12 @@ class julietPlots(object):
                 nbin = int( np.sum(idx_transits) / nos_bin_tra )
 
                 # Performing binning
-                bin_phs_tra, bin_fl_tra, bin_fle_tra = juliet.utils.bin_data(x=bin_phs[idx_transits], y=bin_fl[idx_transits]*ppt, n_bin=nbin, yerr=bin_fle[idx_transits]*ppt)
+                bin_phs_tra, bin_fl_tra, bin_fle_tra = _bin_data(x=bin_phs[idx_transits], y=bin_fl[idx_transits]*ppt, n_bin=nbin, yerr=bin_fle[idx_transits]*ppt)
                 if phasecurve or eclipse:
-                    _, bin_res_tra, bin_reserr_tra = juliet.utils.bin_data(x=bin_phs[idx_transits], y=bin_res[idx_transits]*ppt*1e6, n_bin=nbin, yerr=bin_fle[idx_transits]*ppt)
+                    _, bin_res_tra, bin_reserr_tra = _bin_data(x=bin_phs[idx_transits], y=bin_res[idx_transits]*ppt*1e6, n_bin=nbin, yerr=bin_fle[idx_transits]*ppt)
                 else:
                     # When transit only, we haven't multiplied the errorbars with 1e6 yet; so we need to do it again
-                    _, bin_res_tra, bin_reserr_tra = juliet.utils.bin_data(x=bin_phs[idx_transits], y=bin_res[idx_transits]*1e6, n_bin=nbin, yerr=bin_fle[idx_transits]*1e6)
+                    _, bin_res_tra, bin_reserr_tra = _bin_data(x=bin_phs[idx_transits], y=bin_res[idx_transits]*1e6, n_bin=nbin, yerr=bin_fle[idx_transits]*1e6)
             else:
                 binwid = np.ptp( bin_phs[idx_transits] ) / nos_bin_tra
 
@@ -1030,15 +1059,15 @@ class julietPlots(object):
             ax2.errorbar(bin_phs_tra, bin_res_tra, yerr=bin_reserr_tra, fmt='o', c='navy', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
 
             # Setting y-lim on residuals based on binned residuals
-            ax2.set_ylim(np.nanmedian(bin_res_tra)-5*pipe_mad(bin_res_tra), np.nanmedian(bin_res_tra)+5*pipe_mad(bin_res_tra))
+            _robust_ylim(ax2, bin_res_tra)
             
             # -------------------------------------------
             #        Binned data: For PHASE CURVE
             # -------------------------------------------
             if phasecurve:
                 if not pycheops_binning:
-                    bin_phs_pc, bin_fl_pc, bin_fle_pc = juliet.utils.bin_data(x=bin_phs, y=bin_fl, n_bin=int( len(bin_phs)/nos_bin_pc ), yerr=bin_fle)
-                    _, bin_res_pc, bin_reserr_pc = juliet.utils.bin_data(x=bin_phs, y=bin_res*1e6, n_bin=int( len(bin_phs)/nos_bin_pc ), yerr=bin_fle)
+                    bin_phs_pc, bin_fl_pc, bin_fle_pc = _bin_data(x=bin_phs, y=bin_fl, n_bin=int( len(bin_phs)/nos_bin_pc ), yerr=bin_fle)
+                    _, bin_res_pc, bin_reserr_pc = _bin_data(x=bin_phs, y=bin_res*1e6, n_bin=int( len(bin_phs)/nos_bin_pc ), yerr=bin_fle)
                 else:
                     bin_phs_pc, bin_fl_pc, bin_fle_pc, _ = lcbin(time=bin_phs, flux=bin_fl, binwidth=1/nos_bin_pc)
                     _, bin_res_pc, bin_reserr_pc, _ = lcbin(time=bin_phs, flux=bin_res*1e6, binwidth=1/nos_bin_pc)
@@ -1047,7 +1076,7 @@ class julietPlots(object):
                 ax3.errorbar(bin_phs_pc, bin_fl_pc, yerr=bin_fle_pc, fmt='o', c='navy', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
                 ax4.errorbar(bin_phs_pc, bin_res_pc, yerr=bin_reserr_pc, fmt='o', c='navy', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
 
-                ax4.set_ylim(np.nanmedian(bin_res_pc)-5*pipe_mad(bin_res_pc), np.nanmedian(bin_res_pc)+5*pipe_mad(bin_res_pc))
+                _robust_ylim(ax4, bin_res_pc)
 
             
             # -----------------------------------------------------------------------
@@ -1509,7 +1538,7 @@ class julietPlots(object):
                 # First bin-data
                 if not pycheops_binning:
                     nbin = int( len( self.gp_data[instruments[i]] ) / nos_bin )
-                    bin_tim, bin_fl, bin_fle = juliet.utils.bin_data(x=self._gpx(instruments[i]), y=self.gp_data[instruments[i]]*1e6, yerr=self.detrended_errs[instruments[i]]*1e6, n_bin=nbin)
+                    bin_tim, bin_fl, bin_fle = _bin_data(x=self._gpx(instruments[i]), y=self.gp_data[instruments[i]]*1e6, yerr=self.detrended_errs[instruments[i]]*1e6, n_bin=nbin)
 
                 else:
                     binwid = np.ptp( self._gpx(instruments[i]) ) / nos_bin
@@ -1555,7 +1584,7 @@ class julietPlots(object):
             # First, bin data
             if not pycheops_binning:
                 nbin = int( len( bin_gp_reg ) / nos_bin / len(instruments) )
-                bin_tim, bin_fl, bin_fle = juliet.utils.bin_data(x=bin_gp_reg, y=bin_resids, yerr=bin_errors, n_bin=nbin)
+                bin_tim, bin_fl, bin_fle = _bin_data(x=bin_gp_reg, y=bin_resids, yerr=bin_errors, n_bin=nbin)
 
             else:
                 binwid = np.ptp( bin_gp_reg ) / nos_bin / len(instruments)

@@ -149,6 +149,9 @@ class SpectroscopicFit:
         detector or next to saturated columns.
     linear, gp, ramp, gp_kernel, ld_laws, nuisance, standardise, clip, max_nan_frac
         As in :class:`BroadbandFit`, used for every bin (dicts per dataset).
+    bin_time, supersample
+        As in :class:`BroadbandFit` (off by default): time binning of each
+        bin's light curve and supersampling of the model.
     common_mode : BroadbandFit, dict or None
         Common-mode correction (off by default). A finished
         :class:`BroadbandFit` (its datasets of the same names are used;
@@ -186,7 +189,8 @@ class SpectroscopicFit:
     def __init__(self, datasets, priors=None, out_folder='spectroscopic', edges=None, nbins=None,
                  min_cover=0.5, linear=None, gp=None, ramp=None, gp_kernel='matern',
                  ld_laws='quadratic', nuisance=None, standardise=True, clip=None,
-                 max_nan_frac=0.5, common_mode=None, cm_mode='divide', verbose=True):
+                 max_nan_frac=0.5, common_mode=None, cm_mode='divide', bin_time=None,
+                 supersample=None, verbose=True):
         if not datasets:
             raise ValueError('No datasets given.')
         self.datasets = {}
@@ -216,7 +220,7 @@ class SpectroscopicFit:
                       for n, v in lin.items()}
         self.options = dict(linear=linear, gp=gp, ramp=ramp, gp_kernel=gp_kernel, ld_laws=ld_laws,
                             nuisance=nuisance, standardise=standardise, clip=clip,
-                            max_nan_frac=max_nan_frac)
+                            max_nan_frac=max_nan_frac, bin_time=bin_time, supersample=supersample)
         self.edges = make_bins(self.datasets, edges=edges, nbins=nbins, max_nan_frac=max_nan_frac)
         self.bins = self._define_bins()
         if verbose:

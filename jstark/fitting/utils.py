@@ -89,6 +89,60 @@ def rho_to_ar(rho, per):
     a = ((rho * G * ((per * 24. * 3600.)**2)) / (3. * np.pi))**(1. / 3.)
     return a
 
+def cowan_agol(omega_t, fp, C1, D1, C2=0., D2=0.):
+    """Planet flux of juliet's Cowan & Agol (2008) phase curve (relative to the star).
+
+    ``omega_t = 2 pi (t - t_secondary) / P`` (0 at the eclipse, pi at the
+    transit)::
+
+        F = fp + C1 (cos wt - 1) + D1 sin wt + C2 (cos 2wt - 1) + D2 sin 2wt
+
+    so ``fp`` is the planet flux at the eclipse (the eclipse depth). Inputs
+    broadcast (e.g. ``omega_t[:, None]`` against posterior samples).
+    """
+    w = np.asarray(omega_t, float)
+    return (fp + C1 * (np.cos(w) - 1.) + D1 * np.sin(w)
+            + C2 * (np.cos(2. * w) - 1.) + D2 * np.sin(2. * w))
+
+
+def phase_curve_quantities(fp, C1, D1, C2=0., D2=0., ngrid=1441):
+    """Derived quantities of a Cowan & Agol phase curve, per posterior sample.
+
+    Returns a dict of arrays (relative flux, degrees):
+
+    * ``fday``: planet flux at the eclipse (``fp``);
+    * ``fnight``: planet flux at the transit (``fp - 2 C1``);
+    * ``fmax``, ``fmin``: maximum and minimum over the orbit;
+    * ``amp``: peak-to-peak amplitude ``fmax - fmin``;
+    * ``offset``: phase of the maximum *before* the eclipse, in degrees
+      (positive = peak before the eclipse = hot spot east of the
+      substellar point), in (-180, 180];
+    * ``offset_min``: phase of the minimum before the transit, same
+      convention.
+    """
+    fp, C1, D1, C2, D2 = (np.atleast_1d(np.asarray(x, float)) for x in (fp, C1, D1, C2, D2))
+    w = np.linspace(-np.pi, np.pi, ngrid, endpoint=False)
+    F = cowan_agol(w[:, None], fp[None], C1[None], D1[None], C2[None], D2[None])
+    imax, imin = np.argmax(F, axis=0), np.argmin(F, axis=0)
+    fmax, fmin = F[imax, np.arange(F.shape[1])], F[imin, np.arange(F.shape[1])]
+    # refine the extrema with a parabola through the grid neighbours
+    def refine(i):
+        im, ip = (i - 1) % ngrid, (i + 1) % ngrid
+        cols = np.arange(F.shape[1])
+        y0, y1, y2 = F[im, cols], F[i, cols], F[ip, cols]
+        den = y0 - 2. * y1 + y2
+        d = np.where(den != 0, 0.5 * (y0 - y2) / np.where(den != 0, den, 1.), 0.)
+        return w[i] + d * (w[1] - w[0])
+    wmax, wmin = refine(imax), refine(imin)
+    wrap = lambda a: (np.degrees(a) + 180.) % 360. - 180.
+    off = -wrap(wmax)
+    off_min = -wrap(wmin - np.pi)
+    off = np.where(off <= -180., off + 360., off)
+    off_min = np.where(off_min <= -180., off_min + 360., off_min)
+    return dict(fday=fp + 0. * C1, fnight=fp - 2. * C1, fmax=fmax, fmin=fmin,
+                amp=fmax - fmin, offset=off, offset_min=off_min)
+
+
 def pipe_mad(x, axis=0):
     return np.nanmedian(np.abs(np.diff(x, axis=axis)), axis=axis)
 
