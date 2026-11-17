@@ -41,8 +41,13 @@ Overview
      the 1/f offsets, so only the bright core rows are left to the model.
      The threshold is measured on the first segment and reused for all
      (``Stage1.wing_threshold``). A relative threshold keeps the same rows
-     measured whatever the brightness of the star. NIRCam default:
-     ``wing_frac=0.04``, ``wing_min_pixels=100``.
+     measured whatever the brightness of the star. **Not a default:** the
+     wing pixels let the transit (or eclipse) into the 1/f model. On the
+     WASP-39 b NIRCam F322W2 transit, ``wing_frac=0.04`` diluted the depths
+     by 70 ppm and raised the white-light red noise, although it lowers the
+     point-to-point scatter of data without a transit. NIRCam default
+     (2026-11-17): ``'readout'`` on background pixels only
+     (``readout_order=1``).
    * ``temporal_jump`` -- jump detection in the time domain: each pixel's
      group differences are compared with a running median over
      integrations. Jumps are either repaired (default for short ramps) or
