@@ -175,8 +175,10 @@ NIRISS SOSS               column, difference-image       dark applied
 NIRCam F444W / F322W2     row, readout-time model,       side reference pixels used
                           offsets also measured on the
                           faint trace wings
-MIRI LRS / imaging        none                           emicorr, firstframe,
-                                                         lastframe, reset, rscd, dark
+MIRI LRS / imaging        none                           emicorr, lastframe, reset,
+                                                         dark; firstframe, rscd and
+                                                         refpix skipped (as the
+                                                         official TSO pipeline)
 ========================  =============================  ===========================
 
 Jump detection is ``temporal_jump`` (window 11 integrations, 10 sigma) for

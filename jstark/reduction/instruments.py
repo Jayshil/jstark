@@ -30,13 +30,14 @@ The defaults follow typical choices in the published literature:
 * Dark-current subtraction is skipped for NIRSpec and NIRCam (dark current
   is negligible and the reference files add noise), and applied for
   NIRISS/SOSS and MIRI.
-* MIRI: ``emicorr`` (390 Hz EMI), ``firstframe``, ``lastframe``, ``reset``
-  and ``rscd`` are applied; no group-level background subtraction. The ramp
-  fit uses every group those steps leave usable. The early groups are
-  distorted by RSCD, but on GJ 3929 F1500W the distortion was the same in
-  every integration (it only rescales the flux), while dropping the first 12
-  groups raised the photometric scatter by 28 per cent. ``firstgroup`` (an
-  integer, or ``'auto'``) remains available for tests on a full exposure.
+* MIRI: as in the official TSO pipeline, ``emicorr`` (390 Hz EMI),
+  ``lastframe`` and ``reset`` are applied, and ``firstframe``, ``rscd`` and
+  ``refpix`` are skipped; no group-level background subtraction. The ramp
+  fit uses every group left usable (from group 1). ``rscd`` would flag the
+  first 7 groups on LRS; dropping them deepened the WASP-43 b transit by
+  ~55 ppm. On GJ 3929 F1500W dropping the first 12 groups raised the
+  photometric scatter by 28 per cent. ``firstgroup`` (an integer, or
+  ``'auto'``) remains available for tests.
 
 All of these can be changed by the user through :class:`~jstark.reduction.Stage1`.
 """
@@ -173,13 +174,20 @@ def _miri_recipe():
         StepSpec('emicorr'),
         StepSpec('saturation'),
         StepSpec('consistent_saturation', {'min_frac': 0.01, 'scope': 'exposure'}),
-        StepSpec('firstframe', {'bright_use_group1': True}),
+        # As in the official TSO pipeline (CRDS jwst_miri_pars-detector1pipeline_0012,
+        # TSOVISIT=True; jwst 3.0): firstframe, rscd and refpix skipped, lastframe applied.
+        # rscd only flags the first groups as DO_NOT_USE (7 per integration on LRS
+        # SLITLESSPRISM FASTR1), and the RSCD-distorted early groups then drop out with a
+        # flux-dependent effect: on WASP-43 b it deepened the transit by ~55 ppm against
+        # fitting them (fitting_notes.md 5.7 item 10). SLITLESSPRISM / SUB128 have no
+        # reference pixels, so refpix does nothing there.
+        StepSpec('firstframe', {'bright_use_group1': True}, skip=True),
         StepSpec('lastframe'),
         StepSpec('reset'),
         StepSpec('linearity'),
-        StepSpec('rscd'),
+        StepSpec('rscd', skip=True),
         StepSpec('dark_current'),
-        StepSpec('refpix'),
+        StepSpec('refpix', skip=True),
         StepSpec('group_bkg', {'method': 'median', 'axis': 'row'}, skip=True),
         StepSpec('jump', {'rejection_threshold': 15., 'maximum_cores': 'half'}, skip=True),
         StepSpec('temporal_jump', {'window': 11, 'threshold': 10., 'mode': 'auto'}),
