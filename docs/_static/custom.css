@@ -2,3 +2,15 @@
 .bd-article table.docutils { display: block; overflow-x: auto; }
 /* Pipeline diagram on the home page. */
 pre.pipeline { line-height: 1.35; font-size: 0.85em; }
+
+/* Wider page; on the tutorials (no left sidebar) the article column fits the
+   9-inch notebook figures (about 910 px) next to the "On this page" sidebar. */
+.bd-page-width { max-width: 96rem; }
+.bd-main .bd-content .bd-article-container { max-width: 64em; }
+
+/* Notebook cells: no "[n]:" prompt column, so outputs use the full width. */
+div.nbinput .prompt, div.nboutput .prompt { display: none; }
+div.nboutput.container div.output_area img { max-width: 100%; height: auto; }
+
+/* Figures keep their white background in dark mode; round the corners. */
+html[data-theme="dark"] div.nboutput div.output_area img { border-radius: 6px; }

@@ -79,7 +79,7 @@ intersphinx_mapping = {
 # -- Options for HTML output -------------------------------------------------
 
 html_theme = "pydata_sphinx_theme"
-html_title = f"jstark {release}"
+html_title = "jstark"   # the version (a setuptools_scm dev string, or 'unknown' from a checkout) is left out
 html_static_path = ["_static"]
 html_css_files = ["custom.css"]
 html_theme_options = {
@@ -91,6 +91,10 @@ html_theme_options = {
     "footer_start": ["copyright"],
     "footer_end": ["sphinx-version", "theme-version"],
 }
+# No left (section navigation) sidebar on the tutorials: it only repeats the
+# tutorial list (also in the top bar), and its 25% of the page width would
+# shrink the notebook figures. They keep the right "On this page" sidebar.
+html_sidebars = {"tutorials/*": []}
 html_context = {"default_mode": "auto"}
 html_show_sourcelink = False
 

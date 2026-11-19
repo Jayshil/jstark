@@ -20,6 +20,7 @@ import warnings
 import numpy as np
 from astropy.table import Table
 
+from ..plotting import styled, WIDTH, colorbar
 from .fit import BroadbandFit, _as_list, _per_dataset
 from .lightcurve import as_lightcurves, check_name
 from .priors import normalise_priors
@@ -604,6 +605,7 @@ class SpectroscopicFit:
         """Plot the spectrum (see :meth:`Spectrum.plot`)."""
         return self.spectrum(save=False).plot(param=param, ax=ax, white=white, **kwargs)
 
+    @styled
     def plot_2d(self, dataset=None, quantities=('detrended', 'planet', 'resid'), tbin=1,
                 cmap='plasma', ppm=True, figsize=None, vlim=None):
         """Data, model and residuals of all bins as images (wavelength vs time).
@@ -625,8 +627,8 @@ class SpectroscopicFit:
         import matplotlib.pyplot as plt
         dataset = dataset or self.names[0]
         imgs = {q: self.residuals(dataset, q) for q in quantities}
-        fig, axs = plt.subplots(len(quantities), 1, sharex=True,
-                                figsize=figsize or (10, 2.6 * len(quantities)), squeeze=False)
+        fig, axs = plt.subplots(len(quantities), 1, sharex=True, layout='constrained',
+                                figsize=figsize or (WIDTH, 2.2 * len(quantities) + 0.4), squeeze=False)
         axs = axs[:, 0]
         for ax, q in zip(axs, quantities):
             img, t, rows = imgs[q]
@@ -642,7 +644,7 @@ class SpectroscopicFit:
             if q == 'resid':
                 v = np.nanpercentile(np.abs(img), 99)
                 lim = (-v, v)
-                cm = 'RdBu_r'
+                cm = 'jstark_div'
             else:
                 lim = vlim or tuple(np.nanpercentile(img, [1, 99]))
                 cm = cmap
@@ -653,17 +655,18 @@ class SpectroscopicFit:
             tk = np.linspace(0, len(rows) - 1, min(6, len(rows))).round().astype(int)
             ax.set_yticks(tk)
             ax.set_yticklabels([f'{waves[k]:.2f}' for k in tk])
-            ax.set_ylabel('Wavelength [um]')
-            cb = fig.colorbar(im, ax=ax, pad=0.01)
-            cb.set_label(f'{q} [{"ppm" if ppm else "rel."}]')
-        axs[-1].set_xlabel('Time since first integration [h]')
+            ax.set_ylabel('wavelength [µm]')
+            ax.minorticks_off()
+            colorbar(fig, im, ax, f'{q} [{"ppm" if ppm else "rel."}]')
+        axs[-1].set_xlabel('time since first integration [h]')
         axs[0].set_title(f'{dataset}: {len(imgs[quantities[0]][2])} bins')
         return fig, axs
 
-    def plot_noise(self, figsize=(11, 4)):
+    @styled
+    def plot_noise(self, figsize=(WIDTH, 3.4)):
         """Residual noise: rms vs bin size for every bin, and p2p / error vs wavelength."""
         import matplotlib.pyplot as plt
-        fig, (a1, a2) = plt.subplots(1, 2, figsize=figsize)
+        fig, (a1, a2) = plt.subplots(1, 2, figsize=figsize, layout='constrained')
         colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
         for k, n in enumerate(self.names):
             try:
@@ -685,9 +688,9 @@ class SpectroscopicFit:
             a1.plot([], [], color=c, label=n)
         x = np.geomspace(1, 1e4, 10)
         a1.loglog(x, x ** -0.5, 'k--', lw=1, label='white noise')
-        a1.set_xlabel('Integrations per bin')
+        a1.set_xlabel('integrations per bin')
         a1.set_ylabel('rms / unbinned rms')
-        a1.legend(fontsize=8)
+        a1.legend()
         d = self.diagnostics()
         if d is not None:
             for k, n in enumerate(self.names):
@@ -699,10 +702,9 @@ class SpectroscopicFit:
                     a2.plot(np.asarray(d['wave'][s])[o], np.asarray(d['p2p_over_total'][s])[o],
                             ':', color=colors[k % len(colors)], label=f'{n} incl. jitter')
             a2.axhline(1, color='k', lw=0.8)
-            a2.set_xlabel('Wavelength [um]')
-            a2.set_ylabel('Residual p2p scatter / error')
-            a2.legend(fontsize=8)
-        fig.tight_layout()
+            a2.set_xlabel('wavelength [µm]')
+            a2.set_ylabel('residual p2p scatter / error')
+            a2.legend()
         return fig, (a1, a2)
 
 
@@ -747,6 +749,7 @@ class Spectrum(Table):
         return (w, hw, np.asarray(self[p], float), np.asarray(self[p + '_errp'], float),
                 np.asarray(self[p + '_errm'], float))
 
+    @styled
     def plot(self, param=None, ax=None, white=None, label=None, xerr=True, **kwargs):
         """Plot one parameter against wavelength.
 
@@ -762,7 +765,7 @@ class Spectrum(Table):
         import matplotlib.pyplot as plt
         p = param or self.default_param()
         if ax is None:
-            _, ax = plt.subplots(figsize=(10, 4))
+            _, ax = plt.subplots(figsize=(WIDTH, 3.6), layout='constrained')
         w, hw, v, ep, em = self.values(p)
         kw = dict(fmt='o', ms=3, elinewidth=1, capsize=0, label=label or p)
         kw.update(kwargs)
@@ -778,7 +781,7 @@ class Spectrum(Table):
                 val, err = white
             ax.axhline(val, color='k', lw=1, label='broadband')
             ax.axhspan(val - err, val + err, color='k', alpha=0.1, lw=0)
-        ax.set_xlabel('Wavelength [um]')
+        ax.set_xlabel('wavelength [µm]')
         ax.set_ylabel(p)
         return ax
 

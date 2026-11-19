@@ -11,6 +11,7 @@ import matplotlib.gridspec as gd
 from scipy.interpolate import interp1d
 import juliet
 
+from ..plotting import styled
 from .utils import t14, inc_to_b, rho_to_ar, pipe_mad, lcbin, fake_allan_deviation, corner_plot
 
 __all__ = ['julietPlots']
@@ -250,6 +251,7 @@ class julietPlots(object):
         return planet_only_models_highres
         
 
+    @styled
     def full_model_lc(self, instruments=None, save=False, nrandom=50, quantile_models=True):
         """Plot the full fitted light-curve model for one or more instruments.
 
@@ -311,18 +313,18 @@ class julietPlots(object):
             random_models = sample_models[idx, :]
 
             # And figure
-            fig = plt.figure()
+            fig = plt.figure(figsize=(9, 5.4))
             gs = gd.GridSpec(2,1, height_ratios=[2,1])
 
             # Top panel
             ax1 = plt.subplot(gs[0])
-            ax1.errorbar(tim_ins, fl_ins, yerr=fle_ins, fmt='.', elinewidth=0.5, markersize=1.5, color='dodgerblue')#, alpha=0.3)
-            ax1.plot(tim_ins, full_model, c='navy', lw=2, zorder=50)
+            ax1.errorbar(tim_ins, fl_ins, yerr=fle_ins, fmt='.', elinewidth=0.5, markersize=1.5, color='#86b6ef')#, alpha=0.3)
+            ax1.plot(tim_ins, full_model, c='#184f95', lw=2, zorder=50)
             if quantile_models:
-                ax1.fill_between(x=tim_ins, y1=lo_68CI, y2=up_68CI, color='orangered', alpha=0.5, zorder=25)
+                ax1.fill_between(x=tim_ins, y1=lo_68CI, y2=up_68CI, color='#eb6834', alpha=0.5, zorder=25)
             else:
                 for rand in range(nrandom):
-                    ax1.plot(tim_ins, random_models[rand,:], color='orangered', alpha=0.5, lw=1., zorder=25)
+                    ax1.plot(tim_ins, random_models[rand,:], color='#eb6834', alpha=0.5, lw=1., zorder=25)
 
             ax1.set_ylabel('Relative Flux')
             ax1.set_title('Full fitted model for instrument ' + str(instruments[i]))
@@ -331,7 +333,7 @@ class julietPlots(object):
 
             # Bottom panel
             ax2 = plt.subplot(gs[1])
-            ax2.errorbar(tim_ins, (fl_ins-full_model)*1e6, yerr=fle_ins*1e6, fmt='.', elinewidth=0.5, markersize=1.5, color='dodgerblue')#, alpha=0.3)
+            ax2.errorbar(tim_ins, (fl_ins-full_model)*1e6, yerr=fle_ins*1e6, fmt='.', elinewidth=0.5, markersize=1.5, color='#86b6ef')#, alpha=0.3)
             ax2.axhline(y=0.0, c='black', ls='--', zorder=100)
             ax2.set_ylabel('Residuals [ppm]')
             ax2.set_xlabel(r'Time [BJD$_\mathrm{TDB}$]')
@@ -542,7 +544,8 @@ class julietPlots(object):
                 self.phases_model[instruments[ins]] = juliet.utils.get_phases(t=self.dataset.times_lc[instruments[ins]], P=per, t0=t0, phmin=phmin)
 
     
-    def phase_folded_lc(self, phmin=0.8, instruments=None, planet='p1', highres=False, nrandom=50, quantile_models=True, one_plot=None, figsize=(16/1.5, 9/1.5), pycheops_binning=False, nos_bin_tra=20, nos_bin_pc=30, window=1.):
+    @styled
+    def phase_folded_lc(self, phmin=0.8, instruments=None, planet='p1', highres=False, nrandom=50, quantile_models=True, one_plot=None, figsize=(9, 5.4), pycheops_binning=False, nos_bin_tra=20, nos_bin_pc=30, window=1.):
         """Plot phase-folded light curves and models for the fitted dataset.
 
         This method computes detrended data and planetary models by
@@ -828,17 +831,17 @@ class julietPlots(object):
             else:
                 ppt = 1.
             
-            ax1.errorbar(phs, detrend_data*ppt, fmt='.', elinewidth=0.5, markersize=1.5, alpha=0.5, color='dodgerblue', zorder=1)
+            ax1.errorbar(phs, detrend_data*ppt, fmt='.', elinewidth=0.5, markersize=1.5, alpha=0.5, color='#86b6ef', zorder=1)
             if (not one_plot) or highres:
                 ## if we are making one-plot, we can plot the detrended model out of loop
-                ax1.plot(phs_model, detrend_model*ppt, color='navy', lw=2.5, zorder=50)
+                ax1.plot(phs_model, detrend_model*ppt, color='#184f95', lw=2.5, zorder=50)
             if quantile_models:
                 if (not one_plot) or highres:
                     ## Again, if we are making one plot, we can plot the detrended quantile models out of loop
-                    ax1.fill_between(phs_model, y1=lo_68CI*ppt, y2=up_68CI*ppt, color='orangered', alpha=0.15, zorder=25)
+                    ax1.fill_between(phs_model, y1=lo_68CI*ppt, y2=up_68CI*ppt, color='#eb6834', alpha=0.15, zorder=25)
             else:
                 for rand in range(nrandom):
-                    ax1.plot(phs_model, random_models[rand,:]*ppt, color='orangered', alpha=0.5, lw=1., zorder=25)
+                    ax1.plot(phs_model, random_models[rand,:]*ppt, color='#eb6834', alpha=0.5, lw=1., zorder=25)
             
             # Limits
             ## Maximum of the transit model would always be 1. (or, 0 in case we have phase curve model, and we decided to use ppm)
@@ -857,7 +860,7 @@ class julietPlots(object):
             # -------------------------------------------
             #        Bottom left: transit residuals
             # -------------------------------------------
-            ax2.errorbar(phs, residuals*ppt*1e6, fmt='.', elinewidth=0.5, markersize=1.5, alpha=0.5, color='dodgerblue', zorder=1)
+            ax2.errorbar(phs, residuals*ppt*1e6, fmt='.', elinewidth=0.5, markersize=1.5, alpha=0.5, color='#86b6ef', zorder=1)
             ax2.axhline(y=0., ls='--', color='k', zorder=50)
 
             # Limits (x-limit same as the top axis; for y-lim, we will set 3-sigma from median)
@@ -896,8 +899,8 @@ class julietPlots(object):
                         _, bin_res_tra, bin_reserr_tra, _ = lcbin(time=phs[idx_transits], flux=residuals[idx_transits]*1e6, binwidth=binwid)
 
                 # Plotting them
-                ax1.errorbar(bin_phs_tra, bin_fl_tra, yerr=bin_fle_tra, fmt='o', c='navy', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
-                ax2.errorbar(bin_phs_tra, bin_res_tra, yerr=bin_reserr_tra, fmt='o', c='navy', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
+                ax1.errorbar(bin_phs_tra, bin_fl_tra, yerr=bin_fle_tra, fmt='o', c='#184f95', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
+                ax2.errorbar(bin_phs_tra, bin_res_tra, yerr=bin_reserr_tra, fmt='o', c='#184f95', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
 
                 # Setting y-lim on residuals based on binned residuals
                 _robust_ylim(ax2, bin_res_tra)
@@ -910,19 +913,19 @@ class julietPlots(object):
                 # -------------------------------------------
                 #         Top right: phase curve
                 # -------------------------------------------
-                ax3.errorbar(phs, detrend_data, fmt='.', elinewidth=0.5, markersize=1.5, alpha=0.5, color='dodgerblue', zorder=1)
+                ax3.errorbar(phs, detrend_data, fmt='.', elinewidth=0.5, markersize=1.5, alpha=0.5, color='#86b6ef', zorder=1)
                 if (not one_plot) or highres:
                     ## If we are making one plot, then we can take this outside of the loop
-                    ax3.plot(phs_model, detrend_model, color='navy', lw=2.5, zorder=50)
+                    ax3.plot(phs_model, detrend_model, color='#184f95', lw=2.5, zorder=50)
                 ax3.axhline(0.0, color='k', ls='--', lw=1.5, zorder=45)
                 
                 if quantile_models:
                     if (not one_plot) or highres:
                         ## If we are making one plot, we can take this outside of the loop
-                        ax3.fill_between(phs_model, y1=lo_68CI, y2=up_68CI, color='orangered', alpha=0.15, zorder=25)
+                        ax3.fill_between(phs_model, y1=lo_68CI, y2=up_68CI, color='#eb6834', alpha=0.15, zorder=25)
                 else:
                     for rand in range(nrandom):
-                        ax3.plot(phs_model, random_models[rand,:], color='orangered', alpha=0.5, lw=1., zorder=25)
+                        ax3.plot(phs_model, random_models[rand,:], color='#eb6834', alpha=0.5, lw=1., zorder=25)
                 
                 # Limits
                 ax3.set_xlim(phmin-1., phmin)
@@ -933,7 +936,7 @@ class julietPlots(object):
                 # -------------------------------------------
                 #     Bottom right: phase curve residuals
                 # -------------------------------------------
-                ax4.errorbar(phs, residuals*1e6, fmt='.', elinewidth=0.5, markersize=1.5, alpha=0.5, color='dodgerblue', zorder=1)
+                ax4.errorbar(phs, residuals*1e6, fmt='.', elinewidth=0.5, markersize=1.5, alpha=0.5, color='#86b6ef', zorder=1)
                 ax4.axhline(y=0., ls='--', color='k', zorder=10)
 
                 # Limits
@@ -952,8 +955,8 @@ class julietPlots(object):
                         _, bin_res_pc, bin_reserr_pc, _ = lcbin(time=phs, flux=residuals*1e6, binwidth=1/nos_bin_pc)
 
                     # Plotting them
-                    ax3.errorbar(bin_phs_pc, bin_fl_pc, yerr=bin_fle_pc, fmt='o', c='navy', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
-                    ax4.errorbar(bin_phs_pc, bin_res_pc, yerr=bin_reserr_pc, fmt='o', c='navy', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
+                    ax3.errorbar(bin_phs_pc, bin_fl_pc, yerr=bin_fle_pc, fmt='o', c='#184f95', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
+                    ax4.errorbar(bin_phs_pc, bin_res_pc, yerr=bin_reserr_pc, fmt='o', c='#184f95', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
 
                     _robust_ylim(ax4, bin_res_pc)
 
@@ -1055,8 +1058,8 @@ class julietPlots(object):
                     _, bin_res_tra, bin_reserr_tra, _ = lcbin(time=bin_phs[idx_transits], flux=bin_res[idx_transits]*1e6, binwidth=binwid)
 
             # Plotting them
-            ax1.errorbar(bin_phs_tra, bin_fl_tra, yerr=bin_fle_tra, fmt='o', c='navy', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
-            ax2.errorbar(bin_phs_tra, bin_res_tra, yerr=bin_reserr_tra, fmt='o', c='navy', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
+            ax1.errorbar(bin_phs_tra, bin_fl_tra, yerr=bin_fle_tra, fmt='o', c='#184f95', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
+            ax2.errorbar(bin_phs_tra, bin_res_tra, yerr=bin_reserr_tra, fmt='o', c='#184f95', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
 
             # Setting y-lim on residuals based on binned residuals
             _robust_ylim(ax2, bin_res_tra)
@@ -1073,8 +1076,8 @@ class julietPlots(object):
                     _, bin_res_pc, bin_reserr_pc, _ = lcbin(time=bin_phs, flux=bin_res*1e6, binwidth=1/nos_bin_pc)
 
                 # Plotting them
-                ax3.errorbar(bin_phs_pc, bin_fl_pc, yerr=bin_fle_pc, fmt='o', c='navy', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
-                ax4.errorbar(bin_phs_pc, bin_res_pc, yerr=bin_reserr_pc, fmt='o', c='navy', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
+                ax3.errorbar(bin_phs_pc, bin_fl_pc, yerr=bin_fle_pc, fmt='o', c='#184f95', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
+                ax4.errorbar(bin_phs_pc, bin_res_pc, yerr=bin_reserr_pc, fmt='o', c='#184f95', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
 
                 _robust_ylim(ax4, bin_res_pc)
 
@@ -1096,18 +1099,18 @@ class julietPlots(object):
                 # ---------------------------------------------------
                 
                 ## ----------- We can now plot the models (detrended and quantile models)
-                ax1.plot(bin_phs, all_models_for_plotting*ppt, color='navy', lw=2.5, zorder=50)
+                ax1.plot(bin_phs, all_models_for_plotting*ppt, color='#184f95', lw=2.5, zorder=50)
                 if quantile_models:
-                    ax1.fill_between(bin_phs, y1=all_l68_mods_plotting*ppt, y2=all_u68_mods_plotting*ppt, color='orangered', alpha=0.5, zorder=25)
+                    ax1.fill_between(bin_phs, y1=all_l68_mods_plotting*ppt, y2=all_u68_mods_plotting*ppt, color='#eb6834', alpha=0.5, zorder=25)
 
                 # ---------------------------------------------------
                 #           For phase curve
                 # ---------------------------------------------------
                 if phasecurve:
                     ## ----------- We can now plot the models (detrended and quantile models)
-                    ax3.plot(bin_phs, all_models_for_plotting, color='navy', lw=2.5, zorder=50)
+                    ax3.plot(bin_phs, all_models_for_plotting, color='#184f95', lw=2.5, zorder=50)
                     if quantile_models:
-                        ax3.fill_between(bin_phs, y1=all_l68_mods_plotting, y2=all_u68_mods_plotting, color='orangered', alpha=0.5, zorder=25)
+                        ax3.fill_between(bin_phs, y1=all_l68_mods_plotting, y2=all_u68_mods_plotting, color='#eb6834', alpha=0.5, zorder=25)
 
         if one_plot:
             # ---------------------------------------------------
@@ -1160,6 +1163,7 @@ class julietPlots(object):
         else:
             return fig, ax1, ax2, ax3, ax4
 
+    @styled
     def plot_fake_allan_deviation(self, instruments=None, binmax=10, method='pipe', timeunit=None):
         """Compute and plot per-instrument noise-vs-bin-size curves.
 
@@ -1230,6 +1234,7 @@ class julietPlots(object):
 
         return figs_all, axs_all, binsize_all, noise_all, white_noise_all
     
+    @styled
     def plot_corner(self, planet_only=False, param_list=None, save=True):
         """Create a corner plot of selected posterior parameters.
 
@@ -1374,7 +1379,8 @@ class julietPlots(object):
 
         return fig
     
-    def plot_gp(self, instruments=None, highres=False, one_plot=False, figsize=(16/1.5, 9/1.5), pycheops_binning=False, xlabel='GP regressor', robust_errors=False, plot_errorbars=False, parameter_vector=None, nos_bin=20):
+    @styled
+    def plot_gp(self, instruments=None, highres=False, one_plot=False, figsize=(9, 5.4), pycheops_binning=False, xlabel='GP regressor', robust_errors=False, plot_errorbars=False, parameter_vector=None, nos_bin=20):
         """Plot the Gaussian Process component(s) from the fitted `juliet` model.
 
         This routine computes and plots the GP model (and binned data)
@@ -1524,7 +1530,7 @@ class julietPlots(object):
             # Plotting the "raw" data
             errorbars = self.detrended_errs[instruments[i]]*1e6 if plot_errorbars else None
             alp = 0.3 if plot_errorbars else 0.8
-            axs.errorbar(self._gpx(instruments[i]), self.gp_data[instruments[i]]*1e6, yerr=errorbars, fmt='.', elinewidth=0.3, markersize=1.5, alpha=alp, color='dodgerblue', zorder=1)
+            axs.errorbar(self._gpx(instruments[i]), self.gp_data[instruments[i]]*1e6, yerr=errorbars, fmt='.', elinewidth=0.3, markersize=1.5, alpha=alp, color='#86b6ef', zorder=1)
             
             # ------------------------------------------
             #    Now, we can plot the bin data and
@@ -1543,15 +1549,15 @@ class julietPlots(object):
                 else:
                     binwid = np.ptp( self._gpx(instruments[i]) ) / nos_bin
                     bin_tim, bin_fl, bin_fle, _ = lcbin(time=self._gpx(instruments[i]), flux=self.gp_data[instruments[i]]*1e6, binwidth=binwid)
-                axs.errorbar(bin_tim, bin_fl, yerr=bin_fle, fmt='o', c='navy', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
+                axs.errorbar(bin_tim, bin_fl, yerr=bin_fle, fmt='o', c='#184f95', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
                     
                 # And now models
                 ## If we don't need highres model, we can simply plot what we have
                 ## Else, we need to create highres model first
-                axs.plot(gp_model_regressor[instruments[i]], gp_med_model[instruments[i]]*1e6, color='navy', lw=1.5, zorder=50)
+                axs.plot(gp_model_regressor[instruments[i]], gp_med_model[instruments[i]]*1e6, color='#184f95', lw=1.5, zorder=50)
                 
                 # If we are making one plot per instrument (i.e., one_plot=False), we can simply plot quantile models right here
-                axs.fill_between(gp_model_regressor[instruments[i]], y1=gp_lo68[instruments[i]]*1e6, y2=gp_up68[instruments[i]]*1e6, color='orangered', alpha=0.5, zorder=25)
+                axs.fill_between(gp_model_regressor[instruments[i]], y1=gp_lo68[instruments[i]]*1e6, y2=gp_up68[instruments[i]]*1e6, color='#eb6834', alpha=0.5, zorder=25)
 
                 # Labels, limits
                 axs.set_xlabel(xlabel)
@@ -1589,7 +1595,7 @@ class julietPlots(object):
             else:
                 binwid = np.ptp( bin_gp_reg ) / nos_bin / len(instruments)
                 bin_tim, bin_fl, bin_fle, _ = lcbin(time=bin_gp_reg, flux=bin_resids, binwidth=binwid)
-            axs.errorbar(bin_tim, bin_fl, yerr=bin_fle, fmt='o', c='navy', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
+            axs.errorbar(bin_tim, bin_fl, yerr=bin_fle, fmt='o', c='#184f95', elinewidth=2, capthick=2, capsize=3, mfc='white', zorder=100)
 
             if highres:
                 # ------------------------------------------
@@ -1603,16 +1609,16 @@ class julietPlots(object):
                                                      resids=bin_resids[idx_gp_reg_sort]/1e6, errors=bin_errors[idx_gp_reg_sort]/1e6,\
                                                      parameter_vector=parameter_vector)
                 
-                axs.plot(pred_time, gp_quantiles[0,:]*1e6, color='navy', lw=1.5, zorder=50)
-                axs.fill_between(pred_time, y1=gp_quantiles[2,:]*1e6, y2=gp_quantiles[1,:]*1e6, color='orangered', alpha=0.5, zorder=25)
+                axs.plot(pred_time, gp_quantiles[0,:]*1e6, color='#184f95', lw=1.5, zorder=50)
+                axs.fill_between(pred_time, y1=gp_quantiles[2,:]*1e6, y2=gp_quantiles[1,:]*1e6, color='#eb6834', alpha=0.5, zorder=25)
 
             else:
                 ## First, sorting according to regressors, and then plotting the full model
                 idx_reg_sort = np.argsort(all_regressors_for_plotting)
-                axs.plot(all_regressors_for_plotting[idx_reg_sort], all_models_for_plotting[idx_reg_sort], color='navy', lw=1.5, zorder=50)
+                axs.plot(all_regressors_for_plotting[idx_reg_sort], all_models_for_plotting[idx_reg_sort], color='#184f95', lw=1.5, zorder=50)
                 
                 # We can plot qunatile models here, if highres=False
-                axs.fill_between(all_regressors_for_plotting[idx_reg_sort], y1=all_l68_mods_plotting[idx_reg_sort], y2=all_u68_mods_plotting[idx_reg_sort], color='orangered', alpha=0.5, zorder=25)
+                axs.fill_between(all_regressors_for_plotting[idx_reg_sort], y1=all_l68_mods_plotting[idx_reg_sort], y2=all_u68_mods_plotting[idx_reg_sort], color='#eb6834', alpha=0.5, zorder=25)
             
             # Labels, limits
             axs.set_xlabel(xlabel)
