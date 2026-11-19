@@ -6,7 +6,7 @@ requires = [
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "jstark"
+name = "jwstark"
 description = "Tool to reduce, extract, and analyse JWST timeseries data"
 requires-python = ">=3.11"
 readme = { file = "README.rst", content-type = "text/x-rst" }
@@ -37,8 +37,12 @@ test = [
     "pytest-cov",
 ]
 docs = [
-    "sphinx",
+    "sphinx>=7",
     "sphinx-automodapi",
+    "pydata-sphinx-theme",
+    "sphinx-copybutton",
+    "nbsphinx",
+    "ipython",
 ]
 [project.urls]
 repository = "https://github.com/Jayshil/jstark"

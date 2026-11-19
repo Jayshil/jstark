@@ -1,0 +1,4 @@
+/* Wider tables of results stay readable on narrow screens. */
+.bd-article table.docutils { display: block; overflow-x: auto; }
+/* Pipeline diagram on the home page. */
+pre.pipeline { line-height: 1.35; font-size: 0.85em; }

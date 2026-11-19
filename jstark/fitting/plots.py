@@ -600,8 +600,8 @@ class julietPlots(object):
         -------
         If a single combined plot is produced the function returns the
         combined ``fig`` and the primary axes used. If multiple figures are
-        generated, the function returns lists: ``figs_all, axs1_all,
-        axs2_all, axs3_all, axs4_all`` corresponding to created figures and
+        generated, the function returns lists: ``figs_all``, ``axs1_all``,
+        ``axs2_all``, ``axs3_all``, ``axs4_all`` corresponding to created figures and
         their axes panels.
 
         """

@@ -137,6 +137,8 @@ trace and background masks) are stored in ``s1.diagnostics`` and in a
 ``*_stage1diag.npz`` file per segment. :mod:`jstark.reduction.diagnostics`
 provides plotting functions for all of them.
 
+.. _disk-space:
+
 Disk space
 ----------
 
@@ -172,9 +174,10 @@ Mode                      Group-level background / 1/f   Notes
 ========================  =============================  ===========================
 NIRSpec (all gratings)    column median, trace masked    dark skipped
 NIRISS SOSS               column, difference-image       dark applied
-NIRCam F444W / F322W2     row, readout-time model,       side reference pixels used
-                          offsets also measured on the
-                          faint trace wings
+NIRCam F444W / F322W2     row, readout-time model with   side reference pixels used
+                          a common mode across
+                          amplifiers (background pixels
+                          only)
 MIRI LRS / imaging        none                           emicorr, lastframe, reset,
                                                          dark; firstframe, rscd and
                                                          refpix skipped (as the
@@ -184,3 +187,9 @@ MIRI LRS / imaging        none                           emicorr, lastframe, res
 Jump detection is ``temporal_jump`` (window 11 integrations, 10 sigma) for
 all modes; the standard ``jump`` step can be enabled instead with
 ``s1.set('jump', skip=False); s1.set('temporal_jump', skip=True)``.
+
+The tests behind these defaults are shown in the tutorials: NIRSpec/PRISM
+saturation and 1/f in :doc:`../tutorials/wasp39b_prism`, the NIRCam 1/f
+correction (and why the trace wings are not used) in
+:doc:`../tutorials/wasp39b_nircam`, and the MIRI recipe in
+:doc:`../tutorials/wasp43b_miri_lrs` and :doc:`../tutorials/gj3929b_miri_f1500w`.

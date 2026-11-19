@@ -410,6 +410,35 @@ class BroadbandFit:
                              'light_travel_delay=True, stellar_radius=<R*/Rsun> (juliet then '
                              'computes the eclipse time from P, t0, ecc, omega), or give a '
                              f'{missing[0]} prior (e.g. normal around t0 + P/2).')
+        # A *fixed* t_secondary is ignored while the orbit varies: batman converts
+        # t_secondary into a conjunction time only when t_secondary changes between
+        # calls, and juliet writes the given t0 back into the batman parameters on every
+        # call, so the eclipse is placed at the time implied by t0, ecc, omega (t0 + P/2
+        # for a circular orbit), not at t_secondary. A free t_secondary changes on every
+        # call and is handled correctly.
+        orbit = ('P', 't0', 'a', 'b', 'inc', 'ecc', 'omega', 'r1', 'r2', 'esinomega',
+                 'ecosomega', 'sesinomega', 'secosomega')
+        for pl in planets:
+            p = self.priors.get(f't_secondary_{pl}')
+            if p is None or p['distribution'] != 'fixed':
+                continue
+            free = [k for k, v in self.priors.items() if v['distribution'] != 'fixed'
+                    and ((k.split('_')[0] in orbit and k.split('_')[1:2] == [pl]) or k == 'rho')]
+            # harmless when it is where t0 puts it anyway (circular orbit, t0 and P fixed)
+            fixed = {n: self.priors.get(f'{n}_{pl}') for n in ('t0', 'P', 'ecc')}
+            if all(v is not None and v['distribution'] == 'fixed' for v in fixed.values()):
+                t0, per, ecc = (float(fixed[n]['hyperparameters']) for n in ('t0', 'P', 'ecc'))
+                dt = (float(p['hyperparameters']) - t0 - per / 2) % per
+                if ecc == 0 and min(dt, per - dt) < 1. / 86400:
+                    free = []
+            if free:
+                raise ValueError(
+                    f'Fixed t_secondary_{pl} with a varying orbit ({", ".join(free)}): juliet '
+                    'would place the eclipse at the time implied by t0, ecc and omega (t0 + P/2 '
+                    'for a circular orbit), not at t_secondary_' + pl + '. Give it a narrow free '
+                    "prior instead (e.g. ('normal', [t_sec, sigma])), or fix ecc and omega to "
+                    'values that put the eclipse at that time and fit with '
+                    'light_travel_delay=True, stellar_radius=<R*/Rsun>.')
 
     @classmethod
     def load(cls, out_folder, verbose=False):

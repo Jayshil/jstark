@@ -611,8 +611,10 @@ class ApPhoto(object):
         PCA eigenvectors/values and projected time-series) populated by
         :meth:`pixel_level_decorrelation`.
 
-    Main methods
-    ------------
+    Notes
+    -----
+    Main methods:
+
     identify_crays(clip, niters)
         Flag cosmic-ray affected pixels and update ``badpix``.
     replace_nan(max_iter)
@@ -624,8 +626,6 @@ class ApPhoto(object):
     pixel_level_decorrelation(removeNan)
         Build normalized pixel level light curves and compute PCA basis for PLD.
 
-    Notes
-    -----
     The class stores both raw inputs and intermediate results used by
     subsequent calls; many methods modify the instance in-place and
     also return results for convenience.
@@ -1079,6 +1079,7 @@ class ApPhoto(object):
         """Compute aperture photometry for each frame in the data cube.
 
         The function supports three methods:
+
         - ``manual``: sums pixels inside a binary aperture mask and subtracts
           the estimated sky background per pixel computed from a sky annulus.
         - ``photutils``: uses ``photutils`` aperture classes to compute

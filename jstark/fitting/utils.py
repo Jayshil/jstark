@@ -21,6 +21,9 @@ from pathlib import Path
 import multiprocessing
 import os
 
+__all__ = ['t14', 'b_to_inc', 'inc_to_b', 'rho_to_ar', 'cowan_agol', 'phase_curve_quantities', 'pipe_mad', 'lcbin', 'rms', 'fake_allan_deviation', 'corner_plot', 'make_psd', 'psd_fitting_kernel', 'planck_func', 'BrightnessTemperatureCalculator']
+
+
 def t14(per, ar, rprs, b, ecc=0, omega=90, transit=True):
     """
     To compute transit/eclipse duration from Period, a/R*, Rp/R*, b, eccentricity, and omega
@@ -41,9 +44,9 @@ def t14(per, ar, rprs, b, ecc=0, omega=90, transit=True):
         Argument of periastron (deg)
     transit: bool
         Whether to compute transit or occultation duration
-    -----------
-    return
-    -----------
+
+    Returns
+    -------
     t14 : float, or numpy.ndarray
         Transit/occultation duration, in days
     """
@@ -644,10 +647,10 @@ class BrightnessTemperatureCalculator:
     pout : str, optional
         Output directory used to cache results. Default current working dir.
 
-    Methods
-    -------
-    compute()
-        Run the calculation and return temperature(s) in Kelvin (float or 1D ndarray).
+    Notes
+    -----
+    Call :meth:`compute` to run the calculation; it returns the
+    temperature(s) in Kelvin (float or 1D ndarray).
     """
 
     def __init__(self, fp, rprs, bandpass, nthreads=multiprocessing.cpu_count(),

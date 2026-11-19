@@ -94,7 +94,7 @@ Overview
      depths were biased deep by ~7000 ppm. Partially saturated columns
      with 2–4 usable groups are kept, but their depths are also biased
      (by up to ~1500 ppm with optimal weights on WASP-39 b). Check
-     ``SATGRP_On`` before using them (``docs/extraction_notes.md`` §5.14).
+     ``SATGRP_On`` before using them (see :doc:`../tutorials/wasp39b_prism`).
    * ``ex.set('extract', saturated_box=True)`` extracts every column whose
      aperture holds a saturating pixel with the box sum, and keeps the
      optimal estimate elsewhere. Optimal weights follow the number of
@@ -102,7 +102,7 @@ Overview
      shape (brighter-fatter). On WASP-39 b (PRISM), checked against the
      NIRISS SOSS spectrum, this removes the bias of the saturated bins
      (+391 → −48 ppm on average) without larger errors
-     (``docs/extraction_notes.md`` §5.15). The header key ``SATBOX`` of
+     (see :doc:`../tutorials/wasp39b_prism`). The header key ``SATBOX`` of
      ``SATGRP_On`` records the setting.
    * ``method='box'``: aperture sum, masked pixels filled with the model.
      The box spectra are always saved as well.
@@ -191,7 +191,8 @@ exposures are never stitched (join them at the light-curve level with
 exposures that fitted the PSF are listed in ``psf_exposures`` (also in the
 extraction model and the ``PARAMS`` of the spectra file).
 
-Why: a PSF fitted per exposure differs between exposures by its own noise,
+Why (see :doc:`../tutorials/wasp43b_miri_lrs`): a PSF fitted per exposure
+differs between exposures by its own noise,
 and the optimal flux scales with the profile. On WASP-43 b this gave flux
 steps of -2.5 and +0.4 ppt between the exposures, which a phase-curve fit
 absorbs (nightside 243 ppm instead of ~1600). With one PSF per visit the
@@ -299,9 +300,3 @@ Diagnostics
 ``plot_psf_width``, ``plot_residuals``, ``plot_optimisation``,
 ``plot_white_light``, ``plot_regressors``, ``plot_spectra``,
 ``plot_photometry``, ``plot_contaminants``.
-
-API
----
-
-.. automodapi:: jstark.extraction
-   :no-inheritance-diagram:

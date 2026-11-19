@@ -317,6 +317,61 @@ Connors et al.: 118 +- 22 joint (-54 min); per visit 190 +- 40, 155 +- 34,
   from the model, so binned points of a low-S/N eclipse can fall outside
   (open).
 
+**Correction (2026-11-19): E and F were not at -54 min.** With a *fixed*
+`t_secondary` and a varying orbit (here free a/R*, b), juliet + batman put
+the eclipse at the time implied by t0 (phase 0.5 for e = 0), not at
+`t_secondary`. batman (2.5.1) converts `t_secondary` into a conjunction time
+only when `t_secondary` differs from its value at the previous call, and
+juliet (2.2.10) writes the given t0 into the batman parameters on every call;
+whenever a/R* or b change, batman then recomputes the orbit from the raw t0.
+A free `t_secondary` changes on every call and is handled correctly (D: the
+evaluated eclipse sits at its posterior time, -8 min). Checked on the loaded
+fits (juliet's own model for F has `params.t_secondary` = -54.0 min, but its
+eclipse is centred at phase 0.5) and with a minimal batman reproduction.
+Consequences:
+- E and F are fits at **phase 0.5**, not at Connors' time. "Joint depth
+  reproduced" (F 117 +- 19 vs 118 +- 22) and the E per-visit depths are
+  therefore not comparisons at the same eclipse time.
+- The sampling statements above that use F (max lnL 70636.6 "at -54 min",
+  lnZ_F > lnZ_D, "D lost the -54 min mode") compare D with a phase-0.5 fit and
+  no longer hold. The per-visit least-squares profile (scratch script, no
+  juliet) is unaffected.
+- jstark: `BroadbandFit.fit` now refuses a fixed `t_secondary` while the orbit
+  varies (unless it equals t0 + P/2 for a circular orbit with t0 and P
+  fixed); test `test_fixed_t_secondary_with_varying_orbit_is_refused`;
+  fitting.rst explains it. To impose an eclipse time, use a narrow free prior.
+- Re-done on the reduction with the current MIRI defaults (Stage 1
+  2026-11-19, `<visit>/reduction_current/`; `fit_gj3929_current.py`,
+  `fits/current_eclipses_<D|F|E>`), with `t_secondary` normal(-54, 2 min) for
+  F and E: see below.
+- To report upstream (juliet), with the minimal reproduction.
+
+**Redo on the current-default reduction (2026-11-19).** Stage 1 8-18 min per
+exposure (sequential, ramp_fit 4 cores); each fit ~18-22 min (dynesty, 8
+threads). Same models as before (trim 500/1500, ramp 1, linear time, xc, yc).
+Juliet-only check of the bug first (`juliet_fixed_tsec_repro.py`, injected
+500 ppm at -54 min, free a/R*): fixed `t_secondary` -> 42 +- 20 ppm;
+normal(-54 min, 30 s) -> 498 +- 20 ppm at -54.0 min.
+
+| Fit | Eclipse time (min from phase 0.5) | fp (ppm) | lnZ | max lnL |
+| --- | --- | --- | --- | --- |
+| D | uniform +-72 -> -8.5 +- 1.4 (94%; ~3% at +60..+72, prior edge) | 134 +- 20 | 70697.3 | 70969.1 |
+| F | normal(-54, 2) -> -51.4 +- 1.6 | 111 +- 18 | 70693.8 | 70958.9 |
+| E | normal(-54, 2), fp per visit -> -53.6 | V1 65 +- 41, V2 160 +- 27, V3 77 +- 30, V4 89 +- 64 | 70668.4 | 70960.9 |
+
+- Joint depth at Connors' time 111 +- 18 vs their 118 +- 22; with the time
+  free 134 +- 20 (old reduction 128 +- 20, also at -8 min).
+- The data (this reduction and systematics model) prefer -8 min: max lnL
+  10.3 above F's, and lnZ_D - lnZ_F = +3.6 despite D's 144-min prior. In D
+  the best sample within -60..-45 min is 70950.9, 8 below F's max there:
+  dynesty does not resolve the maximum of a mode with negligible posterior
+  weight, as expected, but that mode is genuinely disfavoured here.
+  Red noise (beta_128 up to 1.6, V3) inflates lnL differences by ~beta^2, so
+  the -8 vs -54 preference should not be over-read.
+- Per visit (E): V2, V3, V4 agree with Connors (155, 60, 97); V1 lower
+  (Connors 190). lnZ_E - lnZ_F = -25.
+- The tutorial (gj3929b_miri_f1500w.ipynb) uses these fits.
+
 ### 5.4 WASP-39 b NIRSpec PRISM transmission spectrum vs the ERS benchmark
 
 Scripts: `.../jwst-ers/Data/NRSPR/reduction/fits/fit_spec_prism.py` (fit)

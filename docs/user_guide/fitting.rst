@@ -30,12 +30,13 @@ named *regressors* (per-integration time series)::
     # anything else
     lc = LightCurves(times, flux2d, err2d, wavelength=wave, regressors={'roll': roll})
 
-Useful methods (each returns a new object):
+``white_light()`` returns the **sum** of the channels and its error as
+arrays (channels that are NaN in most integrations, e.g. saturated or
+contaminated columns, are left out; for a photometric dataset it is the
+light curve itself). :class:`~jstark.fitting.BroadbandFit` computes it
+itself, so pass the dataset, not its white light. Useful methods that return
+a new dataset:
 
-* ``white_light()``: the **sum** of the channels and its error (channels
-  that are NaN in most integrations, e.g. saturated or contaminated
-  columns, are left out). For a photometric dataset it is the light curve
-  itself.
 * ``select_channels(wave_range=(2, 5.35))``: keep a wavelength range.
 * ``bin(nbins=...)`` or ``bin(edges=...)``: sum channels into wavelength
   bins.
@@ -44,12 +45,13 @@ Useful methods (each returns a new object):
   ``time_range``.
 * ``clip(nsigma=5, window=31)``: remove outliers against a running median
   of the white light.
-* ``add_regressor(name, values)``: any array ``(nint,)`` or ``(nint, k)``;
-  ``per_channel=True`` for an array ``(nint, nchan)`` with one column per
-  channel (``bin`` averages it over the summed channels, weighted by their
-  flux).
-* ``split()``: one dataset per channel group (NIRCam: per readout
+* ``split()``: a dict with one dataset per channel group (NIRCam: per readout
   amplifier, ``A1`` ... ``A4``).
+
+``add_regressor(name, values)`` adds a regressor to the dataset in place:
+any array ``(nint,)`` or ``(nint, k)``, or with ``per_channel=True`` an
+array ``(nint, nchan)`` with one column per channel (``bin`` averages it
+over the summed channels, weighted by their flux).
 
 Built-in regressors: ``time`` (days from the middle of the dataset),
 ``time2``, ``time3`` and ``phase4`` (three indicator columns for
@@ -140,6 +142,17 @@ the eclipse time instead, give a ``t_secondary_p1`` prior and leave
 ``light_travel_delay`` off; one ``t_secondary`` serves all visits (the model
 is periodic in ``P``).
 
+**Do not fix** ``t_secondary`` **to a value away from** ``t0 + P/2`` while
+the orbit is fitted (e.g. free ``a`` or ``b``). batman turns ``t_secondary``
+into a conjunction time only when ``t_secondary`` changes between calls,
+and juliet writes ``t0`` into the model parameters on every call, so a fixed
+``t_secondary`` is ignored and the eclipse lands at the time implied by
+``t0``, ``ecc`` and ``omega`` (``t0 + P/2`` for a circular orbit).
+:meth:`~jstark.fitting.BroadbandFit.fit` refuses this combination. To impose
+an eclipse time measured elsewhere, give it a narrow free prior instead,
+e.g. ``'t_secondary_p1': ('normal', [t_sec, sigma])``, which also carries
+its uncertainty into the depth.
+
 A free eclipse time on low signal-to-noise eclipses can give a multimodal
 posterior (each visit's red noise prefers its own time), and the sampler
 with default settings may settle in one mode, even one with a negative
@@ -176,6 +189,8 @@ jitter) and the red-noise factor beta for several bin sizes.
 Example: several eclipses observed with MIRI
 --------------------------------------------
 
+The complete analysis is the tutorial :doc:`../tutorials/gj3929b_miri_f1500w`.
+
 .. code-block:: python
 
     from jstark.fitting import LightCurves, BroadbandFit
@@ -197,6 +212,8 @@ is intended here (no transit in eclipse data).
 
 Phase curves
 ------------
+
+A complete example is the tutorial :doc:`../tutorials/wasp43b_miri_lrs`.
 
 jstark uses juliet's Cowan & Agol (2008) model. The planet flux relative to
 the star is
@@ -418,9 +435,3 @@ Results:
 The ``Spectrum`` table has one row per finished bin, with every fitted or
 derived planet and limb-darkening parameter ``x`` as ``x``, ``x_errp`` and
 ``x_errm``; ``Spectrum.read('spectrum/spectrum.ecsv')`` reads it back.
-
-API
----
-
-.. automodapi:: jstark.fitting
-   :no-inheritance-diagram:
