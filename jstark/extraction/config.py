@@ -27,7 +27,13 @@ Parameters are grouped by step:
     static response factor per detector pixel, see
     :meth:`SpectralExtractor.fit_psf`), ``cv`` (cross-validation folds for
     ``smooth='cv'``: 'phase' = sub-pixel phase of the offset from the trace,
-    'ints' = even/odd integrations, 'columns' = column blocks).
+    'ints' = even/odd integrations, 'columns' = column blocks), ``breaks``
+    (global integration numbers, 0-based, at which the PSF changes abruptly,
+    e.g. a mirror-segment tilt: each epoch between breaks gets its own PSF,
+    pixel-response map and variance map, and chunks never span a break, so
+    the temporal rejection compares each pixel only with integrations of
+    the same epoch. Default None; :meth:`SpectralExtractor.run` warns when
+    the per-integration ``dy`` / ``ds`` show an abrupt, lasting step).
 ``extract``
     ``method`` ('optimal', 'box' or 'covariance'), ``aperture`` (half-width),
     ``variance`` ('mean' = time-averaged per-pixel variance, or 'data'),
@@ -65,7 +71,8 @@ DEFAULTS = {
     'background': dict(method='median', inner=8., outer=None, nsigma=3., maxiters=3,
                        poly_order=1, min_pixels=4),
     'psf': dict(halfwidth=7., oversample=2., knot_col=20, smooth='cv', clip=6.,
-                init_ints=200, ints='all', second_pass=False, pixel_correction=True, cv='phase'),
+                init_ints=200, ints='all', second_pass=False, pixel_correction=True, cv='phase',
+                breaks=None),
     'extract': dict(method='optimal', aperture=5., variance='mean', reject=6., reject_iters=3,
                     reject_mode='temporal', fit_background=False, refine_shift=2, joint_iters=3,
                     max_maskfrac=0.98, min_groups=2, cov_scale=1., saturated_box=False),

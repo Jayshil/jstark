@@ -65,6 +65,28 @@ Overview
      motion, keeps all smooth structure. Each factor is shrunk towards 1
      according to its own precision (pixels far in the wings, with little
      light, would otherwise get noisy factors).
+   * **Abrupt PSF changes** (``breaks``). A mirror-segment tilt changes the
+     PSF from one integration to the next (WASP-39 b NIRSpec/G395H: at
+     integration 269, the PSF ~3 per cent wider and the trace 12 mpx lower).
+     One PSF for the whole exposure then fits neither side, which rescales
+     the optimal flux after the tilt by a wavelength-dependent amount, and
+     the temporal rejection fails in the chunk that contains the tilt
+     (most of the aperture rejected in the minority part). Give the
+     integration at which the new epoch starts (0-based, counted from the
+     first integration given to the extractor, i.e. from the start of the
+     exposure when all segments are processed)::
+
+         ex.set('psf', breaks=[269])
+
+     Each epoch between breaks gets its own PSF, pixel-response map and
+     variance map, fitted from its own integrations, and no chunk spans a
+     break. The spectra get a per-integration ``epoch`` regressor. The flux
+     still steps at the break (the tilt moves light, some of it out of the
+     PSF window): fit a step in the light curves. :meth:`run` warns when
+     the per-integration ``dy`` / ``ds`` show an abrupt, lasting step that
+     is not declared (:func:`jstark.extraction.metrics.find_psf_breaks`).
+     The complete example, light-curve fits included, is the tutorial
+     :doc:`../tutorials/wasp39b_g395h`.
 
 4. **Extraction** (:meth:`~jstark.extraction.SpectralExtractor.run`):
 
@@ -88,7 +110,10 @@ Overview
      (default 2) usable groups before saturation are set to NaN in every
      integration. This uses the Stage 1 saturation map (copied into the
      ``cleaninfo`` file as ``SATMAP``, or read from
-     ``<exposure>_saturation_map.fits`` next to it). With the default,
+     ``<exposure>_saturation_map.fits`` next to it). Static bad pixels of
+     the CRDS mask (dead, hot), which the ``saturation`` step flags from
+     group 0, and their neighbours flagged only by its growth, are not in
+     that map (they are in its ``STATIC`` extension). With the default,
      columns whose core keeps only group 0 are dropped: their flux would
      come from the wings alone, and on WASP-39 b (PRISM) their transit
      depths were biased deep by ~7000 ppm. Partially saturated columns

@@ -1,6 +1,6 @@
 # jstark spectral extraction and photometry: development notes
 
-As of 2026-11-14. The record of what was discussed, decided, implemented
+As of 2026-11-20. The record of what was discussed, decided, implemented
 and measured while building the extraction stage of jstark
 (`jstark/extraction/`), for anyone continuing the work, including future
 work sessions. The code and its docstrings remain the reference for
@@ -98,8 +98,10 @@ Tests: `jstark/tests/test_extraction.py`, with synthetic data:
 - field-star trace model (dy refinement, target bias 27% → 0.7%);
 - disk options (`remove_inputs`, `keep_segments`) and `WAVE_O1`;
 - saturated columns (saturation map → `SATMAP` in cleaninfo →
-  `SATGRP_O1`; group-0-only columns NaN, `min_groups=1` keeps them).
-42 tests in `jstark/tests` pass (~40 s).
+  `SATGRP_O1`; group-0-only columns NaN, `min_groups=1` keeps them);
+- PSF epochs (`test_psf_breaks`, `test_psf_breaks_validation`, §5.17).
+The whole suite (`jstark/tests`, all stages) has 72 tests, all passing
+(~5 min, 2026-11-20).
 
 ## 3. What changed relative to stark (and why)
 
@@ -743,6 +745,104 @@ Q rms 0.038 (per exposure 0.028-0.029: less shrinkage with 3x the data).
 Boundary steps -0.475 / +0.118 ppt (box -0.448 / -0.008), the same as with
 exposure 1's PSF. Phase-curve results: `fitting_notes.md` §5.7.
 
+### 5.17 Full G395H exposure: WASP-39 b and the mirror tilt (2026-11-20)
+
+**Data.** ERS 1366 obs 3, NRS1 + NRS2, SUB2048, NRSRAPID, 70 groups x 465
+integrations (63 s each), 3 segments of 155. Products in
+`/Volumes/Jayshil SSD/JWST/jwst-ers/NRSG395H/Outputs/{NRS1,NRS2}/`; scripts
+in `Outputs/scripts/` (`run_g395h_full.py`, `redo_satmap_extract.py`,
+`compare_g395h.py`, `tilt_test_noreject.py`, `calibrate_breaks.py`); logs in
+`Outputs/logs/`. Whole pipeline per detector 9.5 min (Stage 1 ~8.5 min,
+cleaning 13 s, extraction 30 s), peak RSS 13.5 GB with `ramp_fit
+maximum_cores='4'`. Detector-level results: detector_processing_notes.md
+§6.11.
+
+**Mirror tilt at integration 269** (Alderson et al. 2023 report it). Between
+integrations 268 and 270 the PSF width regressor `ds` jumps from -0.0147 to
++0.0086 (NRS1), the trace moves by +12 mpx; integration 269 is intermediate
+(the tilt happened during it). Box white light jumps by -1900 / -1960 ppm
+(NRS1 / NRS2). With the default extraction (one exposure-wide PSF, temporal
+rejection over the chunk):
+- **The temporal rejection breaks** in segment 2, which holds 115 pre-tilt
+  and 40 post-tilt integrations: each pixel's median residual over the
+  chunk is the pre-tilt one, so 2,500 pixels per integration (most of the
+  aperture) were rejected in integrations 270-309 (NRS1; NRS2 98).
+  Optimal/box white light there: -450 +- 300 ppm. Segment 3 (all post-tilt)
+  had no rejections.
+- **One PSF fits neither side**: PSF chi2 5.5 (NRS1), extraction chi2 4.3
+  before / 7.0 after; the optimal/box ratio steps by -215 / -250 ppm after
+  the tilt, varying with wavelength (-95 to -427 ppm per 0.17 um band).
+- Effect on depths (vs the ERS light curves, below): optimal +150 to +340
+  ppm per band (weighted means; band medians up to +1170) on NRS1, +170 ppm at
+  3.8-4.2 um on NRS2. Box depths were unaffected.
+
+**New: PSF epochs** (`set('psf', breaks=[...])`, global 0-based integration
+numbers at which a new epoch starts; user decision 2026-11-20: manual breaks
+plus a warning, not automatic). `fit_psf` runs the fit separately per epoch
+on that epoch's integrations (`ExposureSource.chunks/sample_ints` take
+`lo`/`hi`; `_fit_range`); each epoch keeps its PSF, Q and var_mean
+(`ex.epochs`), activated per chunk (`_use_epoch`); chunks never span a
+break (`chunks(breaks=...)`, also in `_block_chunks` for `optimise` and the
+covariance estimate). Spectra get an `epoch` column in `REG_O<n>`; the
+extraction model saves epoch 0 under the old names and later epochs as
+`PSF_O<n>_E<k>`, `QMAP_E<k>`, `VARMEAN_E<k>`; `load_model` restores them
+and fills parameters missing from older model files with the defaults.
+Not supported (NotImplementedError): breaks with a PSF shared between
+exposures, and with field-star traces.
+
+**Break warning.** `metrics.find_psf_breaks`: local step of the median over
+w = 5 integrations on either side, in units of its noise (p2p), threshold
+20, and the step must persist over 25 integrations (half of it at least).
+Calibrated on nine full exposures (`calibrate_breaks.py`): the tilt scores
+91 / 63 in `ds` (11 / 10 in `dy`); everything else stays below 10 (PRISM
+HGA move 9.8 in dy, TOI-561 G395H 8.2, G395M 7.8, MIRI LRS 5.2, NIRCam 3.2,
+SOSS 3.6). `run()` warns with the suggested `set('psf', breaks=[...])` when
+a step is found that no declared break covers. On the G395H run without
+breaks it suggests 270 (the local maximum next to the intermediate 269);
+269 was used.
+
+**With `breaks=[269]`:** PSF chi2 2.21 / 2.24 (NRS1 epochs), 1.54 / 1.58
+(NRS2); extraction chi2 1.05 on both sides; rejections back to 1-2 px/int
+except integration 269 itself (2083 / 120 px; exclude it in fits);
+optimal/box flat within each epoch (rms 11-14 ppm) with a constant +1050 /
++1290 ppm step at the tilt. The optimal white light now jumps by -885 /
+-702 ppm against the box's -1903 / -1960: the per-epoch profile (unit
+integral over the +-7 px window) keeps the light the wider post-tilt PSF
+moves beyond the +-5 px box. Either way a step regressor at 269 is needed
+in the light-curve fits. Synthetic test `test_psf_breaks` (PSF 12% wider and
+0.05 px lower from integration 150 of 240, segments of 80): warning raised;
+with the break opt/box flat to < 1e-3, both epochs chi2 < 2, epochs survive
+save/load.
+
+**Comparison with published light curves** (`compare_g395h.py`,
+`tools/ratio_depth.py`; our / reference with a fixed transit shape, ERS
+orbit and ERS exotic-ld LD per bin, linear in time plus a step at 269;
+integrations < 15 and 269 not used; `Outputs/comparison/compare_lcs.json`).
+The ERS benchmark G395H light curves are Eureka! Stage 4 (465 ints); the
+Alderson et al. 2023 Zenodo (7185300) has the ExoTiC-JEDI 10-px light curves
+(Grant; 447 ints) and 11 reductions' spectra. Columns: the ERS `x` is our
+column - 5 (from the shared noise: correlation 0.90 / 0.96 at that shift,
+~0 at the neighbours); for the same photons the wavelength solutions agree
+to < 0.1 nm.
+
+| Detector, band (um) | ours - ERS native bins (optimal) | ours - ExoTiC-JEDI 10 px (optimal) |
+| --- | --- | --- |
+| NRS1 2.70-3.00 | -9.5 +- 5.2 | -17.0 +- 7.2 |
+| NRS1 3.00-3.30 | -1.3 +- 3.6 | -6.0 +- 5.2 |
+| NRS1 3.30-3.72 | +4.8 +- 3.2 | +4.0 +- 4.4 |
+| NRS2 3.82-4.20 | +3.8 +- 4.3 | +3.7 +- 4.9 |
+| NRS2 4.20-4.60 | -10.6 +- 6.5 | -17.4 +- 7.6 |
+| NRS2 4.60-5.18 | -7.5 +- 8.7 | -1.9 +- 10.0 |
+
+- Depths agree with both reductions to <= 17 ppm per band (reduced chi2
+  0.8-1.4 per bin), much closer than PRISM (fitting_notes 5.6).
+- Noise per bin ours / reference 1.00-1.01 (5-95%: 0.92-1.08); residual
+  correlation 0.96-0.98. Box and optimal give the same depths and noise
+  here (photon-limited 70-group ramps; white-light p2p box 124 vs optimal
+  128 ppm on NRS1).
+- Our p2p / propagated error: 1.04-1.06 in native bins, 1.10-1.13 at R100
+  (some correlated noise in wider bins).
+
 ## 6. Open issues and next steps
 
 - [x] PRISM saturated columns, part 1 (§5.14): (a) columns with
@@ -760,7 +860,12 @@ exposure 1's PSF. Phase-curve results: `fitting_notes.md` §5.7.
 
 - [ ] Full exposures (all segments): red noise, PSF stability over the visit
       (`ds`, `chi2` regressors), the optimiser on several blocks. **Done for
-      PRISM (§5.14)**; the other modes remain.
+      PRISM (§5.14) and G395H (§5.17)**; the other modes remain.
+- [x] Abrupt PSF changes (mirror tilt): `psf breaks` epochs + warning
+      (§5.17).
+- [x] G395H: light-curve fits with a step at the tilt; spectrum vs the ERS
+      benchmark (R100 and native bins) and the 11 Alderson et al.
+      reductions: agree, fitting_notes §5.8.
 - [ ] SOSS: column-wise residual 1/f (per-column ratio 1.2–1.4). Revisit the
       group-level `diff` / `median` choice of Stage 1 on a full exposure;
       a scaled zodiacal background model.

@@ -10,7 +10,61 @@ import numpy as np
 
 from ..reduction.robust import MAD_TO_SIGMA, running_median
 
-__all__ = ['p2p_sigma', 'p2p_noise', 'binned_noise', 'white_light']
+__all__ = ['p2p_sigma', 'p2p_noise', 'binned_noise', 'white_light', 'find_psf_breaks']
+
+
+def find_psf_breaks(series, threshold=20., w=5, persist=25, min_sep=10):
+    """Abrupt, lasting steps in per-integration PSF regressors (e.g. a mirror tilt).
+
+    For each regressor (e.g. ``{'dy': dy, 'ds': ds}``) the local step
+    ``median(x[k:k+w]) - median(x[k-w:k])`` is compared with its noise (from
+    the point-to-point scatter). A break is reported where the score exceeds
+    ``threshold`` and the step persists: the medians over ``persist``
+    integrations on either side differ by at least half of it, in the same
+    direction. Calibrated on full exposures (docs/MD/extraction_notes.md
+    §5.17): the WASP-39 b G395H tilt scores 63-91 in ``ds``, nothing in nine
+    other exposures (transits, ramps, the PRISM high-gain-antenna move)
+    exceeds 10.
+
+    Returns
+    -------
+    list of dict
+        ``gidx`` (first integration of the new epoch), ``score``, ``key``,
+        ``step``, sorted by integration.
+    """
+    found = []
+    for key, x in series.items():
+        x = np.asarray(x, float)
+        n = len(x)
+        if n < 2 * w + 1:
+            continue
+        sig = p2p_sigma(x[np.isfinite(x)])
+        if not np.isfinite(sig) or sig <= 0:
+            continue
+        sd = sig * 1.2533 * np.sqrt(2. / w)
+        z = np.zeros(n)
+        for k in range(w, n - w + 1):
+            z[k] = (np.nanmedian(x[k:k + w]) - np.nanmedian(x[k - w:k])) / sd
+        az = np.abs(z)
+        while True:
+            k = int(np.argmax(az))
+            if az[k] < threshold:
+                break
+            az[max(0, k - min_sep):k + min_sep] = 0.
+            step = z[k] * sd
+            lo, hi = max(0, k - persist), min(n, k + persist)
+            big = np.nanmedian(x[k:hi]) - np.nanmedian(x[lo:k])
+            if np.sign(big) == np.sign(step) and abs(big) >= 0.5 * abs(step):
+                found.append(dict(gidx=k, score=float(abs(z[k])), key=key, step=float(step)))
+    # merge detections of the same event in different regressors
+    out = []
+    for f in sorted(found, key=lambda d: (d['gidx'], -d['score'])):
+        if out and abs(f['gidx'] - out[-1]['gidx']) <= min_sep:
+            if f['score'] > out[-1]['score']:
+                out[-1] = f
+            continue
+        out.append(f)
+    return out
 
 
 def p2p_sigma(y, axis=-1):

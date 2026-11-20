@@ -497,21 +497,34 @@ class Stage1:
         saturated in at least ``min_frac`` of all integrations (so that
         saturation by single cosmic rays does not count).
 
+        Static bad pixels (``DO_NOT_USE`` in the pixel DQ after ``dq_init``,
+        i.e. dead / hot / low-QE pixels of the CRDS mask) that the
+        ``saturation`` step flags, and the neighbours that saturate at the
+        same group only because the step grows the flag around them
+        (``n_pix_grow_sat``), are not saturation by the scene. They are
+        kept for ``consistent_saturation`` (Stage 1 processing is the same)
+        but left out of the returned map, which is the one saved for
+        extraction (``min_groups`` would otherwise blank whole columns);
+        they are saved in the ``STATIC`` extension.
+
         Returns
         -------
         ndarray
-            ``(ny, nx)`` map of the first saturated group (``ngroup`` = never).
+            ``(ny, nx)`` map of the first saturated group by the scene
+            (``ngroup`` = never).
         """
         segments = list(range(len(self.files))) if segments is None else list(segments)
         names = self.step_names
         stop = names.index('saturation')
-        counts, nint = None, 0
+        counts, nint, static_dq = None, 0, None
         for seg in segments:
             m = self.load(seg)
             for spec in self.recipe[:stop + 1]:
                 if spec.skip or spec.is_custom:
                     continue
                 m = self._jwst_step(spec.name, m, **spec.kwargs)
+                if spec.name == 'dq_init' and static_dq is None:
+                    static_dq = (np.asarray(m.pixeldq) & 1) > 0
             sat = (np.asarray(m.groupdq) & 2) > 0
             c = sat.sum(axis=0).astype(np.int32)
             counts = c if counts is None else counts + c
@@ -519,23 +532,58 @@ class Stage1:
             m.close()
             if self.verbose:
                 print(f'  saturation pre-pass: segment {seg + 1}/{len(self.files)}')
-        self.saturation_map = self._first_saturated_group(counts, nint, min_frac)
-        self._saturation_counts = (counts, nint)
+        full = self._first_saturated_group(counts, nint, min_frac)
         ngroup = counts.shape[0]
+        grow = int(self.recipe[stop].kwargs.get('n_pix_grow_sat', 1))
+        static = self._static_saturation(full, static_dq, ngroup, grow)
+        self.saturation_map = np.where(static < ngroup, ngroup, full).astype(np.int16)
+        self._saturation_static = static
+        self._saturation_counts = (counts, nint)
         n = int((self.saturation_map < ngroup).sum())
+        ns = int((static < ngroup).sum())
         if self.verbose:
             print(f'  saturation map: {n} pixels saturate (in >= {min_frac * 100:g}% of integrations); '
                   f'first saturated group histogram {np.bincount(self.saturation_map.ravel(), minlength=ngroup + 1).tolist()}')
+            if ns:
+                print(f'  saturation map: {ns} more pixels are static bad pixels (DO_NOT_USE) or '
+                      f'flagged only by growth around them; left out (STATIC extension)')
         if save:
             fn = os.path.join(self.outdir, f'{self.exposure}_saturation_map.fits')
             hdr = fits.Header()
             hdr['MINFRAC'] = (min_frac, 'min fraction of integrations saturated')
             hdr['NINT'] = nint
             hdr['NGROUPS'] = (ngroup, 'groups per integration (map value = never saturated)')
+            hdr['NSTATIC'] = (ns, 'static bad / grown pixels left out (STATIC ext.)')
             fits.HDUList([fits.PrimaryHDU(self.saturation_map, header=hdr),
-                          fits.ImageHDU(counts, name='SATCOUNT')]).writeto(fn, overwrite=True)
-        self.log.add('compute_saturation_map', segment=None, min_frac=min_frac, n_pixels=n)
+                          fits.ImageHDU(counts, name='SATCOUNT'),
+                          fits.ImageHDU(static, name='STATIC')]).writeto(fn, overwrite=True)
+        self.log.add('compute_saturation_map', segment=None, min_frac=min_frac, n_pixels=n,
+                     n_static=ns)
         return self.saturation_map
+
+    @staticmethod
+    def _static_saturation(first, static_dq, ngroup, grow=1):
+        """First saturated group of static bad pixels and of their grown neighbours.
+
+        A neighbour within ``grow`` pixels of a saturating static bad pixel
+        counts as grown when it first saturates at the same group (its own
+        saturation would come earlier or later). Returns a map with
+        ``ngroup`` everywhere else.
+        """
+        out = np.full(first.shape, ngroup, np.int16)
+        if static_dq is None:
+            return out
+        seeds = static_dq & (first < ngroup)
+        ny, nx = first.shape
+        for y, x in zip(*np.where(seeds)):
+            g = first[y, x]
+            y0, y1 = max(0, y - grow), min(ny, y + grow + 1)
+            x0, x1 = max(0, x - grow), min(nx, x + grow + 1)
+            blk = first[y0:y1, x0:x1]
+            sel = (blk == g) | static_dq[y0:y1, x0:x1] & (blk < ngroup)
+            sub = out[y0:y1, x0:x1]
+            sub[sel] = np.minimum(sub[sel], blk[sel])
+        return out
 
     def _consistent_saturation(self, model, segment=None, min_frac=0.01, scope='exposure',
                                saturation_map=None):
@@ -571,6 +619,9 @@ class Stage1:
                     print('  consistent_saturation: building the exposure-wide saturation map')
                 self.compute_saturation_map(min_frac=min_frac)
             smap = self.saturation_map
+            static = getattr(self, '_saturation_static', None)
+            if static is not None:                   # static bad pixels stay consistent too
+                smap = np.minimum(smap, static)
         elif scope == 'segment':
             counts = ((np.asarray(gdq) & 2) > 0).sum(axis=0)
             smap = self._first_saturated_group(counts, nint, min_frac)

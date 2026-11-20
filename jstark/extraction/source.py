@@ -162,16 +162,31 @@ class ExposureSource:
         per_int = np.prod(self.shape) * 4 * factor
         return max(1, int(self.max_mem_gb * 1024 ** 3 / per_int))
 
-    def chunks(self, segments=None, chunk=None):
-        """Yield ``(k, data, err, good, gidx)`` chunks, one segment at a time."""
-        chunk = chunk or self.chunk_size()
-        for k in (range(self.nseg) if segments is None else segments):
-            n = self.seg_nint[k]
-            for a in range(0, n, chunk):
-                d, e, g, gi = self.read(k, slice(a, min(n, a + chunk)))
-                yield k, d, e, g, gi
+    def chunks(self, segments=None, chunk=None, breaks=None, lo=0, hi=None):
+        """Yield ``(k, data, err, good, gidx)`` chunks, one segment at a time.
 
-    def sample_ints(self, n):
-        """``n`` integrations spread evenly over the exposure (global indices)."""
-        n = min(int(n), self.nint)
-        return np.unique(np.linspace(0, self.nint - 1, n).round().astype(int))
+        ``breaks``: global integration numbers at which a chunk must end (no
+        chunk spans a break). ``lo`` / ``hi``: only global integrations
+        ``lo <= gidx < hi``.
+        """
+        chunk = chunk or self.chunk_size()
+        hi = self.nint if hi is None else hi
+        cuts = sorted(int(b) for b in (breaks or []))
+        for k in (range(self.nseg) if segments is None else segments):
+            s0 = int(self.seg_start[k])
+            a0 = max(0, lo - s0)
+            a1 = min(self.seg_nint[k], hi - s0)
+            if a1 <= a0:
+                continue
+            edges = [a0] + [b - s0 for b in cuts if a0 < b - s0 < a1] + [a1]
+            for e0, e1 in zip(edges[:-1], edges[1:]):
+                for a in range(e0, e1, chunk):
+                    d, e, g, gi = self.read(k, slice(a, min(e1, a + chunk)))
+                    yield k, d, e, g, gi
+
+    def sample_ints(self, n, lo=0, hi=None):
+        """``n`` integrations spread evenly over the exposure (global indices),
+        or over ``lo <= gidx < hi``."""
+        hi = self.nint if hi is None else hi
+        n = min(int(n), hi - lo)
+        return np.unique(np.linspace(lo, hi - 1, n).round().astype(int))

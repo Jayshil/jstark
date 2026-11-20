@@ -1,6 +1,6 @@
 # jstark detector processing: development notes
 
-As of 2026-11-14. The record of what was discussed, decided, implemented
+As of 2026-11-20. The record of what was discussed, decided, implemented
 and measured while building the detector-processing stage of jstark
 (`jstark/reduction/`), for anyone continuing the work, including future
 work sessions. The code and its docstrings remain the reference for
@@ -82,6 +82,7 @@ details; `docs/reduction.rst` is the user-facing walk-through.
 | MIRI LRS | WASP-43 (ERS) | `/Volumes/Jayshil SSD/JWST/jwst-ers/Data/MIRI` |
 | MIRI F1500W | GJ 3929 | `/Volumes/Jayshil SSD/JWST/gj3929/Data/uncal/V1` |
 | NIRCam F444W (2 groups) | 55 Cnc (program 2084) | `/Volumes/Jayshil SSD/JWST/55Cnc-jwst/Data/V1_uncal` (segment 1 of 22 only) |
+| NIRSpec G395H (70 groups, full exposure) | WASP-39 (ERS) | `/Volumes/Jayshil SSD/JWST/jwst-ers/Data/NRSG395H_NRS1` and `..._NRS2`; outputs in `/Volumes/Jayshil SSD/JWST/jwst-ers/NRSG395H/Outputs/` |
 
 Full-exposure products: PRISM in `.../jwst-ers/Data/NRSPR/reduction/` (all 4
 segments; comparison with the published light curves in `comparison/`).
@@ -853,6 +854,41 @@ Check on segment 1 of the three data sets (default extraction,
   integration; 6.9% always-bad pixels, mostly the 8 left-edge columns; the
   early ramp is about −1% over the first ~50 integrations.
 
+### 6.11 Full G395H exposure: WASP-39 b (2026-11-20)
+
+ERS 1366 obs 3, NRS1 and NRS2, NRSRAPID **70 groups** x 465 integrations
+(63 s), 3 segments. The first NIRSpec data with many groups (TOI-561: 6).
+All defaults except `ramp_fit maximum_cores='4'` (memory). Per detector:
+Stage 1 506-530 s (segment 204 s: `temporal_jump` 84 s, `group_bkg` 33 s,
+`ramp_fit` 22 s, `refpix` 19 s; saturation pre-pass 22 s), cleaning 13 s;
+peak RSS 9.8 (NRS1) / 13.5 GB (NRS2), at least 51% memory free.
+
+- `temporal_jump` runs in `mode='flag'` (>= 10 groups): 35,400-36,000 jumps
+  per segment, 0.32-0.34% of pixels per integration. Cleaning: 144-161
+  transient flags per integration, spread in time (84-389), mostly on
+  faint pixels (median signal ~0; fewer on the trace rows, where small hits
+  hide in the photon noise), 2% from pixels flagged >= 10 times. Both are
+  the expected cosmic-ray rate for 63 s: ~5 events/cm2/s x 0.21 cm2 x 63 s
+  ~ 67 events x 2-3 px. The per-second rate of §6.1 (0.0026%/s, from short
+  integrations) underestimates it.
+- **Saturation map and static bad pixels (fixed).** The star does not
+  saturate. The map held 18 (NRS1) / 225 (NRS2) pixels: 3x3 blocks around
+  static bad pixels of the CRDS mask (`DO_NOT_USE` + `DEAD` / `HOT` /
+  `LOW_QE`), which the jwst `saturation` step flags (mostly from group 0)
+  and grows onto their neighbours (`n_pix_grow_sat=1`; official pipeline
+  the same). Extraction's `min_groups=2` then set 13 NRS2 columns
+  (3-column groups) to NaN for the whole exposure. Now
+  `compute_saturation_map` leaves out static `DO_NOT_USE` pixels (pixel DQ
+  after `dq_init`) and neighbours within the growth radius that first
+  saturate at the same group, and saves them in a `STATIC` extension
+  (header `NSTATIC`); `consistent_saturation` still uses them, so the
+  Stage 1 processing is unchanged (`Stage1._static_saturation`, test
+  `test_static_bad_pixels_left_out_of_saturation_map`). After the fix:
+  NRS1 0 pixels, NRS2 9 (pixel (14, 60) saturated at group 0 but not in
+  the CRDS mask, plus its growth; outside the aperture). No NaN columns.
+- The mirror tilt at integration 269 and the extraction changes it needed:
+  extraction_notes.md §5.17. Stage 1 and cleaning are not affected by it.
+
 ## 7. Bugs found and fixed
 
 | Issue | Fix |
@@ -873,6 +909,7 @@ Check on segment 1 of the three data sets (default extraction,
 | `firstgroup` leaving < 3 groups | guard with warning |
 | FITS history column 1 char wide | width = string length |
 | `ApPhoto.identify_crays` failed with a 2D bad-pixel map | 2D map broadcast to 3D |
+| saturation map counted static bad pixels (and their grown neighbours) → `min_groups` blanked 13 G395H NRS2 columns | left out of the map, `STATIC` extension (§6.11) |
 
 ## 8. Open issues and next steps
 
@@ -880,7 +917,9 @@ Check on segment 1 of the three data sets (default extraction,
       method choice, and the MIRI ramp start. **PRISM done** (WASP-39 b,
       16 min, 11 GB; extraction_notes.md §5.14): no segment-boundary
       artefacts, same noise as the published reduction outside the
-      saturated region.
+      saturated region. **G395H done** (WASP-39 b, 2 x 9.5 min; §6.11,
+      extraction_notes.md §5.17): light curves agree with the ERS and
+      ExoTiC-JEDI reductions to <= 17 ppm per band, same noise.
 - [ ] **PRISM saturated columns:** depths biased deep (see §6.6 and
       extraction_notes.md §5.14). Done: the saturation map (now with
       `NGROUPS`) goes into `cleaninfo` as `SATMAP`; extraction sets columns

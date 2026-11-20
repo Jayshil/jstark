@@ -78,6 +78,10 @@ class SpectralExtractor:
         self.psf_exposures = []      # exposures whose integrations fitted the PSF (shared)
         self.var_mean = None
         self.qmap = None
+        # PSF epochs (psf breaks=[...]): one dict per epoch with start, stop, psfs, qmap,
+        # var_mean; the active epoch's model is in self.psfs / self.qmap / self.var_mean
+        self.epochs = []
+        self._fit_range = None       # (lo, hi) global integrations while fitting one epoch
         self.cov = {}
         self.bkg_mask = self.bkg_ok = None
         self.shat, self.ref = {}, {}
@@ -129,6 +133,45 @@ class SpectralExtractor:
         if step in ('background', 'columns', 'trace'):
             self.bkg_mask = None
         return self
+
+    # ------------------------------------------------------------------
+    # PSF epochs (abrupt PSF changes within the exposure)
+    # ------------------------------------------------------------------
+    def breaks(self):
+        """Validated PSF breaks: sorted global integration numbers in (0, nint)."""
+        b = self.params['psf'].get('breaks')
+        if b is None:
+            return []
+        b = sorted({int(x) for x in np.atleast_1d(b)})
+        bad = [x for x in b if not 0 < x < self.src.nint]
+        if bad:
+            raise ValueError(f'psf breaks {bad} outside 1..{self.src.nint - 1} (global, 0-based '
+                             'integration numbers at which a new epoch starts).')
+        return b
+
+    def epoch_ranges(self):
+        """``[(start, stop), ...]`` global integration ranges of the PSF epochs."""
+        edges = [0] + self.breaks() + [self.src.nint]
+        return list(zip(edges[:-1], edges[1:]))
+
+    def epoch_of(self, gidx):
+        """Epoch number of global integration(s) ``gidx``."""
+        return np.searchsorted(np.asarray(self.breaks(), int), gidx, side='right')
+
+    def _use_epoch(self, gidx):
+        """Activate the PSF, pixel-response and variance maps of the epoch of ``gidx``.
+
+        ``gidx`` (int or array) must lie in one epoch. Returns the epoch number.
+        """
+        if not self.epochs:
+            return 0
+        e = np.unique(self.epoch_of(np.atleast_1d(gidx)))
+        if e.size != 1:
+            raise ValueError(f'integrations {np.min(gidx)}-{np.max(gidx)} span PSF epochs '
+                             f'{e.tolist()}; chunks must be split at the breaks.')
+        ep = self.epochs[int(e[0])]
+        self.psfs, self.qmap, self.var_mean = ep['psfs'], ep['qmap'], ep['var_mean']
+        return int(e[0])
 
     def show(self):
         """Print the current parameters."""
@@ -364,6 +407,46 @@ class SpectralExtractor:
     def fit_psf(self, verbose=None, others=None):
         """Fit the spline PSF (and the pixel-response map) of every order.
 
+        With ``set('psf', breaks=[...])`` the fit below is done separately
+        for each epoch between the breaks, from that epoch's integrations
+        only (``init_ints`` and a numeric ``ints`` then apply per epoch); see
+        :meth:`_fit_psf_one` for the fit itself.
+        """
+        verbose = self.verbose if verbose is None else verbose
+        brk = self.breaks()
+        self.epochs = []
+        if not brk:
+            return self._fit_psf_one(verbose=verbose, others=others)
+        if others:
+            raise NotImplementedError('PSF breaks with a PSF shared between exposures are not '
+                                      'supported; use VisitExtractor(shared_psf=False).')
+        if self.field_traces:
+            raise NotImplementedError('PSF breaks with field-star traces are not supported.')
+        t0 = time.time()
+        epochs = []
+        try:
+            for i, (a, b) in enumerate(self.epoch_ranges()):
+                if verbose:
+                    print(f'  PSF epoch {i + 1}/{len(brk) + 1}: integrations {a}-{b - 1}')
+                self._fit_range = (a, b)
+                self.psfs = {}
+                self._fit_psf_one(verbose=verbose)
+                epochs.append(dict(start=a, stop=b, psfs=self.psfs, qmap=self.qmap,
+                                   var_mean=self.var_mean))
+        finally:
+            self._fit_range = None
+        self.epochs = epochs
+        self._use_epoch(0)
+        self.log.add('fit_psf_epochs', breaks=brk, seconds=time.time() - t0,
+                     chi2_red={str(o): [ep['psfs'][o].fit_info['chi2_red'] for ep in epochs]
+                               for o in self.orders})
+        if verbose:
+            print(f'fit_psf: {len(epochs)} epochs done in {time.time() - t0:.0f} s')
+        return self.psfs
+
+    def _fit_psf_one(self, verbose=None, others=None):
+        """Fit the spline PSF (and the pixel-response map) of every order (one epoch).
+
         ``others``: further :class:`SpectralExtractor` objects of the same
         visit (other exposures). Their integrations are added to the same
         fit, so all exposures share one PSF and one pixel-response map; each
@@ -592,10 +675,12 @@ class SpectralExtractor:
 
     @staticmethod
     def _split_ints(members, n):
-        """Integrations of each exposure for a sample of ``n`` spread over all of them."""
-        nints = np.array([m.src.nint for m in members], float)
+        """Integrations of each exposure for a sample of ``n`` spread over all of them
+        (within the epoch being fitted, if any)."""
+        rng = [m._fit_range or (0, m.src.nint) for m in members]
+        nints = np.array([b - a for a, b in rng], float)
         share = np.maximum(1, np.round(int(n) * nints / nints.sum())).astype(int)
-        return [m.src.sample_ints(k) for m, k in zip(members, share)]
+        return [m.src.sample_ints(k, a, b) for m, k, (a, b) in zip(members, share, rng)]
 
     def _check_joint(self, members):
         """The exposures of a joint PSF fit must share mode, frame, orders, columns, parameters."""
@@ -755,12 +840,13 @@ class SpectralExtractor:
         """Chunks of the integrations used for the PSF (all, or a spread sample)."""
         src = self.src
         chunk = self._chunk()
+        lo, hi = self._fit_range or (0, src.nint)
         if isinstance(ints, str) and ints == 'all':
-            self._nint_used = src.nint
-            for _, d, e, g, gi in src.chunks(chunk=chunk):
+            self._nint_used = hi - lo
+            for _, d, e, g, gi in src.chunks(chunk=chunk, lo=lo, hi=hi):
                 yield d, e, g, gi
         else:
-            sel = src.sample_ints(int(ints))
+            sel = src.sample_ints(int(ints), lo, hi)
             self._nint_used = len(sel)
             for a in range(0, len(sel), chunk):
                 yield src.read_ints(sel[a:a + chunk])
@@ -1318,8 +1404,12 @@ class SpectralExtractor:
         self._ready()
         src = self.src
         parts = []
-        for _, d, e, g, gi in src.chunks(segments=[k], chunk=self._chunk()):
+        for _, d, e, g, gi in src.chunks(segments=[k], chunk=self._chunk(), breaks=self.breaks()):
+            ep = self._use_epoch(gi)
             res = self.extract_chunk(d, e, g)
+            if self.epochs:
+                for o in res:
+                    res[o]['epoch'] = np.full(len(gi), ep, np.int64)
             parts.append((gi, res))
         gidx = np.concatenate([p[0] for p in parts])
         out = {o: {key: np.concatenate([p[1][o][key] for p in parts])
@@ -1370,8 +1460,11 @@ class SpectralExtractor:
                 nb = int(((nsat < (self.src.sat_ngroups or nsat.max())) & (nsat >= (mg or 0))).sum())
                 print(f'  order {o}: {nb} saturated column(s) extracted with the box sum')
         segs = range(self.src.nseg) if segments is None else segments
+        reg = []
         for k in segs:
-            self.extract_segment(k)
+            gi, out = self.extract_segment(k)
+            reg.append((gi, out))
+        self._warn_breaks(reg)
         self.log.add('run', segments=list(segs), params=self.params,
                      order_params=self.order_params, seconds=time.time() - t0)
         if self.verbose:
@@ -1382,6 +1475,35 @@ class SpectralExtractor:
         if not keep_segments:
             remove_files(self.outputs, self.verbose)
         return out
+
+    def _warn_breaks(self, reg):
+        """Warn about abrupt, lasting PSF changes not covered by ``psf breaks``."""
+        from .metrics import find_psf_breaks
+        if not reg:
+            return []
+        gidx = np.concatenate([g for g, _ in reg])
+        known = self.breaks()
+        found = []
+        for o in self.orders:
+            ser = {key: np.concatenate([out[o][key] for _, out in reg]) for key in ('dy', 'ds')}
+            for f in find_psf_breaks(ser):
+                g = int(gidx[f['gidx']])
+                if any(abs(g - b) <= 3 for b in known):
+                    continue
+                f.update(gidx=g, order=o)
+                found.append(f)
+        if found:
+            gs = sorted({f['gidx'] for f in found})
+            txt = '; '.join(f'integration {f["gidx"]} (order {f["order"]}, {f["key"]} step '
+                            f'{f["step"]:+.4f}, {f["score"]:.0f} sigma)' for f in found)
+            msg = (f'Abrupt, lasting change of the PSF at {txt}. One PSF across it rescales the '
+                   f'optimal flux and the temporal rejection can fail near it. Consider '
+                   f"ex.set('psf', breaks={sorted(set(known) | set(gs))}); ex.fit_psf(); ex.run().")
+            warnings.warn(msg)
+            if self.verbose:
+                print('  WARNING: ' + msg)
+        self.log.add('psf_break_check', found=found, breaks=known)
+        return found
 
     # ------------------------------------------------------------------
     # Aperture / background optimisation
@@ -1517,9 +1639,13 @@ class SpectralExtractor:
         return res
 
     def _block_chunks(self, k, sl):
-        chunk = self._chunk()
-        for a in range(sl.start, sl.stop, chunk):
-            d, e, g, gi = self.src.read(k, slice(a, min(sl.stop, a + chunk)))
+        """Chunks of integrations ``sl`` of segment ``k``, split at the PSF breaks; the
+        epoch of each chunk is activated before it is yielded."""
+        s0 = int(self.src.seg_start[k])
+        for _, d, e, g, gi in self.src.chunks(segments=[k], chunk=self._chunk(),
+                                              breaks=self.breaks(), lo=s0 + sl.start,
+                                              hi=s0 + sl.stop):
+            self._use_epoch(gi)
             yield d, e, g, gi
 
     # ------------------------------------------------------------------
@@ -1564,12 +1690,21 @@ class SpectralExtractor:
             cols = [fits.Column(name=n, format='D', array=np.asarray(r[key], float))
                     for n, key in (('dy', 'dy'), ('ds', 'ds'), ('dy_cof', 'dy_cof'), ('chi2', 'chi2'))]
             cols.append(fits.Column(name='nrej', format='K', array=np.asarray(r['nrej'])))
+            if 'epoch' in r:
+                cols.append(fits.Column(name='epoch', format='K', array=np.asarray(r['epoch'])))
             hdus.append(fits.BinTableHDU.from_columns(cols, name='REG' + s))
         tcols = [fits.Column(name='gidx', format='K', array=gidx)]
         if times is not None:
             tcols.append(fits.Column(name='int_mid_BJD_TDB', format='D', array=times))
         hdus.append(fits.BinTableHDU.from_columns(tcols, name='TIMES'))
         fits.HDUList(hdus).writeto(fn, overwrite=True)
+
+    def _epoch_models(self):
+        """PSF epochs as dicts (one pseudo-epoch with the current model without breaks)."""
+        if self.epochs:
+            return self.epochs
+        return [dict(start=0, stop=self.src.nint, psfs=self.psfs, qmap=self.qmap,
+                     var_mean=self.var_mean)]
 
     def model_file(self):
         return os.path.join(self.outdir, f'{self.src.exposure}_extract_model.fits')
@@ -1590,13 +1725,17 @@ class SpectralExtractor:
             if 'wavelength' in tr.info:
                 cols.append(fits.Column(name='wavelength', format='D', array=tr.info['wavelength']))
             hdus.append(fits.BinTableHDU.from_columns(cols, name=f'TRACE_O{o}'))
-            if o in self.psfs:
-                hdus += self.psfs[o].to_hdus(f'_O{o}')
-        if self.var_mean is not None:
-            hdus.append(fits.ImageHDU(np.where(np.isfinite(self.var_mean), self.var_mean, 0.)
-                                      .astype(np.float32), name='VARMEAN'))
-        if self.qmap is not None:
-            hdus.append(fits.ImageHDU(self.qmap.astype(np.float32), name='QMAP'))
+        # epoch 0 under the plain names; later PSF epochs with the suffix _E<n>
+        for i, ep in enumerate(self._epoch_models()):
+            sfx = '' if i == 0 else f'_E{i}'
+            for o in self.orders:
+                if o in ep['psfs']:
+                    hdus += ep['psfs'][o].to_hdus(f'_O{o}{sfx}')
+            if ep['var_mean'] is not None:
+                hdus.append(fits.ImageHDU(np.where(np.isfinite(ep['var_mean']), ep['var_mean'], 0.)
+                                          .astype(np.float32), name='VARMEAN' + sfx))
+            if ep['qmap'] is not None:
+                hdus.append(fits.ImageHDU(ep['qmap'].astype(np.float32), name='QMAP' + sfx))
         if self.contam_mask is not None:
             hdus.append(fits.ImageHDU(self.contam_mask.astype(np.uint8), name='CONTAM'))
         if self.field_model is not None:
@@ -1618,6 +1757,9 @@ class SpectralExtractor:
         with fits.open(fname) as h:
             par = json.loads(h['PARAMS'].data['params'][0])
             self.params = par['params']
+            for step, kw in get_defaults(self.mode)[0].items():   # parameters added since
+                for key, val in kw.items():
+                    self.params.setdefault(step, {}).setdefault(key, val)
             self.order_params = {int(k): v for k, v in par['order_params'].items()}
             self.orders = [int(x) for x in h[0].header['ORDERS'].split(',')]
             for o in self.orders:
@@ -1627,12 +1769,22 @@ class SpectralExtractor:
                 if 'wavelength' in t.names:
                     tr.info['wavelength'] = np.asarray(t['wavelength'], float)
                 self.traces[o] = tr
-                if f'PSF_O{o}' in h:
-                    self.psfs[o] = SplinePSF.from_hdu(h[f'PSF_O{o}'])
-            if 'VARMEAN' in h:
-                v = np.asarray(h['VARMEAN'].data, float)
-                self.var_mean = np.where(v > 0, v, np.inf)
-            self.qmap = np.asarray(h['QMAP'].data, float) if 'QMAP' in h else None
+            brk = self.breaks()
+            self.epochs = []
+            for i, (a, b) in enumerate(self.epoch_ranges()):
+                sfx = '' if i == 0 else f'_E{i}'
+                psfs = {o: SplinePSF.from_hdu(h[f'PSF_O{o}{sfx}']) for o in self.orders
+                        if f'PSF_O{o}{sfx}' in h}
+                vm = None
+                if 'VARMEAN' + sfx in h:
+                    v = np.asarray(h['VARMEAN' + sfx].data, float)
+                    vm = np.where(v > 0, v, np.inf)
+                qm = np.asarray(h['QMAP' + sfx].data, float) if 'QMAP' + sfx in h else None
+                self.epochs.append(dict(start=a, stop=b, psfs=psfs, qmap=qm, var_mean=vm))
+            ep0 = self.epochs[0]
+            self.psfs, self.qmap, self.var_mean = ep0['psfs'], ep0['qmap'], ep0['var_mean']
+            if not brk:
+                self.epochs = []
             self.contam_mask = np.asarray(h['CONTAM'].data, bool) if 'CONTAM' in h else None
             self.field_model = np.asarray(h['FIELD'].data, np.float32) if 'FIELD' in h else None
         self.contaminants = par.get('contaminants', [])
@@ -1701,8 +1853,9 @@ class SpectralExtractor:
                 cols.append(fits.Column(name='amp', format='I',
                                         array=amplifier_groups(self.src, tr.cols)))
             hdus.append(fits.BinTableHDU.from_columns(cols, name=f'TRACE_O{o}'))
-            if o in self.psfs:
-                hdus += self.psfs[o].to_hdus(f'_O{o}')
+            for i, ep in enumerate(self._epoch_models()):
+                if o in ep['psfs']:
+                    hdus += ep['psfs'][o].to_hdus(f'_O{o}' + ('' if i == 0 else f'_E{i}'))
             fa = self.field_in_aperture(o)
             if fa is not None:
                 hf = fits.ImageHDU(fa, name=f'FIELD_O{o}')

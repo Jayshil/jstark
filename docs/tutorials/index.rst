@@ -11,6 +11,12 @@ chose each method, and the comparison with published results.
    pixels and columns, the 1/f correction, the PSF model and pixel-response
    map, and the transmission spectrum against the ERS benchmark.
 
+:doc:`wasp39b_g395h`
+   NIRSpec/G395H transit of WASP-39 b on two detectors: a mirror-segment
+   tilt in mid-transit makes the flux jump. PSF epochs (``psf breaks``) and
+   the break warning, a step in the light-curve fits, and the spectrum
+   against the ERS benchmark and 11 published reductions.
+
 :doc:`wasp39b_nircam`
    NIRCam/F322W2 transit of WASP-39 b: 1/f noise across four amplifiers,
    extraction weights for summed columns, per-amplifier fits, and a default
@@ -40,6 +46,7 @@ cell.
    :hidden:
 
    wasp39b_prism
+   wasp39b_g395h
    wasp39b_nircam
    wasp43b_miri_lrs
    gj3929b_miri_f1500w

@@ -1,6 +1,6 @@
 # jstark light-curve fitting: development notes
 
-As of 2026-11-15. The record of what was discussed, decided, implemented
+As of 2026-11-20. The record of what was discussed, decided, implemented
 and measured while building the light-curve fitting stage of jstark
 (`jstark/fitting/`), for anyone continuing the work, including future work
 sessions. The code and its docstrings remain the reference for details;
@@ -1222,6 +1222,105 @@ t0, a/R*, b, Rp/R*, q1, q2 free, t_secondary normal(+-10 min).
       the nightside. The rest of the nightside gap is still the
       exposure-start ramps (item 9, 20-40 ppm) plus inter-reduction spread
       (Bell's own nightsides span ~100 ppm).
+
+### 5.8 WASP-39 b NIRSpec G395H, full exposure (2026-11-20)
+
+Reduction and extraction: extraction_notes.md §5.17 (optimal extraction with
+PSF epochs, `psf breaks=[269]` at the mirror tilt). Scripts in
+`/Volumes/Jayshil SSD/JWST/jwst-ers/NRSG395H/Outputs/scripts/`
+(`fit_white_g395h.py`, `fit_spec_g395h.py`, `compare_spec_g395h.py`);
+fits in `Outputs/fits/`, comparisons in `Outputs/comparison/`.
+
+**Set-up (user decisions 2026-11-20).** One fit per detector. Integrations
+0-14 (settling) and 269 (tilt during the integration) removed. Systematics:
+linear in time + `dy` + a step at the tilt, which is the extraction's
+`epoch` regressor (0 before 269, 1 after). No ramp. `ds` and `dx` left out
+(transit-shaped, §5.2). Optimal extraction (box gives the same light curves
+here, extraction_notes §5.17). P = 4.0552842518 d and e = 0 fixed; t0, a/R*,
+b, Rp/R*, q1, q2, jitter free. White light over the ERS bin range of each
+detector (2.725-3.716 / 3.829-5.172 um). Dynamic dynesty, 8 threads: 40 s.
+
+| | NRS1 | NRS2 | ERS benchmark (joint fit) |
+| --- | --- | --- | --- |
+| Rp/R* | 0.14631 +- 0.00016 | 0.14664 +- 0.00020 | 0.14613 / 0.14678 |
+| depth (ppm) | 21,405 +- 47 | 21,503 +- 58 | |
+| b | 0.4466 +- 0.0049 | 0.4466 +- 0.0062 | 0.4498 |
+| a/R* | 11.421 +- 0.024 | 11.393 +- 0.032 | 11.390 |
+| t0 - ERS (s) | -3.4 +- 1.4 | +5.1 +- 1.9 | |
+| q1, q2 | 0.040, 0.19 | 0.032, 0.18 | 0.049, 0.11 / 0.024, 0.31 |
+| step at the tilt (standardised coefficient) | -483 +- 60 ppm | -428 +- 76 ppm | |
+| p2p / err; p2p / (err + jitter) | 1.15; 0.92 | 1.25; 0.98 | |
+| jitter (ppm) | 74 | 104 | |
+
+- Rp/R* within ~1 sigma of the benchmark on each detector, geometry too.
+- The white light scatters 15-25% above its propagated errors (native bins
+  only 4-6%): a noise common to the columns, absorbed by the jitter.
+- The two detectors' t0 differ by 8.5 +- 2.4 s (3.5 sigma), although they
+  record the same photons at the same times. Not followed up. The tilt sits
+  in the flat bottom (mid-transit is integration ~259, egress ends ~337).
+- **Integration 270** is a +721 / +729 ppm outlier on both detectors
+  (5-7 sigma): the tilt had not fully settled. The ExoTiC-JEDI light
+  curves (Alderson et al. 2023) drop 269-271. Refitting without 269-271
+  changes the depths by +21 / +16 ppm (0.4 sigma), the geometry not at all,
+  and lowers the jitter (74 -> 65, 104 -> 98 ppm). Kept as the user
+  specified (only 269 dropped); for future tilts drop the tilt integration
+  and the next one or two.
+
+**Spectra in the ERS bins** (`fit_spec_g395h.py`): orbit fixed to each
+detector's white-light medians (`channel_priors(fix=(P, t0, a, b, ecc,
+omega))`), per bin Rp/R*, q1, q2 free, linear time + dy + epoch, jitter.
+R100 (30 + 29 bins): 260 s per detector with 8 processes (~70 s per bin).
+
+| R100 | offset ours - ref (ppm) | rms after offset | chi2_red | error ratio ours/ref | > 3 sigma |
+| --- | --- | --- | --- | --- | --- |
+| NRS1 vs ERS | +20 | 50 | 0.17 | 0.98 | 0 |
+| NRS2 vs ERS | -40 | 40 | 0.08 | 1.00 | 0 |
+| NRS1 vs Alderson+23 weighted average | -142 | 56 | 0.37 | 1.09 | 0 |
+| NRS2 vs Alderson+23 weighted average | -50 | 47 | 0.13 | 1.11 | 0 |
+| 11 Alderson+23 reductions: range of offsets | NRS1 -357 to +77, NRS2 -211 to +151 | 47-130 | | 0.68-1.39 | 0 |
+
+- The spectrum reproduces the benchmark bin by bin (SO2 at 4.05 um, CO2 at
+  4.3 um, H2O on NRS1) with the same error bars, and sits inside the spread
+  of the 11 published reductions. (Alderson reductions rebinned onto R100 by
+  inverse-variance weighting of their 10-pixel bins.)
+
+Native ERS bins (`bins_scale1`, 488 + 675 bins of ~3 columns; same setup;
+3312 s + 4304 s with 8 processes, ~55 s per bin; no failed bins). Plot and
+numbers: `Outputs/comparison/spectrum_bins_scale1.png/.json`.
+
+| native bins | offset ours - ERS (ppm) | rms after offset | chi2_red | error ratio ours/ERS | > 3 sigma |
+| --- | --- | --- | --- | --- | --- |
+| NRS1 vs ERS (fitted LD) | +40 | 235 | 0.09 | 0.96 | 0 |
+| NRS2 vs ERS (fitted LD) | +3 | 287 | 0.10 | 0.80 | 0 |
+| NRS1 vs ERS (fixed LD) | +64 | 215 | 0.13 | 1.03 | 0 |
+| NRS2 vs ERS (fixed LD) | -12 | 297 | 0.12 | 0.81 | 0 |
+
+- chi2_red ~0.1: the two reductions share photons and errors, so their
+  differences are much smaller than the errors would imply (as at R100).
+  The few large differences are ERS outliers with large errors (e.g. 3.06 um).
+- **Error bars on NRS2.** Ours are 9% smaller than ERS at 3.96 um,
+  rising to 28% at 5.04 um. On NRS1 they are 3-13% smaller. The light
+  curves are not the cause: the p2p scatter of our native-bin light
+  curves matches the ERS light curves to within 1% at every wavelength.
+  Limb darkening is not the cause either: the ERS fixed-LD errors are
+  almost the same as its fitted-LD errors. Check against a fixed-LD
+  least-squares floor (residual rms, depth + offset + slope + step, no
+  dy):
+
+  | wavelength | rms/err | floor | ours | ERS fitted LD |
+  | --- | --- | --- | --- | --- |
+  | NRS1 2.82-3.62 um | 1.02-1.04 | 223-292 | 1.08-1.10 x floor | 1.12-1.24 x |
+  | NRS2 3.96 um | 1.05 | 293 | 1.07 x | 1.17 x |
+  | NRS2 4.51 um | 1.05 | 410 | 1.06 x | 1.33 x |
+  | NRS2 5.04 um | 1.05 | 557 | 1.06 x | 1.47 x |
+
+  Our errors are what white noise at the measured scatter gives,
+  plus the LD and systematics freedom. Our residuals show no red noise
+  (beta_32 ~0.75-1). The ERS errors grow with wavelength beyond that
+  level. That points to inflation on their side (red-noise or
+  systematics treatment we cannot see from the released tables), not to
+  underestimated errors here. At R100 the two error sets agree (0.98-1.00).
+  Not followed up.
 
 ## 6. Open issues and next steps
 
