@@ -731,11 +731,11 @@ class BroadbandFit:
             tab.write(os.path.join(self.out_folder, 'jstark_diagnostics.ecsv'), overwrite=True)
         return tab
 
-    def plots(self, N=1000):
+    def plots(self, N=1000, **kwargs):
         """:class:`jstark.fitting.plots.julietPlots` for this fit."""
         from .plots import julietPlots
         self._require()
-        return julietPlots(input_folder=self.out_folder, dataset=self.dataset, res=self.results, N=N)
+        return julietPlots(input_folder=self.out_folder, dataset=self.dataset, res=self.results, N=N, **kwargs)
 
     def channel_priors(self, fix=_PLANET_GEOMETRY, mode='fixed', planet=None):
         """Priors for spectroscopic channels from this fit.
