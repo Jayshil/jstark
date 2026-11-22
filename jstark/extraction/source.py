@@ -62,6 +62,9 @@ class ExposureSource:
         self.dispersion_axis = ec.dispersion_axis
         self.transpose = self.dispersion_axis == 0
         self.outdir = ec.outdir
+        if not ec.outputs:
+            raise ValueError(f'{self.info_file or self.exposure}: no cleaned segments yet; '
+                             'run ExposureCleaner.run() first.')
         self.files = [ec.outputs[i] for i in sorted(ec.outputs)]
         self.segments = sorted(ec.outputs)
         self.seg_nint = [int(ec.seg_nint[i]) for i in self.segments]

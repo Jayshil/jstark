@@ -102,7 +102,7 @@ Quick start
     s2.run()                                    # writes *_wavelength.fits
 
     # --- Cleaning (segment by segment) ------------------------------------
-    ec = ExposureCleaner('/data/NRS1/reduction', wavelength=s2.save_wavelength())
+    ec = ExposureCleaner('/data/NRS1/reduction', wavelength=s2.wavelength_file())
     ec.compute_global()                         # pass 1: masks, bad pixels, noise
     info = ec.run(background=True)              # pass 2: clean + save every segment
 
@@ -136,6 +136,69 @@ Diagnostics of the custom steps (removed 1/f stripes, jump statistics, the
 trace and background masks) are stored in ``s1.diagnostics`` and in a
 ``*_stage1diag.npz`` file per segment. :mod:`jstark.reduction.diagnostics`
 provides plotting functions for all of them.
+
+.. _overwrite:
+
+Running again: ``overwrite``
+----------------------------
+
+Every ``run`` method (and ``compute_saturation_map``, ``compute_global``,
+``fit_psf``, ``optimise`` and the fits) takes ``overwrite``, ``False`` by
+default: what was already made is loaded instead of made again, so a notebook
+can be re-opened and run from the top. ``overwrite=True`` makes it again.
+
+With ``overwrite=False``:
+
+==========================================  ==================================
+On disk                                     What happens
+==========================================  ==================================
+nothing                                     the step runs
+complete product, same settings and inputs  loaded (a line says from when)
+some segments done                          only the others are processed
+file whose writing was interrupted          made again
+product made with other settings or inputs  ``ProductMismatchError``, with the
+                                            list of differences; nothing is
+                                            touched
+product made by an older jstark             loaded with a notice if the file is
+                                            complete (its settings are unknown)
+==========================================  ==================================
+
+.. code-block:: python
+
+    s1 = Stage1(data, outdir=red)
+    s1.run()                          # second time: loads the rateints files
+    s1.set('group_bkg', method='poly')
+    s1.run()                          # ProductMismatchError: method 'median' -> 'poly'
+    s1.run(overwrite=True)            # processes all segments again
+
+Stage by stage:
+
+* ``Stage1.run`` restores the masks, wing threshold and group range found on
+  the first segment, so an interrupted run continues as if it had not been.
+  Runs given ``model=``, or stopping before ``ramp_fit``, always execute.
+  After loading, ``s1.model`` stays ``None``.
+* ``Stage1.compute_saturation_map`` loads a map made from the requested
+  segments or from the whole exposure. ``Stage1.run`` refuses segments made
+  with a map of *other* segments (e.g. a one-segment test).
+* ``ExposureCleaner.run`` keeps segments cleaned earlier with the same settings
+  in the info file. Cleaning depends on all segments: cleaning after more
+  segments were added needs ``overwrite=True``.
+* ``remove_inputs=True``: the deleted ``rateints`` are described by the info
+  file. ``Stage1.run`` does not make them again; cleaning again needs
+  ``Stage1.run(overwrite=True)`` first.
+* ``SpectralExtractor.fit_psf`` and ``optimise`` (also of ``Photometry``) never
+  raise: with other settings they compute. A new PSF replaces the saved one
+  unless existing spectra were made from that; then use ``overwrite=True`` in
+  ``run`` (or ``fit_psf``).
+
+How it works: each output folder holds one ``<exposure>_products.json`` with
+the settings, the content identifiers of product and inputs, and whether the
+file was completed (:mod:`jstark.reduction.products`). Deleting that file makes
+the products count as made by an older jstark; deleting a product makes the
+step run again. Number of cores, memory limits and ``verbose`` are ignored.
+
+**Not detected:** changes of the jstark code or of the CRDS context. Use
+``overwrite=True`` after updating either.
 
 .. _disk-space:
 

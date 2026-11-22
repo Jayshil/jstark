@@ -300,18 +300,22 @@ class BroadbandFit:
         return sorted(f for f in out if not os.path.basename(f).startswith('._'))
 
     def _check_folder(self, overwrite):
-        """Refuse to reuse a folder that holds a different fit (juliet would silently reuse it)."""
+        """Refuse to reuse a folder that holds a different fit (juliet would silently reuse it);
+        ``overwrite=True`` empties the folder in any case."""
         js = os.path.join(self.out_folder, 'jstark_fit.json')
         files = self._juliet_files()
         if not files:
             return
-        same = False
-        if os.path.isfile(js):
-            with open(js) as f:
-                same = json.load(f).get('fingerprint') == self.fingerprint()
-        if same:
-            return
         if not overwrite:
+            same = False
+            if os.path.isfile(js):
+                with open(js) as f:
+                    same = json.load(f).get('fingerprint') == self.fingerprint()
+            if same:
+                if self.verbose:
+                    print(f'{self.out_folder} holds the same fit: loaded if finished '
+                          '(overwrite=True to fit again)')
+                return
             raise RuntimeError(f'{self.out_folder} holds a different fit (data, regressors or '
                                'priors changed). juliet would reuse its files; use another '
                                'out_folder or overwrite=True.')
@@ -372,8 +376,11 @@ class BroadbandFit:
             juliet sampler (``'dynamic_dynesty'``, ``'dynesty'``,
             ``'ultranest'``, ``'emcee'``, ...).
         overwrite : bool
-            Delete the files of a *different* earlier fit in ``out_folder``.
-            An identical earlier fit is always loaded instead of re-run.
+            ``False`` (default): an identical earlier fit (same data,
+            regressors, priors and model settings) in ``out_folder`` is
+            loaded instead of re-run, a different one raises an error.
+            ``True``: delete the files of any earlier fit and fit again.
+            The sampler settings are not compared.
         **fit_kwargs
             Passed to ``juliet.load.fit``: juliet options (``n_live_points``,
             ``nthreads``, ``light_travel_delay``, ``stellar_radius``, ...)

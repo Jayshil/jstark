@@ -164,8 +164,9 @@ fixed-time fits by their evidence (``lnZ`` in juliet's results).
 juliet writes its files into ``out_folder`` and never overwrites them: run
 again with the same inputs and the finished fit is loaded. jstark saves a
 fingerprint of the data, regressors and priors in ``jstark_fit.json`` and
-refuses to reuse a folder that holds a *different* fit, unless
-``overwrite=True`` (which deletes the old juliet files).
+refuses to reuse a folder that holds a *different* fit. ``overwrite=True``
+deletes the old files and fits again, also if the fit is the same. The sampler
+settings are not part of the fingerprint.
 
 Results
 -------
@@ -416,8 +417,10 @@ the other options are those of ``BroadbandFit``.
 processes (juliet single-threaded in each; dynesty's progress output off
 unless ``print_progress=True``), and skips bins already finished with the
 same inputs: an interrupted run continues where it stopped. Bins whose
-folder holds a different fit stop the run before anything is fitted, unless
-``overwrite=True``. Bin ``i`` lives in ``<out_folder>/bin<i>`` (a complete
+folder holds a different fit stop the run before anything is fitted.
+``overwrite=True`` fits all bins again: their old files are deleted at the
+start, so if that run is interrupted, continue it with ``overwrite=False``.
+Bin ``i`` lives in ``<out_folder>/bin<i>`` (a complete
 ``BroadbandFit`` folder: ``sf.bin_result(i)`` reloads it).
 
 Results:

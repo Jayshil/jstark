@@ -1,6 +1,6 @@
 # jstark spectral extraction and photometry: development notes
 
-As of 2026-11-20. The record of what was discussed, decided, implemented
+As of 2026-11-22. The record of what was discussed, decided, implemented
 and measured while building the extraction stage of jstark
 (`jstark/extraction/`), for anyone continuing the work, including future
 work sessions. The code and its docstrings remain the reference for
@@ -100,8 +100,8 @@ Tests: `jstark/tests/test_extraction.py`, with synthetic data:
 - saturated columns (saturation map → `SATMAP` in cleaninfo →
   `SATGRP_O1`; group-0-only columns NaN, `min_groups=1` keeps them);
 - PSF epochs (`test_psf_breaks`, `test_psf_breaks_validation`, §5.17).
-The whole suite (`jstark/tests`, all stages) has 72 tests, all passing
-(~5 min, 2026-11-20).
+The whole suite (`jstark/tests`, all stages) has 99 tests, all passing
+(~5.5 min, 2026-11-22).
 
 ## 3. What changed relative to stark (and why)
 
@@ -842,6 +842,46 @@ to < 0.1 nm.
   128 ppm on NRS1).
 - Our p2p / propagated error: 1.04-1.06 in native bins, 1.10-1.13 at R100
   (some correlated noise in wider bins).
+
+### 5.18 `overwrite`: finished steps are loaded (2026-11-22)
+
+**Request.** Re-opening a notebook should not re-run everything. Before, all
+`run` methods re-ran; `overwrite=False` of `Stage1.run` only made the final
+save fail. **User decisions:** `overwrite=False` everywhere by default; an
+error if settings or inputs differ (as in the fits); `overwrite=True` re-runs
+identical fits too; products without a record load with a notice.
+
+**Implementation** (`jstark/reduction/products.py`). One
+`<exposure>_products.json` per output folder: per product its settings, a
+content hash (`uid`), the `uid`s of its inputs, size, and status (`writing` /
+`done`, so interrupted files are redone). Content hashes mean that making an
+identical file again does not invalidate what follows. User guide:
+reduction.rst, "Running again".
+- **Stage 1:** restores masks, wing threshold and group range from the first
+  finished segment (record + stage1diag.npz; npz + log for old products), so a
+  resumed run equals an uninterrupted one. The saturation map is described by
+  the segments it was made from.
+- **Cleaner:** info file written after pass 1 and after each segment
+  (atomically); segments of earlier sessions stay listed (before, `run
+  (segments=[1])` in a new session dropped the others, and the same for
+  spectra). Constructors work when `remove_inputs` deleted the rateints.
+- **Extraction:** the model file stores `psf_record` (identifier, settings at
+  the time of the fit, inputs) and `fit_info`; QMAP / VARMEAN now in double
+  precision, so extraction from the reloaded PSF is bit-identical. Spectra
+  depend on the PSF identifier. `fit_psf` / `optimise` recompute on changed
+  settings; a model that existing spectra were made from is not replaced
+  without `overwrite=True`. New files: `<exposure>_optimise.json`,
+  `<exposure>_phot_model.fits`, `<exposure>_phot_optimise.json`.
+- **Not detected:** changes of the jstark code or the CRDS context. Memory
+  limits are ignored, although the chunk size enters the temporal rejection.
+- **Bug fixed on the way:** `optimise` restored the background mask but not
+  `shat` / `ref` (those of the last background tested stayed); effect on
+  G395H fluxes 1e-11.
+
+**Checks.** `jstark/tests/test_products.py` (27 tests). G395H NRS1 segment 2:
+first session 3.5 min, second 0 s, PSF fitted / reloaded / refitted give
+identical fluxes; spectra equal the tutorial's to 1e-9. A copy of the full
+NRS1 exposure of 2026-11-20 (no records) loads at every stage.
 
 ## 6. Open issues and next steps
 

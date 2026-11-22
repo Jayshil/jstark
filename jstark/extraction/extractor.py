@@ -22,12 +22,16 @@ import copy
 import json
 import os
 import time
+import uuid
 import warnings
 
 import numpy as np
 from astropy.io import fits
 
 from ..reduction.io import StepLog, output_filename
+from ..reduction.products import (Check, ProductStore, content_id, differences, fits_complete,
+                                  input_differences, load_result, loaded_message, plain,
+                                  save_result)
 from ..reduction.robust import mad_sigma
 from .background import background_region, estimate_background
 from .bspline import NormalSums
@@ -74,6 +78,11 @@ class SpectralExtractor:
         self.wavelength_file = wf if os.path.isfile(wf) else None
         self.verbose = verbose
         self.log = StepLog(os.path.join(self.outdir, f'{self.src.exposure}_extract_log.json'))
+        self.store = ProductStore(self.outdir, self.src.exposure)
+        self._psf_record = None      # identifier and settings of the PSF in memory
+        self._psf_silent = False     # PSF loaded by run(), not by the user
+        self._cov_args = {}          # estimate_covariance called by the user: its arguments
+        self._maps = None
         self.traces, self.psfs = {}, {}
         self.psf_exposures = []      # exposures whose integrations fitted the PSF (shared)
         self.var_mean = None
@@ -404,8 +413,14 @@ class SpectralExtractor:
         f = num / np.where(den > 0, den, np.inf)
         return f[T['grp']]
 
-    def fit_psf(self, verbose=None, others=None):
+    def fit_psf(self, verbose=None, others=None, overwrite=False):
         """Fit the spline PSF (and the pixel-response map) of every order.
+
+        ``overwrite=False`` (default): a PSF fitted earlier with the same
+        settings to the same integrations is loaded from
+        ``<exposure>_extract_model.fits``. With other settings the PSF is
+        fitted, and saved there unless existing spectra were made from the
+        saved one. ``overwrite=True``: always fit and save.
 
         With ``set('psf', breaks=[...])`` the fit below is done separately
         for each epoch between the breaks, from that epoch's integrations
@@ -414,6 +429,30 @@ class SpectralExtractor:
         """
         verbose = self.verbose if verbose is None else verbose
         brk = self.breaks()
+        members = [self] + [m for m in (others or []) if m is not self]
+        for m in members:
+            m._ensure_background_region()
+            m._psf_silent = False
+        if len(members) > 1 and not brk and not self.field_traces:
+            self._check_joint(members)
+        wanted = [m._psf_request(members) for m in members]
+        if not overwrite and all(m._psf_saved(*w) for m, w in zip(members, wanted)):
+            for m, w in zip(members, wanted):
+                m._restore_psf(*w, verbose=verbose)
+            return self.psfs
+        out = self._fit_psf(verbose, others, brk)
+        uid = uuid.uuid4().hex[:12]
+        for m, (settings, inputs) in zip(members, wanted):
+            m._psf_record = dict(id=uid, settings=settings, inputs=inputs,
+                                 time=time.strftime('%Y-%m-%dT%H:%M:%S'))
+            if overwrite or not m._model_protected():
+                m.save_model()
+            elif verbose:
+                print(f'  PSF not saved: {os.path.basename(m.spectra_file())} was made from the saved '
+                      f'one (overwrite=True to replace them)')
+        return out
+
+    def _fit_psf(self, verbose, others, brk):
         self.epochs = []
         if not brk:
             return self._fit_psf_one(verbose=verbose, others=others)
@@ -1046,7 +1085,7 @@ class SpectralExtractor:
             raise ValueError(f'Order {order} is not extracted (orders {self.orders}).')
         self.field_traces.append(dict(order=int(order), dx=float(dx), dy=float(dy),
                                       columns=None if columns is None else tuple(int(c) for c in columns),
-                                      refine=bool(refine)))
+                                      refine=bool(refine), dy0=float(dy)))
         self.field_model = None
         self.psfs = {}
         self.bkg_mask = None
@@ -1302,6 +1341,7 @@ class SpectralExtractor:
             from .covariance import covariance_extract
             if o not in self.cov:
                 self.estimate_covariance(orders=[o])
+                self._cov_args.pop(o, None)          # the default: not a user setting
             Gc = G & ~res['rejected']
             cf, cv = covariance_extract(self, o, D, V, Gc, P, e, W['rows'],
                                         scale=pe.get('cov_scale', 1.))
@@ -1352,6 +1392,8 @@ class SpectralExtractor:
         integrations spread over the exposure (like :meth:`optimise`).
         """
         from .covariance import estimate_row_covariance
+        for o in (orders or self.orders):
+            self._cov_args[o] = plain(dict(nblocks=nblocks, block_len=block_len, segments=segments))
         self._ready()
         for o in (orders or self.orders):
             self.cov[o] = estimate_row_covariance(self, o, nblocks=nblocks, block_len=block_len,
@@ -1416,8 +1458,10 @@ class SpectralExtractor:
                    for key in parts[0][1][o]} for o in self.orders}
         times = src.times[gidx] if src.times is not None else None
         if save:
-            fn = output_filename(src.files[k], self.outdir, 'spec')
+            fn = self._spec_file(k)
+            self.store.begin(fn)
             self._write_segment(fn, k, gidx, times, out)
+            self.store.done(fn, self._run_settings(), self._run_inputs())
             self.outputs[k] = fn
         if self.verbose:
             txt = '; '.join(f'order {o}: {np.mean(out[o]["nrej"]):.1f} rejected px/int, '
@@ -1425,8 +1469,11 @@ class SpectralExtractor:
             print(f'  segment {k + 1}/{src.nseg}: {len(gidx)} integrations; {txt}')
         return gidx, out
 
-    def run(self, segments=None, combine=True, keep_segments=True):
+    def run(self, segments=None, combine=True, keep_segments=True, overwrite=False):
         """Extract all (or the given) segments, save them, and combine the spectra.
+
+        Segments extracted earlier with the same settings are combined with
+        them.
 
         Parameters
         ----------
@@ -1437,6 +1484,12 @@ class SpectralExtractor:
         keep_segments : bool
             Keep the per-segment files (``*_spec.fits``). They hold the same
             data as the combined file; ``False`` deletes them after combining.
+        overwrite : bool
+            ``False`` (default): spectra made earlier with the same settings,
+            PSF and inputs are loaded, and only missing segments are
+            extracted; existing spectra made with other settings raise an
+            error. ``True``: extract again (with a new PSF fit, unless
+            :meth:`fit_psf` or :meth:`load_model` was called before).
 
         Returns
         -------
@@ -1444,8 +1497,51 @@ class SpectralExtractor:
             The combined product (``combine=True``).
         """
         t0 = time.time()
+        segs = list(range(self.src.nseg) if segments is None else segments)
+        self._ensure_background_region()
+        if overwrite and self._psf_silent:
+            self.psfs = {}
+        if not self.psfs and not overwrite:
+            w = self._psf_request([self])
+            if self._psf_saved(*w):
+                self._restore_psf(*w, verbose=False)
+                self._psf_silent = True
+        combined = None
+        if combine and not overwrite:
+            combined, spec = self._load_finished(segs)
+            if spec is not None:
+                return spec
+        if not self.psfs:
+            self.fit_psf(overwrite=overwrite)
         self._ready()
-        self.save_model()
+        finished = self._find_finished(segs, combined, overwrite)
+        if any(k not in finished for k in segs):
+            self._print_columns()
+            if overwrite or not self._model_protected():
+                self.save_model()
+        reg = []
+        for k in segs:
+            if k in finished:
+                reg.append(self._read_regressors(self.outputs[k]))
+                if self.verbose:
+                    print(f'  segment {k + 1}/{self.src.nseg}: {loaded_message(finished[k])}')
+            else:
+                reg.append(self.extract_segment(k))
+        self._warn_breaks(reg)
+        self.log.add('run', segments=segs, loaded=sorted(finished), params=self.params,
+                     order_params=self.order_params, seconds=time.time() - t0)
+        if self.verbose:
+            print(f'extraction done in {time.time() - t0:.0f} s')
+        if not combine:
+            return None
+        out = self.combine()
+        if not keep_segments:
+            self.store.forget(*self.outputs.values())
+            remove_files(self.outputs, self.verbose)
+        return out
+
+    def _print_columns(self):
+        """Report the columns affected by saturation."""
         for o in self.orders:
             nsat = self.column_saturation(o)
             mg = self.p('extract', o).get('min_groups')
@@ -1459,24 +1555,229 @@ class SpectralExtractor:
             if nsat is not None and self.verbose and self.p('extract', o).get('saturated_box'):
                 nb = int(((nsat < (self.src.sat_ngroups or nsat.max())) & (nsat >= (mg or 0))).sum())
                 print(f'  order {o}: {nb} saturated column(s) extracted with the box sum')
-        segs = range(self.src.nseg) if segments is None else segments
-        reg = []
-        for k in segs:
-            gi, out = self.extract_segment(k)
-            reg.append((gi, out))
-        self._warn_breaks(reg)
-        self.log.add('run', segments=list(segs), params=self.params,
-                     order_params=self.order_params, seconds=time.time() - t0)
-        if self.verbose:
-            print(f'extraction done in {time.time() - t0:.0f} s')
-        if not combine:
-            return None
-        out = self.combine()
-        if not keep_segments:
-            remove_files(self.outputs, self.verbose)
+
+    # ------------------------------------------------------------------
+    # Products of earlier runs (see jstark.reduction.products)
+    # ------------------------------------------------------------------
+    def spectra_file(self):
+        return os.path.join(self.outdir, f'{self.src.exposure}_spectra.fits')
+
+    def _spec_file(self, k):
+        return output_filename(self.src.files[k], self.outdir, 'spec')
+
+    def _steps(self, *steps):
+        return {str(o): {s: self.p(s, o) for s in steps} for o in self.orders}
+
+    def _inputs(self):
+        return ProductStore.ids(self.src.files, self.src.exposure)
+
+    def _maps_id(self):
+        if self._maps is None:
+            s = self.src
+            self._maps = content_id(s.median, self._badpix0, s.cr_sigma, s.std)
+        return self._maps
+
+    def _psf_settings(self):
+        """Everything the PSF of this exposure depends on, except the data."""
+        steps = ['trace', 'background', 'psf']
+        if len(self.orders) > 1 or self.field_traces:      # the orders are extracted in the fit
+            steps.append('extract')
+        return plain(dict(
+            mode=self.mode, orders=self.orders, params=self._steps(*steps), maps=self._maps_id(),
+            traces={str(o): [int(t.cols[0]), int(t.cols[-1]), content_id(np.round(t.y0, 6))]
+                    for o, t in self.traces.items()},
+            contaminants=None if self.contam_mask is None else content_id(self.contam_mask),
+            field_traces=[dict(order=f['order'], dx=f['dx'], dy=f.get('dy0', f['dy']),
+                               columns=f['columns'], refine=f['refine']) for f in self.field_traces]))
+
+    def _psf_request(self, members):
+        """``(settings, inputs)`` of the PSF a fit to ``members`` would give."""
+        settings, inputs = self._psf_settings(), {}
+        for m in members:
+            inputs.update(m._inputs())
+        if len(members) > 1:
+            settings['joint'] = {m.src.exposure: content_id(np.frombuffer(
+                json.dumps(m._psf_settings(), sort_keys=True).encode(), np.uint8)) for m in members}
+        return settings, inputs
+
+    def _psf_saved(self, settings, inputs):
+        """Whether the saved model holds the PSF described by ``settings`` and ``inputs``."""
+        fn = self.model_file()
+        if not os.path.isfile(fn):
+            return False
+        rec = self.store.get(fn)
+        if (rec is not None and rec['status'] != 'done') or not fits_complete(fn, ('PARAMS',)):
+            return False
+        with fits.open(fn) as h:
+            par = json.loads(h['PARAMS'].data['params'][0])
+            if par.get('psf_record') is not None:
+                r = par['psf_record']
+                return not (differences(r['settings'], settings) or
+                            input_differences(r['inputs'], inputs))
+            # saved before records existed: compare what the file holds
+            if self.field_traces or par.get('field_traces'):
+                return False
+            if any(ProductStore(self.src.outdir, self.src.exposure).get(f) is not None
+                   and ProductStore(self.src.outdir, self.src.exposure).get(f).get('stamp', 0.)
+                   > os.path.getmtime(fn) + 2 for f in self.src.files):
+                return False
+            if list(par.get('psf_exposures') or []) != (list(settings.get('joint', {}))):
+                return False
+            if h[0].header['ORDERS'] != ','.join(str(o) for o in self.orders):
+                return False
+            if differences(self._saved_steps(par, settings['params']), settings['params']):
+                return False
+            for o, tr in self.traces.items():
+                t = h[f'TRACE_O{o}'].data
+                if not (np.array_equal(t['col'], tr.cols) and np.allclose(t['y0'], tr.y0, atol=1e-6)):
+                    return False
+            cm = np.asarray(h['CONTAM'].data, bool) if 'CONTAM' in h else None
+            if (cm is None) != (self.contam_mask is None) or \
+                    (cm is not None and not np.array_equal(cm, self.contam_mask)):
+                return False
+            return all(f'PSF_O{o}' in h for o in self.orders)
+
+    def _saved_steps(self, par, like):
+        """Parameters saved in ``par``, of the orders and steps of ``like`` (defaults if absent)."""
+        base = get_defaults(self.mode)[0]
+        out = {}
+        for o, steps in like.items():
+            over = (par.get('order_params') or {}).get(o, {})
+            out[o] = {s: {**base[s], **par['params'].get(s, {}), **over.get(s, {})} for s in steps}
         return out
 
-    def _warn_breaks(self, reg):
+    def _restore_psf(self, settings, inputs, verbose=True):
+        """Load the PSF, pixel response, variance map and field model (not the parameters)."""
+        fn = self.model_file()
+        with fits.open(fn) as h:
+            par = json.loads(h['PARAMS'].data['params'][0])
+            self._read_psf(h, par)
+        rec = par.get('psf_record')
+        self._psf_record = rec or self._unrecorded_psf(settings, inputs)
+        self.bkg_mask = None
+        self._ensure_background_region()
+        if verbose:
+            print(loaded_message(Check('done', fn, [], rec), compared=True) + ': PSF')
+        return self.psfs
+
+    def _unrecorded_psf(self, settings=None, inputs=None):
+        uid = content_id(*[self.psfs[o].C for o in self.orders], self.qmap)
+        return dict(id=f'content {uid}', settings=settings, inputs=inputs or {}, time=None)
+
+    def _model_protected(self):
+        """Whether existing spectra were made from the saved model (and not from the current one)."""
+        fn, sp = self.model_file(), self.spectra_file()
+        if not (os.path.isfile(fn) and os.path.isfile(sp)):
+            return False
+        rec = self.store.get(sp)
+        if rec is None:
+            return True
+        if rec['status'] != 'done':
+            return False
+        psf = (rec.get('inputs') or {}).get('psf')
+        return psf != (self._psf_record or {}).get('id') and self._model_id() in (psf, None)
+
+    def _model_id(self):
+        """Identifier of the PSF in the saved model file."""
+        try:
+            with fits.open(self.model_file()) as h:
+                rec = json.loads(h['PARAMS'].data['params'][0]).get('psf_record')
+        except Exception:
+            return None
+        return None if rec is None else rec['id']
+
+    def _run_settings(self):
+        """Everything the spectra depend on, except the data."""
+        rec = self._psf_record if self.psfs else None
+        psf = rec['settings'] if rec and rec.get('settings') else \
+            (rec['id'] if rec else self._psf_settings())
+        s = self.src
+        return plain(dict(mode=self.mode, orders=self.orders, params=self._steps('background', 'extract'),
+                          psf=psf, wavelength=None if s.wavelength is None else content_id(s.wavelength),
+                          saturation=None if s.satmap is None else content_id(s.satmap),
+                          covariance={str(o): a for o, a in self._cov_args.items()}))
+
+    def _run_inputs(self):
+        rec = self._psf_record if self.psfs else None
+        return dict(self._inputs(), psf=rec['id'] if rec else None)
+
+    def _covers(self, gidx, segs):
+        have = np.zeros(self.src.nint, bool)
+        have[np.asarray(gidx, int)[np.asarray(gidx, int) < self.src.nint]] = True
+        return all(have[self.src.seg_start[k]:self.src.seg_start[k] + self.src.seg_nint[k]].all()
+                   for k in segs)
+
+    def _load_finished(self, segs):
+        """``(check, Spectra)`` of the combined file; ``Spectra`` is None if it must be made."""
+        fn = self.spectra_file()
+        c = self.store.check(fn, self._run_settings(), self._run_inputs(), need=('TIMES', 'PARAMS'),
+                             input_files=self.src.files)
+        if c.status == 'unrecorded':
+            c = self._check_unrecorded(c)
+        ProductStore.refuse(c)
+        if c.status not in ('done', 'unrecorded'):
+            return c, None
+        spec = Spectra(fn)
+        if not self._covers(spec.gidx, segs):
+            return c, None
+        for k in range(self.src.nseg):
+            f = self._spec_file(k)
+            if k not in self.outputs and os.path.isfile(f) and self._covers(spec.gidx, [k]):
+                self.outputs[k] = f
+        if self.verbose:
+            n = '' if self._covers(spec.gidx, range(self.src.nseg)) else \
+                f' ({len(spec.gidx)} of {self.src.nint} integrations)'
+            print(loaded_message(c, compared=True) + n)
+        self._warn_breaks([(spec.gidx, {o: spec.regressors[o] for o in self.orders})], log=False)
+        return c, spec
+
+    def _check_unrecorded(self, c):
+        """Compare the parameters stored in a spectra file without a record with the current ones."""
+        with fits.open(c.path) as h:
+            par = json.loads(h['PARAMS'].data['params'][0])
+            diffs = []
+            if h[0].header['ORDERS'] != ','.join(str(o) for o in self.orders):
+                diffs.append(f'orders: {h[0].header["ORDERS"]} -> {self.orders}')
+            else:
+                now = self._steps('trace', 'background', 'psf', 'extract')
+                diffs += differences(self._saved_steps(par, now), now)
+                for o, tr in self.traces.items():
+                    if not np.array_equal(h[f'TRACE_O{o}'].data['col'], tr.cols):
+                        diffs.append(f'columns of order {o}: changed')
+                if sorted(par.get('psf_exposures') or []) != sorted(self.psf_exposures):
+                    diffs.append(f'exposures of the PSF: {par.get("psf_exposures")} -> {self.psf_exposures}')
+        return c._replace(status='different' if diffs else 'unrecorded', diffs=diffs)
+
+    def _find_finished(self, segs, combined, overwrite):
+        """Segments of ``segs`` whose spectra exist (``{segment: check}``); updates ``outputs``."""
+        settings, inputs = self._run_settings(), self._run_inputs()
+        checks = {k: self.store.check(self._spec_file(k), settings, inputs, need=('TIMES',),
+                                      input_files=self.src.files) for k in range(self.src.nseg)}
+        gidx = []
+        if combined is not None and combined.status == 'unrecorded':   # its parameters were compared
+            gidx = Spectra(combined.path).gidx
+
+        def usable(k):
+            return checks[k].status == 'done' or (checks[k].status == 'unrecorded' and not overwrite
+                                                  and len(gidx) and self._covers(gidx, [k]))
+        finished = {}
+        if not overwrite:
+            ProductStore.refuse([checks[k] for k in segs])
+            finished = {k: checks[k] for k in segs if usable(k)}
+        for k in range(self.src.nseg):
+            if k in finished or (k not in segs and usable(k)):
+                self.outputs[k] = checks[k].path
+            elif k not in segs:
+                self.outputs.pop(k, None)          # extracted with other settings
+        return finished
+
+    def _read_regressors(self, fn):
+        with fits.open(fn) as h:
+            gidx = np.asarray(h['TIMES'].data['gidx'])
+            out = {o: {n: np.asarray(h[f'REG_O{o}'].data[n]) for n in ('dy', 'ds')} for o in self.orders}
+        return gidx, out
+
+    def _warn_breaks(self, reg, log=True):
         """Warn about abrupt, lasting PSF changes not covered by ``psf breaks``."""
         from .metrics import find_psf_breaks
         if not reg:
@@ -1502,7 +1803,8 @@ class SpectralExtractor:
             warnings.warn(msg)
             if self.verbose:
                 print('  WARNING: ' + msg)
-        self.log.add('psf_break_check', found=found, breaks=known)
+        if log:
+            self.log.add('psf_break_check', found=found, breaks=known)
         return found
 
     # ------------------------------------------------------------------
@@ -1534,7 +1836,7 @@ class SpectralExtractor:
         return uniq
 
     def optimise(self, apertures=None, bkg_inner=None, nblocks=3, block_len=300, segments=None,
-                 order=None, apply=True, plot=False):
+                 order=None, apply=True, plot=False, overwrite=False):
         """Choose the extraction aperture and background region by light-curve scatter.
 
         For every combination, the background is re-estimated and the
@@ -1559,6 +1861,9 @@ class SpectralExtractor:
             Order whose white light is used (default: the first).
         apply : bool
             Set the best combination as the current parameters.
+        overwrite : bool
+            ``False`` (default): load the result of the same test made
+            earlier (``<exposure>_optimise.json``); ``True``: test again.
 
         Returns
         -------
@@ -1574,7 +1879,48 @@ class SpectralExtractor:
                    np.arange(max(1., pe['aperture'] - 2), pe['aperture'] + 2.5, 1.))
         inner = list(bkg_inner if bkg_inner is not None else [pb['inner']])
         blocks = self._blocks(nblocks, block_len, segments)
-        saved = (self.bkg_mask, self.bkg_ok, copy.deepcopy(self.params['background']))
+        key = plain(dict(self._run_settings(), inputs=self._run_inputs(), order=o, apertures=aps,
+                         bkg_inner=inner, blocks=[(k, sl.start, sl.stop) for k, sl in blocks]))
+        res = None if overwrite else load_result(self._optimise_file(), key)
+        if res is not None:
+            for name in ('apertures', 'bkg_inner', 'sigma', 'ratio', 'sigma_err'):
+                res[name] = np.asarray(res[name], float)
+            res['blocks'] = [tuple(b) for b in res['blocks']]
+            if self.verbose:
+                print(f'Loaded existing result from {os.path.basename(self._optimise_file())}')
+        else:
+            res = self._optimise_test(o, aps, inner, blocks)
+            save_result(self._optimise_file(), key, res)
+        self.optimisation = res
+        best = res['best']
+        if self.verbose:
+            sigma = res['sigma']
+            print('  bkg_inner \\ aperture ' + ' '.join(f'{a:7.1f}' for a in aps))
+            for ii, rin in enumerate(inner):
+                print(f'  {rin:20.1f} ' + ' '.join(f'{1e6 * s:7.1f}' for s in sigma[ii]))
+            print(f'  best: aperture {best["aperture"]}, bkg_inner {best["bkg_inner"]}: '
+                  f'{1e6 * best["sigma"]:.1f} +- {1e6 * best["sigma_err"]:.1f} ppm '
+                  f'({best["ratio"]:.2f} x propagated); settings within the +- are equivalent')
+        if apply:
+            self.set('extract', aperture=best['aperture'])
+            if best['bkg_inner'] != pb['inner']:
+                self.params['background']['inner'] = best['bkg_inner']
+                self.bkg_mask = None
+                self._ensure_background_region()
+        self.log.add('optimise', order=o, apertures=aps, bkg_inner=inner,
+                     sigma_ppm=(1e6 * res['sigma']).round(2).tolist(), best=best, applied=apply)
+        if plot:
+            from .diagnostics import plot_optimisation
+            plot_optimisation(res)
+        return res
+
+    def _optimise_file(self):
+        return os.path.join(self.outdir, f'{self.src.exposure}_optimise.json')
+
+    def _optimise_test(self, o, aps, inner, blocks):
+        """The scatter for every aperture / background combination (see :meth:`optimise`)."""
+        pe = self.p('extract', o)
+        saved = copy.deepcopy(self.params['background'])
         wl = {(i, j): [[] for _ in blocks] for i in range(len(inner)) for j in range(len(aps))}
         wle = {key: [[] for _ in blocks] for key in wl}
         t0 = time.time()
@@ -1598,9 +1944,10 @@ class SpectralExtractor:
                             wl[(i, j)][b].append(f)
                             wle[(i, j)][b].append(fe)
         finally:
-            self.bkg_mask, self.bkg_ok, self.params['background'] = saved[0], saved[1], saved[2]
-            if self.bkg_mask is None:
-                self._ensure_background_region()
+            # the region *and* the reference quantities measured with it
+            self.params['background'] = saved
+            self.bkg_mask = None
+            self._ensure_background_region()
         sigma = np.zeros((len(inner), len(aps)))
         ratio = np.zeros_like(sigma)
         for (i, j), bl in wl.items():
@@ -1615,27 +1962,9 @@ class SpectralExtractor:
                     ratio=float(ratio[i, j]), sigma_err=float(sigma_err[i, j]))
         res = dict(apertures=np.asarray(aps, float), bkg_inner=np.asarray(inner, float),
                    sigma=sigma, ratio=ratio, sigma_err=sigma_err, best=best, blocks=[(k, sl.start, sl.stop) for k, sl in blocks])
-        self.optimisation = res
         if self.verbose:
             print(f'optimise ({time.time() - t0:.0f} s, {len(blocks)} block(s), '
                   f'{sum(s.stop - s.start for _, s in blocks)} integrations): white-light p2p scatter [ppm]')
-            print('  bkg_inner \\ aperture ' + ' '.join(f'{a:7.1f}' for a in aps))
-            for ii, rin in enumerate(inner):
-                print(f'  {rin:20.1f} ' + ' '.join(f'{1e6 * s:7.1f}' for s in sigma[ii]))
-            print(f'  best: aperture {best["aperture"]}, bkg_inner {best["bkg_inner"]}: '
-                  f'{1e6 * best["sigma"]:.1f} +- {1e6 * best["sigma_err"]:.1f} ppm '
-                  f'({best["ratio"]:.2f} x propagated); settings within the +- are equivalent')
-        if apply:
-            self.set('extract', aperture=best['aperture'])
-            if best['bkg_inner'] != pb['inner']:
-                self.params['background']['inner'] = best['bkg_inner']
-                self.bkg_mask = None
-                self._ensure_background_region()
-        self.log.add('optimise', order=o, apertures=aps, bkg_inner=inner,
-                     sigma_ppm=(1e6 * sigma).round(2).tolist(), best=best, applied=apply)
-        if plot:
-            from .diagnostics import plot_optimisation
-            plot_optimisation(res)
         return res
 
     def _block_chunks(self, k, sl):
@@ -1732,10 +2061,11 @@ class SpectralExtractor:
                 if o in ep['psfs']:
                     hdus += ep['psfs'][o].to_hdus(f'_O{o}{sfx}')
             if ep['var_mean'] is not None:
+                # double precision: an extraction from the reloaded model is identical
                 hdus.append(fits.ImageHDU(np.where(np.isfinite(ep['var_mean']), ep['var_mean'], 0.)
-                                          .astype(np.float32), name='VARMEAN' + sfx))
+                                          .astype(np.float64), name='VARMEAN' + sfx))
             if ep['qmap'] is not None:
-                hdus.append(fits.ImageHDU(ep['qmap'].astype(np.float32), name='QMAP' + sfx))
+                hdus.append(fits.ImageHDU(ep['qmap'].astype(np.float64), name='QMAP' + sfx))
         if self.contam_mask is not None:
             hdus.append(fits.ImageHDU(self.contam_mask.astype(np.uint8), name='CONTAM'))
         if self.field_model is not None:
@@ -1743,12 +2073,19 @@ class SpectralExtractor:
         par = json.dumps({'params': self.params, 'order_params': {str(k): v for k, v in
                                                                   self.order_params.items()},
                           'psf_exposures': list(self.psf_exposures),
+                          'psf_record': self._psf_record,
+                          'fit_info': [{str(o): plain({k: v for k, v in p.fit_info.items()
+                                                       if not k.startswith('cv_')})
+                                        for o, p in ep['psfs'].items()} for ep in self._epoch_models()],
                           'contaminants': self.contaminants,
                           'field_traces': [{k: (v.tolist() if isinstance(v, np.ndarray) else v)
                                             for k, v in ft.items()} for ft in self.field_traces]})
         hdus.append(fits.BinTableHDU.from_columns(
             [fits.Column(name='params', format=f'{len(par)}A', array=np.array([par]))], name='PARAMS'))
+        store = ProductStore(os.path.dirname(os.path.abspath(fname)), self.src.exposure)
+        store.begin(fname)
         fits.HDUList(hdus).writeto(fname, overwrite=True)
+        store.done(fname, uid=(self._psf_record or {}).get('id'))
         return fname
 
     def load_model(self, fname=None):
@@ -1769,37 +2106,46 @@ class SpectralExtractor:
                 if 'wavelength' in t.names:
                     tr.info['wavelength'] = np.asarray(t['wavelength'], float)
                 self.traces[o] = tr
-            brk = self.breaks()
-            self.epochs = []
-            for i, (a, b) in enumerate(self.epoch_ranges()):
-                sfx = '' if i == 0 else f'_E{i}'
-                psfs = {o: SplinePSF.from_hdu(h[f'PSF_O{o}{sfx}']) for o in self.orders
-                        if f'PSF_O{o}{sfx}' in h}
-                vm = None
-                if 'VARMEAN' + sfx in h:
-                    v = np.asarray(h['VARMEAN' + sfx].data, float)
-                    vm = np.where(v > 0, v, np.inf)
-                qm = np.asarray(h['QMAP' + sfx].data, float) if 'QMAP' + sfx in h else None
-                self.epochs.append(dict(start=a, stop=b, psfs=psfs, qmap=qm, var_mean=vm))
-            ep0 = self.epochs[0]
-            self.psfs, self.qmap, self.var_mean = ep0['psfs'], ep0['qmap'], ep0['var_mean']
-            if not brk:
-                self.epochs = []
             self.contam_mask = np.asarray(h['CONTAM'].data, bool) if 'CONTAM' in h else None
-            self.field_model = np.asarray(h['FIELD'].data, np.float32) if 'FIELD' in h else None
+            self._read_psf(h, par)
         self.contaminants = par.get('contaminants', [])
-        self.psf_exposures = list(par.get('psf_exposures', []))
-        self.field_traces = [{k: (np.asarray(v) if k in ('flux', 'cols') else
-                                  (tuple(v) if k == 'columns' and v is not None else v))
-                              for k, v in ft.items()} for ft in par.get('field_traces', [])]
+        self._psf_record = par.get('psf_record') or self._unrecorded_psf()
+        self._psf_silent = False
         self._set_badpix()
         self.bkg_mask = None
         self._ensure_background_region()
         return self
 
+    def _read_psf(self, h, par):
+        """PSFs (of every epoch), pixel-response and variance maps, field model from a model file."""
+        info = par.get('fit_info') or []
+        self.epochs = []
+        for i, (a, b) in enumerate(self.epoch_ranges()):
+            sfx = '' if i == 0 else f'_E{i}'
+            psfs = {o: SplinePSF.from_hdu(h[f'PSF_O{o}{sfx}']) for o in self.orders
+                    if f'PSF_O{o}{sfx}' in h}
+            for o, p in psfs.items():
+                if i < len(info) and str(o) in info[i]:
+                    p.fit_info = dict(info[i][str(o)])
+            vm = None
+            if 'VARMEAN' + sfx in h:
+                v = np.asarray(h['VARMEAN' + sfx].data, float)
+                vm = np.where(v > 0, v, np.inf)
+            qm = np.asarray(h['QMAP' + sfx].data, float) if 'QMAP' + sfx in h else None
+            self.epochs.append(dict(start=a, stop=b, psfs=psfs, qmap=qm, var_mean=vm))
+        ep0 = self.epochs[0]
+        self.psfs, self.qmap, self.var_mean = ep0['psfs'], ep0['qmap'], ep0['var_mean']
+        if not self.breaks():
+            self.epochs = []
+        self.field_model = np.asarray(h['FIELD'].data, np.float32) if 'FIELD' in h else None
+        self.psf_exposures = list(par.get('psf_exposures', []))
+        self.field_traces = [{k: (np.asarray(v) if k in ('flux', 'cols') else
+                                  (tuple(v) if k == 'columns' and v is not None else v))
+                              for k, v in ft.items()} for ft in par.get('field_traces', [])]
+
     def combine(self, fname=None):
         """Combine the per-segment spectra into ``<exposure>_spectra.fits``."""
-        fname = fname or os.path.join(self.outdir, f'{self.src.exposure}_spectra.fits')
+        fname = fname or self.spectra_file()
         segs = sorted(self.outputs)
         data = {}
         for k in segs:
@@ -1869,7 +2215,10 @@ class SpectralExtractor:
                            for k, v in self.optimisation.items()}})
         hdus.append(fits.BinTableHDU.from_columns(
             [fits.Column(name='params', format=f'{len(par)}A', array=np.array([par]))], name='PARAMS'))
+        store = ProductStore(os.path.dirname(os.path.abspath(fname)), self.src.exposure)
+        store.begin(fname)
         fits.HDUList(hdus).writeto(fname, overwrite=True)
+        store.done(fname, self._run_settings(), self._run_inputs(), segments=segs)
         if self.verbose:
             print(f'Saved spectra to {fname}')
         self.log.add('combine', file=fname, segments=segs)
@@ -1921,6 +2270,7 @@ class VisitExtractor:
             raise ValueError(f'The same exposure is given twice: {names}.')
         self.shared_psf = bool(shared_psf)
         self.verbose = verbose
+        self._psf_silent = False
 
     def __len__(self):
         return len(self.extractors)
@@ -1965,22 +2315,33 @@ class VisitExtractor:
                                          f'({first.traces[o].cols[0]}-{first.traces[o].cols[-1]}).')
         return [ex.traces for ex in self.extractors]
 
-    def fit_psf(self, verbose=None):
-        """One PSF from all exposures (``shared_psf=True``) or one per exposure."""
+    def fit_psf(self, verbose=None, overwrite=False):
+        """One PSF from all exposures (``shared_psf=True``) or one per exposure.
+
+        ``overwrite``: as in :meth:`SpectralExtractor.fit_psf`.
+        """
+        self._psf_silent = False
         if any(not ex.traces for ex in self.extractors):
             self.find_trace()
         if self.shared_psf and len(self) > 1:
-            self.extractors[0].fit_psf(verbose=verbose, others=self.extractors[1:])
+            self.extractors[0].fit_psf(verbose=verbose, others=self.extractors[1:],
+                                       overwrite=overwrite)
         else:
             for ex in self.extractors:
-                ex.fit_psf(verbose=verbose)
+                ex.fit_psf(verbose=verbose, overwrite=overwrite)
         return [ex.psfs for ex in self.extractors]
 
-    def run(self, combine=True, keep_segments=True):
-        """Extract every exposure (:meth:`SpectralExtractor.run`); list of results."""
-        if any(not ex.psfs for ex in self.extractors):
-            self.fit_psf()
-        return [ex.run(combine=combine, keep_segments=keep_segments) for ex in self.extractors]
+    def run(self, combine=True, keep_segments=True, overwrite=False):
+        """Extract every exposure (:meth:`SpectralExtractor.run`); list of results.
+
+        ``overwrite=False`` (default) loads what was made earlier with the
+        same settings; ``True`` extracts again.
+        """
+        if any(not ex.psfs for ex in self.extractors) or (overwrite and self._psf_silent):
+            self.fit_psf(overwrite=overwrite)
+            self._psf_silent = True
+        return [ex.run(combine=combine, keep_segments=keep_segments, overwrite=overwrite)
+                for ex in self.extractors]
 
 
 def _fill_along_dispersion(img, bad, good):

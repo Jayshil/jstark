@@ -76,12 +76,13 @@ def find_exposures(inputs, suffix='uncal'):
     return dict(sorted(exposures.items()))
 
 
-def select_exposure(exposures, exposure=None, verbose=True):
+def select_exposure(exposures, exposure=None, verbose=True, nints=None):
     """Select one exposure from the output of :func:`find_exposures`.
 
     If ``exposure`` is ``None`` and several exposures are present, the one
     with the largest total number of integrations (i.e. the time series) is
-    chosen, and the others are reported.
+    chosen, and the others are reported. ``nints`` gives the number of
+    integrations of exposures whose files no longer exist (``{key: n}``).
     """
     if exposure is not None:
         matches = [k for k in exposures if exposure in k]
@@ -91,10 +92,11 @@ def select_exposure(exposures, exposure=None, verbose=True):
     if len(exposures) == 1:
         key = next(iter(exposures))
         return key, exposures[key]
-    nints = {}
+    nints = dict(nints or {})
     for key, flist in exposures.items():
-        h = fits.getheader(flist[0], 0)
-        nints[key] = h.get('NINTS', 0)
+        if key not in nints:
+            h = fits.getheader(flist[0], 0)
+            nints[key] = h.get('NINTS', 0)
     key = max(nints, key=nints.get)
     if verbose:
         others = ', '.join(f'{k} (NINTS={nints[k]})' for k in exposures if k != key)

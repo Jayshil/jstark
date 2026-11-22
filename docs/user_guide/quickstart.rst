@@ -89,6 +89,8 @@ Things to know
   Notebooks do not need it.
 * **Memory and time.** Stage 1 takes 1--7 minutes per segment and can use
   16--20 GB of memory with four cores. Run large exposures one at a time.
+* **Running again.** Finished steps are loaded, not repeated; changed settings
+  raise an error unless ``overwrite=True`` is given (see :ref:`overwrite`).
 * **Testing on one segment.** ``s1.run(segments=[0])`` processes only the
   first segment. Build the saturation map from the same segment first with
   ``s1.compute_saturation_map(segments=[0])``; by default it is built from
@@ -128,6 +130,8 @@ File                                  Content
 ``<exposure>_spectra.fits``           spectra of every integration, with
                                       regressors (``dy``, ``ds``, ...)
 ``<exposure>_*_log.json``             every step and parameter that was run
+``<exposure>_products.json``          what each file was made with
+                                      (see :ref:`overwrite`)
 ====================================  =======================================
 
 Next steps

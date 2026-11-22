@@ -374,9 +374,11 @@ class SpectroscopicFit:
         sampler : str
             juliet sampler (default ``'dynamic_dynesty'``).
         overwrite : bool
-            Refit bins whose folder holds a different fit (data, regressors
-            or priors changed). Without it such bins stop the run before any
-            fitting.
+            ``False`` (default): finished bins are skipped; bins whose folder
+            holds a different fit (data, regressors or priors changed) stop
+            the run before any fitting. ``True``: fit all (requested) bins
+            again. Their earlier files are deleted at the start, so an
+            interrupted run continues with ``overwrite=False``.
         bins : sequence of int or None
             Only these bins (default all bins with data); bins without
             data are skipped.
@@ -410,7 +412,7 @@ class SpectroscopicFit:
             bb = self.bin_fit(i)
             msgs.update(bb._construction_warnings)
             st = self._state(bb)
-            if st == 'done':
+            if st == 'done' and not overwrite:
                 done.append(i)
             else:
                 if st == 'different':
@@ -422,6 +424,11 @@ class SpectroscopicFit:
             raise RuntimeError(f'{len(different)} bin folder(s) hold a different fit (e.g. '
                                f'{self.bins[different[0]]["folder"]}); use overwrite=True or '
                                'another out_folder.')
+        if overwrite:
+            for _, bb in todo:
+                bb._check_eclipse_timing(fit_kwargs)      # errors before anything is deleted
+            for _, bb in todo:
+                bb._check_folder(True)
         self._write_json(sampler, fit_kwargs)
         if self.verbose:
             print(f'{len(done)} bins already done, {len(todo)} to fit with {sampler} '
@@ -442,7 +449,7 @@ class SpectroscopicFit:
 
         if nproc <= 1:
             for k, (i, bb) in enumerate(todo, 1):
-                report(k, i, _run_bin(bb, sampler, overwrite, fit_kwargs, nsamples))
+                report(k, i, _run_bin(bb, sampler, False, fit_kwargs, nsamples))
         elif todo:
             import multiprocessing
             from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -452,7 +459,7 @@ class SpectroscopicFit:
             try:
                 ctx = multiprocessing.get_context('spawn')
                 with ProcessPoolExecutor(max_workers=int(nproc), mp_context=ctx) as ex:
-                    fut = {ex.submit(_run_bin, bb, sampler, overwrite, fit_kwargs, nsamples): i
+                    fut = {ex.submit(_run_bin, bb, sampler, False, fit_kwargs, nsamples): i
                            for i, bb in todo}
                     for k, f in enumerate(as_completed(fut), 1):
                         i = fut[f]

@@ -100,7 +100,10 @@ runs; the spectroscopic test spawns 2 worker processes).
   fingerprint (data, regressors, priors, LD laws, ramps) in
   `jstark_fit.json` and refuses a folder holding a different fit unless
   `overwrite=True` (which deletes the juliet files). An identical earlier
-  fit is loaded instead of re-run.
+  fit is loaded instead of re-run. Since 2026-11-22 `overwrite=True` also
+  re-runs an *identical* fit (user decision), and `SpectroscopicFit.run`
+  clears all requested bins first, so an interrupted `overwrite=True` run is
+  continued with `overwrite=False`.
 - **Instrument names** must not contain `_` (parameter names are split on
   it) or `-` (per-instrument LD laws are written `inst-law`), and must not
   equal a parameter part (`p1`, `q1`, `w`, `theta0`, ...): juliet matches

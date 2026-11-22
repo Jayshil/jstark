@@ -29,6 +29,8 @@ from .instruments import BAD_DQ_FLAGS, identify_mode, get_mode_config
 from .io import find_exposures, select_exposure, read_int_times, output_filename
 from .masks import build_trace_mask, ensure_min_background
 from .onef import group_background
+from .products import (ProductStore, content_id, differences, input_exposures, loaded_message,
+                       plain)
 from .robust import running_median, nanmedian, mad_sigma, MAD_TO_SIGMA
 import bottleneck as bn
 
@@ -791,7 +793,10 @@ class ExposureCleaner:
        would in a stitched cube. The padding is removed before saving
        ``<root>-segNNN_<det>_cleaned.fits``.
 
-    :meth:`run` does both. :meth:`save_info` writes a small exposure-level
+    :meth:`run` does both. Products of an earlier run made with the same
+    settings from the same inputs are loaded, not made again, unless
+    ``overwrite=True`` (an interrupted run continues where it stopped).
+    :meth:`save_info` writes a small exposure-level
     file (``<exposure>_cleaninfo.fits``) with the bad-pixel map, masks,
     median frame, wavelength map, all integration times and the list of
     cleaned segment files; :meth:`load` restores the object from it, and
@@ -821,9 +826,12 @@ class ExposureCleaner:
 
     def __init__(self, inputs, outdir=None, suffix='rateints', exposure=None, wavelength=None,
                  dq_flags=BAD_DQ_FLAGS, persistent_frac=0.5, verbose=True):
-        exps = find_exposures(inputs, suffix=suffix)
-        self.exposure, self.files = select_exposure(exps, exposure, verbose=verbose)
-        h0 = fits.getheader(self.files[0], 0)
+        exps, removed = input_exposures(inputs, suffix, outdir)
+        self.exposure, self.files = select_exposure(
+            exps, exposure, verbose=verbose, nints={k: sum(v['nint']) for k, v in removed.items()})
+        # inputs deleted after cleaning (remove_inputs=True): described by the info file
+        info = removed.get(self.exposure)
+        h0 = info['header'] if info is not None else fits.getheader(self.files[0], 0)
         self.mode = identify_mode(h0)
         self.config = get_mode_config(self.mode)
         self.dispersion_axis = self.config.dispersion_axis
@@ -832,7 +840,9 @@ class ExposureCleaner:
         self.header['NSEGMENT'] = len(self.files)
         self.outdir = outdir or os.path.dirname(os.path.abspath(self.files[0]))
         os.makedirs(self.outdir, exist_ok=True)
-        self.seg_nint = [int(fits.getheader(f, 'SCI')['NAXIS3']) for f in self.files]
+        self.store = ProductStore(self.outdir, self.exposure)
+        self.seg_nint = (list(info['nint']) if info is not None else
+                         [int(fits.getheader(f, 'SCI')['NAXIS3']) for f in self.files])
         self.seg_start = np.concatenate([[0], np.cumsum(self.seg_nint)[:-1]]).astype(int)
         if isinstance(wavelength, str):
             wavelength = fits.getdata(wavelength, 'WAVELENGTH')
@@ -845,6 +855,7 @@ class ExposureCleaner:
         self.outputs = {}
         self.history = []
         self.diagnostics = {}
+        self._global_settings = None
         if verbose:
             print(f'ExposureCleaner: {self.mode} | {self.exposure} | {len(self.files)} segment(s), '
                   f'{sum(self.seg_nint)} integrations')
@@ -869,6 +880,9 @@ class ExposureCleaner:
             ``INT_TIMES`` columns for the selected integrations.
         """
         ints = slice(None) if ints is None else ints
+        if not os.path.isfile(self.files[i]):
+            raise FileNotFoundError(f'{os.path.basename(self.files[i])} no longer exists (removed after '
+                                    'cleaning?); run Stage 1 with overwrite=True to make it again.')
         bitmask = _dq_bitmask(self.dq_flags)
         # ``section`` reads only the requested integrations (and handles scaled DQ arrays)
         with fits.open(self.files[i]) as h:
@@ -885,7 +899,68 @@ class ExposureCleaner:
                 times = {n: np.asarray(tab[n])[sel][ints] for n in tab.names}
         return data, err, dqbad, times
 
-    def compute_global(self, hot_pixels=True, hot_kwargs=None, trace_kwargs=None):
+    def info_path(self):
+        return os.path.join(self.outdir, f'{self.exposure}_cleaninfo.fits')
+
+    def _maps_id(self):
+        return content_id(self.badpix, self.median, self.std, self.cr_sigma, self.trace_mask,
+                          self.bkg_mask)
+
+    def _restore_global(self, settings):
+        """Load the exposure-wide maps of an earlier run from the info file. Returns success."""
+        fn = self.info_path()
+        c = self.store.check(fn, None, ProductStore.ids(self.files, self.exposure),
+                             need=('BADPIX', 'SEGMENTS', 'HISTORY'), input_files=self.files)
+        if c.status in ('missing', 'incomplete'):
+            return False
+        if c.record is not None:
+            c = c._replace(diffs=c.diffs + differences(c.record['settings'].get('global'),
+                                                       settings))
+            c = c._replace(status='different' if c.diffs else 'done')
+        with fits.open(fn) as h:
+            names = [str(x).strip() for x in h['SEGMENTS'].data['input']]
+            nint = [int(n) for n in h['SEGMENTS'].data['nint']]
+            here = [os.path.basename(f) for f in self.files]
+            if c.record is None and (names != here or nint != self.seg_nint):
+                c = c._replace(status='different', diffs=[f'segments: {names} -> {here}'])
+            wl = np.asarray(h['WAVELENGTH'].data, np.float32) if 'WAVELENGTH' in h else None
+            if (wl is not None and self.wavelength is not None and
+                    not np.array_equal(wl, np.asarray(self.wavelength, np.float32), equal_nan=True)):
+                c = c._replace(status='different', diffs=c.diffs + ['wavelength map: changed'])
+            ProductStore.refuse(c)
+            get = lambda n, t: np.asarray(h[n].data, t) if n in h else None
+            self.badpix = get('BADPIX', np.uint8)
+            self.median, self.std = get('MEDIAN', np.float32), get('STD', np.float32)
+            self.cr_sigma = get('CRSIGMA', np.float32)
+            self.trace_mask = get('TRACEMASK', bool)
+            self.bkg_mask = get('BKGMASK', bool)
+            self._info_wavelength = wl
+            if self.wavelength is None:
+                self.wavelength = wl
+            self._int_times_cache = {}
+            if 'INT_TIMES' in h:
+                t = h['INT_TIMES'].data
+                self._int_times_cache = {n: [np.array(t[n])] for n in t.names}
+            if 'SATMAP' in h:
+                self.satmap = get('SATMAP', np.int16)
+                self.sat_ngroups = h['SATMAP'].header.get('NGROUPS')
+            try:
+                self.history = [e for e in json.loads(h['HISTORY'].data['history'][0])]
+            except Exception:
+                self.history = []
+            self._info_outputs = {i: os.path.join(self.outdir, str(x).strip()) for i, x in
+                                  enumerate(h['SEGMENTS'].data['cleaned']) if str(x).strip()}
+        self._global_settings = settings if c.record is not None else None
+        self._maps0 = (c.record or {}).get('state', {}).get('maps')
+        self._loaded_maps = self._maps_id()
+        if self.verbose:
+            print(f'  {loaded_message(c)}')
+            if self._maps0 is not None and self._maps0 != self._maps_id():
+                print('  note: its masks were changed by hand after compute_global; overwrite=True '
+                      'restores the automatic ones')
+        return True
+
+    def compute_global(self, hot_pixels=True, hot_kwargs=None, trace_kwargs=None, overwrite=False):
         """Pass 1: exposure-wide median / scatter images, bad-pixel map and masks.
 
         Parameters
@@ -897,7 +972,19 @@ class ExposureCleaner:
         trace_kwargs : dict or None
             Keyword arguments for :func:`~jstark.reduction.masks.build_trace_mask`
             (defaults from the mode configuration).
+        overwrite : bool
+            ``False`` (default): load the maps from the info file if it was
+            made with the same settings and inputs. ``True``: make them again.
         """
+        settings = plain(dict(dq_flags=list(self.dq_flags), persistent_frac=self.persistent_frac,
+                              hot_pixels=hot_pixels, hot_kwargs=hot_kwargs or {},
+                              trace_mask=dict(self.config.trace_mask, **(trace_kwargs or {})),
+                              window=self.config.nint_window))
+        self._global_kwargs = dict(hot_pixels=hot_pixels, hot_kwargs=hot_kwargs, trace_kwargs=trace_kwargs)
+        self._loaded_maps = None
+        if not overwrite and self._restore_global(settings):
+            return
+        self.history = []
         nflag, meds, stds, rsig = None, [], [], []
         window = self.config.nint_window
         for i in range(len(self.files)):
@@ -946,6 +1033,9 @@ class ExposureCleaner:
         if self.verbose:
             print(f'compute_global: {n_dq} bad pixels from DQ, {n_hot} hot/noisy pixels; '
                   f'trace mask {self.trace_mask.mean() * 100:.1f}% of pixels')
+        self._global_settings, self._maps0 = settings, self._maps_id()
+        self._info_wavelength = self.wavelength
+        self.save_info(verbose=False)                     # pass 1 need not be repeated
 
     def clean_segment(self, i, overlap=None, cr_kwargs=None, replace_kwargs=None,
                       background=False, bkg_kwargs=None, save=True):
@@ -978,10 +1068,9 @@ class ExposureCleaner:
         """
         if self.badpix is None:
             self.compute_global()
+        settings = self._segment_settings(overlap, cr_kwargs, replace_kwargs, background, bkg_kwargs)
         cr_kwargs = {} if cr_kwargs is None else cr_kwargs
-        window = (cr_kwargs or {}).get('window') or self.config.nint_window
-        if overlap is None:
-            overlap = window // 2 + 1
+        overlap = settings['overlap']
         parts = []
         n_before = 0
         if overlap and i > 0:
@@ -1032,7 +1121,11 @@ class ExposureCleaner:
                                'cr_frac_per_int': out.crmask.reshape(len(out.data), -1).mean(1)}
         if save:
             fn = output_filename(self.files[i], self.outdir, 'cleaned')
+            inputs = self._segment_inputs(i, overlap)
+            self.store.begin(fn)
             out.save(fn)
+            self.store.done(fn, settings, inputs,
+                            uid=content_id(out.data, out.err, out.badpix, out.crmask))
             self.outputs[i] = fn
         if self.verbose:
             print(f'  segment {i + 1}/{len(self.files)}: {nflag} transient flags '
@@ -1040,10 +1133,40 @@ class ExposureCleaner:
                   + (f' -> {os.path.basename(self.outputs[i])}' if save else ''))
         return out
 
-    def run(self, segments=None, remove_inputs=False, **kwargs):
+    def _segment_settings(self, overlap=None, cr_kwargs=None, replace_kwargs=None, background=False,
+                          bkg_kwargs=None):
+        window = (cr_kwargs or {}).get('window') or self.config.nint_window
+        return plain(dict(overlap=window // 2 + 1 if overlap is None else overlap,
+                          cr_kwargs={} if cr_kwargs is None else cr_kwargs,
+                          replace_kwargs={} if replace_kwargs is None else replace_kwargs,
+                          background=bool(background), bkg_kwargs=bkg_kwargs or {},
+                          window=self.config.nint_window, dq_flags=list(self.dq_flags),
+                          maps=self._maps_id()))
+
+    def _segment_inputs(self, i, overlap):
+        n = len(self.files)
+        use = [k for k in (i - 1, i, i + 1) if 0 <= k < n and (overlap or k == i)]
+        return ProductStore.ids([self.files[k] for k in use], self.exposure)
+
+    def _check_segments(self, kwargs):
+        """State of the cleaned file of every segment (see :meth:`ProductStore.check`)."""
+        kw = {k: v for k, v in kwargs.items() if k != 'save'}
+        settings = self._segment_settings(**kw)
+        out = {}
+        for i in range(len(self.files)):
+            inputs = self._segment_inputs(i, settings['overlap'])
+            out[i] = self.store.check(output_filename(self.files[i], self.outdir, 'cleaned'), settings,
+                                      inputs, need=('SCI', 'ERR', 'HISTORY'),
+                                      input_files=[os.path.join(os.path.dirname(self.files[i]), f)
+                                                   for f in inputs])
+        return out
+
+    def run(self, segments=None, remove_inputs=False, overwrite=False, **kwargs):
         """Run both passes on all (or the given) segments and save the products.
 
-        Keyword arguments are passed to :meth:`clean_segment`.
+        Keyword arguments are passed to :meth:`clean_segment`. Segments
+        cleaned in an earlier run stay listed in the info file if they were
+        made with the same settings.
 
         Parameters
         ----------
@@ -1056,6 +1179,11 @@ class ExposureCleaner:
             info file is rewritten after every segment, so the products on disk
             stay consistent if the run is interrupted. Re-cleaning then
             requires re-running Stage 1.
+        overwrite : bool
+            ``False`` (default): segments whose cleaned file exists and was
+            made with the same settings and inputs are not cleaned again; an
+            existing file made with other settings raises an error.
+            ``True``: clean them again.
 
         Returns
         -------
@@ -1066,24 +1194,76 @@ class ExposureCleaner:
             raise ValueError('remove_inputs=True requires cleaning all segments.')
         if remove_inputs and kwargs.get('save') is False:
             raise ValueError('remove_inputs=True requires saving the cleaned segments.')
-        if self.badpix is None:
-            self.compute_global()
         segs = list(range(len(self.files)) if segments is None else segments)
-        if remove_inputs:
+        save = kwargs.get('save', True)
+        if overwrite or not save:
+            use = {k for i in segs for k in (i - 1, i, i + 1) if 0 <= k < len(self.files)}
+            gone = [os.path.basename(self.files[k]) for k in
+                    (range(len(self.files)) if self.badpix is None else sorted(use))
+                    if not os.path.isfile(self.files[k])]
+            if gone:
+                raise FileNotFoundError(f'Cannot clean again: {", ".join(gone)} no longer exist(s) '
+                                        '(removed after cleaning?). Run Stage 1 with overwrite=True first.')
+        if self.badpix is None:
+            self.compute_global(overwrite=overwrite)
+        elif overwrite and getattr(self, '_loaded_maps', None) == self._maps_id():
+            self.compute_global(**self._global_kwargs, overwrite=True)   # loaded, not changed by hand
+        finished = {}
+        if save:
+            checks = self._check_segments(kwargs)
+            listed = getattr(self, '_info_outputs', {})
+            if not overwrite:
+                ProductStore.refuse([checks[i] for i in segs])
+                finished = {i: checks[i] for i in segs if checks[i].status == 'done' or
+                            (checks[i].status == 'unrecorded' and i in listed)}
+            for i, c in checks.items():
+                # segments of earlier runs (same settings) stay part of the exposure
+                if i not in self.outputs and (i not in segs or i in finished) and (
+                        c.status == 'done' or (c.status == 'unrecorded' and i in listed
+                                               and not overwrite)):
+                    self.outputs[i] = c.path
+            for i in [i for i, c in checks.items() if i in self.outputs and i not in segs
+                      and c.status in ('different', 'missing', 'incomplete')]:
+                del self.outputs[i]                       # cleaned with other settings
+            left = [i for i in listed if i not in self.outputs and i not in segs]
+            if left and self.verbose:
+                print(f'  segment(s) {[i + 1 for i in left]} of an earlier run (other settings) are no '
+                      f'longer listed in the info file')
+        if remove_inputs and getattr(self, '_int_times_cache', None) is None:
             self._int_times_cache = self._read_int_times()
+        cleaned = [i for i in segs if i not in finished]
         for i in segs:
-            self.clean_segment(i, **kwargs)
-            if remove_inputs:
-                self.save_info()
-                if i > 0:
-                    self._remove_input(i - 1)
+            if i in finished:
+                if self.verbose:
+                    print(f'  segment {i + 1}/{len(self.files)}: {loaded_message(finished[i])}')
+            else:
+                self.clean_segment(i, **kwargs)
+                if save:
+                    self.save_info(verbose=False)
+            if remove_inputs and i > 0:
+                self._remove_input(i - 1, finished)
         if remove_inputs and segs:
-            self.save_info()
-            self._remove_input(segs[-1])
+            self._remove_input(segs[-1], finished)
+        if not cleaned and not self._info_outdated():
+            self.info_file = self.info_path()
+            return self.info_file
         return self.save_info()
 
-    def _remove_input(self, i):
+    def _info_outdated(self):
+        """Whether the info file on disk lacks something of this object."""
+        if not os.path.isfile(self.info_path()):
+            return True
+        same_wl = (self.wavelength is None or
+                   getattr(self, '_info_wavelength', None) is not None)
+        return not same_wl or set(getattr(self, '_info_outputs', {})) != set(self.outputs)
+
+    def _remove_input(self, i, finished=None):
         fn = self.files[i]
+        if not os.path.isfile(fn):
+            return
+        if finished and i in finished and finished[i].status != 'done':
+            print(f'  kept input {os.path.basename(fn)}: the settings of its cleaned file are not recorded')
+            return
         for f in (fn, os.path.join(os.path.dirname(fn), '._' + os.path.basename(fn))):
             if os.path.isfile(f):
                 os.remove(f)
@@ -1106,10 +1286,11 @@ class ExposureCleaner:
         return cols
 
     # ------------------------------------------------------------------
-    def save_info(self, fname=None, overwrite=True):
+    def save_info(self, fname=None, overwrite=True, verbose=None):
         """Write the exposure-level file: masks, median, wavelength, times, segment list."""
+        verbose = self.verbose if verbose is None else verbose
         if fname is None:
-            fname = os.path.join(self.outdir, f'{self.exposure}_cleaninfo.fits')
+            fname = self.info_path()
         hdr = fits.Header()
         for k, v in self.header.items():
             try:
@@ -1136,7 +1317,9 @@ class ExposureCleaner:
             hs.header['COMMENT'] = 'first saturated group per pixel (Stage 1 saturation map)'
             hdus.append(hs)
         # all integration times (read from the input files, or cached before they were removed)
-        cols = getattr(self, '_int_times_cache', None) or self._read_int_times()
+        cols = getattr(self, '_int_times_cache', None)
+        if cols is None:
+            cols = self._read_int_times()
         if cols:
             hdus.append(fits.BinTableHDU.from_columns(
                 [fits.Column(name=n, array=np.concatenate(v),
@@ -1155,9 +1338,22 @@ class ExposureCleaner:
         hdus.append(fits.BinTableHDU.from_columns(
             [fits.Column(name='history', format=f'{max(1, len(hist))}A', array=np.array([hist]))],
             name='HISTORY'))
-        fits.HDUList(hdus).writeto(fname, overwrite=overwrite)
+        store = ProductStore(os.path.dirname(os.path.abspath(fname)), self.exposure)
+        if os.path.isfile(fname) and not overwrite:
+            raise OSError(f'{fname} already exists (overwrite=False).')
+        # written to a temporary file first: with remove_inputs=True it cannot be made again
+        tmp = fname + '.tmp'
+        fits.HDUList(hdus).writeto(tmp, overwrite=True)
+        os.replace(tmp, fname)
+        if getattr(self, '_global_settings', None) is not None:
+            store.done(fname, {'global': self._global_settings},
+                       ProductStore.ids(self.files, self.exposure),
+                       uid=self._maps_id(), maps=getattr(self, '_maps0', None))
+        else:                             # masks set by hand, or made before records existed
+            store.forget(fname)
         self.info_file = fname
-        if self.verbose:
+        self._info_outputs, self._info_wavelength = dict(self.outputs), self.wavelength
+        if verbose:
             print(f'Saved exposure info to {fname}')
         return fname
 
@@ -1178,7 +1374,7 @@ class ExposureCleaner:
             obj.dispersion_axis = None if disp == -1 else disp
             obj.header = {k: hdr[k] for k in _HEADER_KEYS + ('EXPOSURE', 'NSEGMENT') if k in hdr}
             obj.exposure = hdr.get('EXPOSURE', '')
-            obj.files = inputs
+            obj.files = [os.path.join(d, f) for f in inputs]
             obj.outdir = d
             obj.seg_nint = [int(n) for n in seg['nint']]
             obj.seg_start = np.asarray(seg['start'], int)
@@ -1203,6 +1399,10 @@ class ExposureCleaner:
                 obj.history = []
         obj.dq_flags, obj.persistent_frac = BAD_DQ_FLAGS, 0.5
         obj.verbose, obj.diagnostics, obj.info_file = verbose, {}, info_file
+        obj.store = ProductStore(d, obj.exposure)
+        rec = obj.store.get(info_file) or {}
+        obj._global_settings = rec.get('settings', {}).get('global')
+        obj._maps0 = rec.get('state', {}).get('maps')
         return obj
 
     def load_segment(self, i):

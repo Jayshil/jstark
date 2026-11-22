@@ -9,6 +9,8 @@ from astropy.io import fits
 
 from .instruments import StepSpec, identify_mode, get_mode_config
 from .io import find_exposures, select_exposure, output_filename, StepLog
+from .products import (ProductStore, Check, cleaned_exposures, content_id, differences,
+                       loaded_message, plain)
 from .masks import (quick_signal_image, build_trace_mask, ensure_min_background)
 from .onef import group_background, amp_bounds_from_model
 from .jump import temporal_jump
@@ -27,6 +29,23 @@ def set_jwst_log_level(level=logging.WARNING):
     """Set the verbosity of the jwst / stpipe / stcal / CRDS loggers."""
     for name in ('stpipe', 'jwst', 'stcal', 'CRDS', 'crds'):
         logging.getLogger(name).setLevel(level)
+
+
+class _LazyDiagnostics(dict):
+    """``{segment: diagnostics}``; segments loaded from disk are read on first access."""
+
+    def __init__(self):
+        super().__init__()
+        self.files = {}
+
+    def __missing__(self, seg):
+        from .diagnostics import load_stage1_diagnostics
+        if seg not in self.files:
+            raise KeyError(seg)
+        d = load_stage1_diagnostics(self.files[seg])
+        self[seg] = {step: {k: (v.item() if v.ndim == 0 else v) for k, v in info.items()}
+                     for step, info in d.items() if isinstance(info, dict)}
+        return self[seg]
 
 
 class Stage1:
@@ -49,6 +68,11 @@ class Stage1:
         ...inspect model.data...
         s1.run(segments=[0], start='group_bkg', model=model)   # resume
         s1.run()                                   # everything, all segments
+
+    Segments whose ``rateints`` file already exists (made with the same
+    settings) are not processed again: :meth:`run` returns the existing file.
+    ``run(overwrite=True)`` processes them again. See
+    :mod:`jstark.reduction.products` for how this is decided.
 
     Parameters
     ----------
@@ -112,6 +136,7 @@ class Stage1:
         os.makedirs(outdir, exist_ok=True)
         self.verbose = verbose
         self.log = StepLog(os.path.join(outdir, f'{self.exposure}_stage1_log.json'))
+        self.store = ProductStore(outdir, self.exposure)
         self.trace_mask = None
         self.bkg_mask = None
         self.wing_threshold = None    # group_bkg wing_frac threshold (DN/group), set once
@@ -119,7 +144,12 @@ class Stage1:
         self.saturation_map = None
         self.auto_firstgroup = None
         self._user_mask = False
-        self.diagnostics = {}
+        # exposure-wide quantities found automatically (or restored), see _derived_settings
+        self._auto_mask = self._auto_wing = self._auto_satmap = None
+        self._satmap_info = None
+        self._overwrite = False
+        self._restored = []
+        self.diagnostics = _LazyDiagnostics()
         self.model = None
         self.outputs = {}
         set_jwst_log_level(jwst_log_level)
@@ -240,8 +270,8 @@ class Stage1:
         return datamodels.RampModel(self.files[segment])
 
     def run(self, segments=None, start=None, stop=None, model=None, save_after=None,
-            overwrite=True, save_variances=True):
-        """Run the recipe on one or more segments.
+            overwrite=False, save_variances=True):
+        """Run the recipe on one or more segments (finished segments are loaded).
 
         Parameters
         ----------
@@ -259,7 +289,15 @@ class Stage1:
             (``<root>_<step>.fits``). The ``rateints`` product is always saved
             after ``ramp_fit`` / ``gain_scale``.
         overwrite : bool
-            Overwrite existing products.
+            ``False`` (default): segments whose ``rateints`` file exists and
+            was made with the current settings are not processed again; an
+            existing file made with other settings raises an error. The
+            exposure-wide quantities measured on the first segment (masks,
+            wing threshold, group range) are restored, so a run that was
+            interrupted continues as if it had not been. ``True``: process
+            everything again. Runs with ``model=``, or that stop before
+            ``ramp_fit``, are always executed (``save_after`` files are
+            replaced).
         save_variances : bool
             Keep the ``VAR_POISSON`` and ``VAR_RNOISE`` arrays in the
             ``rateints`` files. jstark does not use them (``ERR`` is kept);
@@ -284,14 +322,36 @@ class Stage1:
             datamodels, _ = _jwst_imports()
             model = datamodels.RampModel(model)
         save_after = set(save_after or [])
+        self._overwrite = overwrite
+        if overwrite and len(set(segments)) == len(self.files):
+            self._drop_restored()
+        steps = self.recipe[i0:i1 + 1]
+        makes_rates = any(s.name == 'ramp_fit' and not s.skip for s in steps)
+        settings = self._settings(i0, i1, start, model)
+        finished = {}
+        if makes_rates and model is None and not overwrite:
+            finished = self._find_finished(segments, settings)
         outputs = []
         for seg in segments:
             t0 = time.time()
-            if self.verbose:
+            fn = output_filename(self.files[seg], self.outdir, 'rateints')
+            todo = steps
+            if seg in finished:
+                # only intermediate products that are still missing
+                last = [k for k, s in enumerate(steps) if s.name in save_after and not s.skip and not
+                        os.path.isfile(output_filename(self.files[seg], self.outdir, s.name))]
+                todo = steps[:last[-1] + 1] if last else []
+                outputs.append(fn)
+                self.outputs[seg] = fn
+                if self.verbose:
+                    print(f'Segment {seg + 1}/{len(self.files)}: {finished[seg]}')
+                if not todo:
+                    continue
+            elif self.verbose:
                 print(f'Segment {seg + 1}/{len(self.files)}: {os.path.basename(self.files[seg])}')
             m = model if model is not None else self.load(seg)
             ramp_done = False
-            for spec in self.recipe[i0:i1 + 1]:
+            for spec in todo:
                 if spec.skip:
                     continue
                 ts = time.time()
@@ -301,22 +361,156 @@ class Stage1:
                 if self.verbose:
                     print(f'    {spec.name:20s} done in {time.time() - ts:6.1f} s')
                 if spec.name in save_after:
-                    fn = output_filename(self.files[seg], self.outdir, spec.name)
-                    m.save(fn, overwrite=overwrite)
-            if ramp_done:
-                fn = output_filename(self.files[seg], self.outdir, 'rateints')
+                    m.save(output_filename(self.files[seg], self.outdir, spec.name), overwrite=True)
+            if ramp_done and seg not in finished:
                 if not save_variances:
                     for attr in ('var_poisson', 'var_rnoise', 'var_flat'):
                         if m.hasattr(attr):
                             delattr(m, attr)
-                m.save(fn, overwrite=overwrite)
+                self.store.begin(fn)
+                m.save(fn, overwrite=True)
                 outputs.append(fn)
                 self.outputs[seg] = fn
                 self._save_diagnostics(seg)
+                self.store.done(fn, dict(settings, **self._derived_settings()), self._inputs(seg),
+                                uid=content_id(m.data, m.err, m.dq), derived=self._derived_state())
                 if self.verbose:
                     print(f'  -> {fn}  ({time.time() - t0:.1f} s)')
             self.model = m
         return outputs if outputs else self.model
+
+    # ------------------------------------------------------------------
+    # Products of earlier runs
+    # ------------------------------------------------------------------
+    def _settings(self, i0, i1, start=None, model=None):
+        """Settings of a run (recipe steps and mode configuration), for the product records."""
+        out = dict(mode=self.mode,
+                   steps={s.name: dict(s.kwargs) for s in self.recipe[i0:i1 + 1] if not s.skip},
+                   order=[s.name for s in self.recipe[i0:i1 + 1] if not s.skip],
+                   trace_mask=dict(self.config.trace_mask), onef_axis=self.config.onef_axis,
+                   per_amplifier=self.config.per_amplifier)
+        if model is not None or i0 > 0:
+            out['resumed_from'] = start or 'a model in memory'
+        return plain(out)
+
+    def _inputs(self, seg):
+        fn = self.files[seg]
+        out = {os.path.basename(fn): f'{os.path.getsize(fn)} bytes'}
+        info = self._satmap_expected()
+        if info is not None:
+            out[os.path.basename(self._satmap_file())] = info[1]
+        return out
+
+    def _derived_settings(self):
+        """Exposure-wide quantities: ``'auto'`` (found by the pipeline) or set by the user."""
+        mask = 'auto'
+        if self.trace_mask is not None:
+            h = content_id(self.trace_mask, self.bkg_mask)
+            mask = 'auto' if h == self._auto_mask else f'user {h}'
+        wing = 'auto'
+        if self.wing_threshold is not None and self.wing_threshold != self._auto_wing:
+            wing = float(self.wing_threshold)
+        info = self._satmap_expected()
+        return dict(masks=mask, wing_threshold=wing,
+                    saturation_map=None if info is None else info[0])
+
+    def _derived_state(self):
+        """What the other segments of the exposure need from the first one (saved in the record)."""
+        return dict(masks=None if self.trace_mask is None else content_id(self.trace_mask, self.bkg_mask),
+                    auto_mask=self._auto_mask, wing_threshold=self.wing_threshold,
+                    auto_wing=self._auto_wing, group_range=self.auto_firstgroup)
+
+    def _find_finished(self, segments, settings):
+        """Segments of ``segments`` already done: ``{segment: message}``; restores the exposure state.
+
+        Raises :class:`~jstark.reduction.products.ProductMismatchError` if a
+        product was made with other settings.
+        """
+        full = dict(settings, **self._derived_settings())
+        cleaned = cleaned_exposures([self.outdir]).get(self.exposure)
+        checks = {}
+        for seg in range(len(self.files)):
+            fn = output_filename(self.files[seg], self.outdir, 'rateints')
+            removed = not os.path.isfile(fn) and self._was_cleaned(fn, cleaned)
+            c = self.store.check(fn, full, self._inputs(seg), need=('SCI', 'ERR', 'DQ'),
+                                 input_files=[self.files[seg]], missing_ok=removed)
+            checks[seg] = (c, removed)
+        ProductStore.refuse([checks[s][0] for s in segments])
+        ok = [s for s in checks if checks[s][0].status in ('done', 'unrecorded')]
+        self._restore([(s, checks[s][0]) for s in ok])
+        out = {}
+        for s in segments:
+            if s not in ok:
+                continue
+            c, removed = checks[s]
+            out[s] = loaded_message(c)
+            if removed:
+                out[s] = (f'{os.path.basename(c.path)} was removed after cleaning; the cleaned segment '
+                          f'exists (overwrite=True to process it again)')
+            diag = c.path.replace('_rateints.fits', '_stage1diag.npz')
+            if os.path.isfile(diag):
+                self.diagnostics.files[s] = diag
+        return out
+
+    @staticmethod
+    def _was_cleaned(fn, cleaned):
+        if cleaned is None:
+            return False
+        name = os.path.basename(fn)
+        return any(f == name and c for f, c in zip(cleaned['files'], cleaned['cleaned']))
+
+    def _restore(self, checks):
+        """Restore masks, wing threshold and group range from finished segments."""
+        states = []
+        for seg, c in checks:
+            diag = c.path.replace('_rateints.fits', '_stage1diag.npz')
+            st = dict((c.record or {}).get('state', {}).get('derived') or {})
+            if c.record is None and os.path.isfile(diag):           # made before records existed
+                with np.load(diag) as z:
+                    if 'trace_mask' in z.files:
+                        st['masks'] = st['auto_mask'] = content_id(z['trace_mask'], z['bkg_mask'])
+                    if 'group_bkg__wing_threshold' in z.files:
+                        st['wing_threshold'] = st['auto_wing'] = float(z['group_bkg__wing_threshold'])
+                for e in self.log.entries:
+                    if e['step'] == 'find_linear_group_range':
+                        st['group_range'] = [e['firstgroup'], e['lastgroup']]
+            if st:
+                states.append((seg, st, diag))
+        if not states:
+            return
+        seg, st, diag = states[0]
+        other = [s for s, t, _ in states[1:] if differences(
+            {k: st.get(k) for k in ('masks', 'wing_threshold', 'group_range')},
+            {k: t.get(k) for k in ('masks', 'wing_threshold', 'group_range')})]
+        if other:
+            warnings.warn(f'Segments {[s + 1 for s in other]} were processed with other masks, wing '
+                          f'threshold or group range than segment {seg + 1} (processed separately?). '
+                          f'Process all segments with overwrite=True to make them consistent.')
+        if self.trace_mask is None and st.get('masks') and os.path.isfile(diag):
+            with np.load(diag) as z:
+                if 'trace_mask' in z.files:
+                    self.trace_mask, self.bkg_mask = z['trace_mask'], z['bkg_mask']
+                    self._auto_mask = st.get('auto_mask')
+                    self._restored.append('mask')
+                    if 'signal_image' in z.files:
+                        self.signal_image = z['signal_image']
+        if self.wing_threshold is None and st.get('wing_threshold') is not None:
+            self.wing_threshold, self._auto_wing = st['wing_threshold'], st.get('auto_wing')
+            self._restored.append('wing')
+        if self.auto_firstgroup is None and st.get('group_range') is not None:
+            self.auto_firstgroup = tuple(st['group_range'])
+            self._restored.append('groups')
+
+    def _drop_restored(self):
+        """Forget quantities restored from disk (not set by the user): everything is made again."""
+        if 'mask' in self._restored and self.trace_mask is not None and \
+                content_id(self.trace_mask, self.bkg_mask) == self._auto_mask:
+            self.trace_mask = self.bkg_mask = self.signal_image = self._auto_mask = None
+        if 'wing' in self._restored and self.wing_threshold == self._auto_wing:
+            self.wing_threshold = self._auto_wing = None
+        if 'groups' in self._restored:
+            self.auto_firstgroup = None
+        self._restored = []
 
     def run_step(self, name, model, segment=None, **kwargs):
         """Run a single step (jwst or jstark) on ``model`` and return the result."""
@@ -396,8 +590,7 @@ class Stage1:
             return self.auto_firstgroup
         if model is None:
             raise ValueError('A ramp model is needed to determine the linear group range.')
-        if self.trace_mask is None:
-            self.build_trace_mask(model)
+        self._ensure_masks(model)
         nint, ng = model.data.shape[:2]
         sel = slice(1, min(nint, 201)) if nint > 2 else slice(None)
         d = np.array(model.data[sel], dtype=np.float32)
@@ -459,6 +652,7 @@ class Stage1:
     def _ensure_masks(self, model):
         if self.trace_mask is None or self.bkg_mask is None:
             self.build_trace_mask(model)
+            self._auto_mask = content_id(self.trace_mask, self.bkg_mask)
 
     def _crds_superbias(self, model):
         from jwst.superbias import SuperBiasStep
@@ -487,7 +681,77 @@ class Stage1:
         first = np.where(hit.any(axis=0), np.argmax(hit, axis=0), ngroup)
         return first.astype(np.int16)
 
-    def compute_saturation_map(self, segments=None, min_frac=0.01, save=True):
+    def _satmap_file(self):
+        return os.path.join(self.outdir, f'{self.exposure}_saturation_map.fits')
+
+    def _satmap_settings(self, segments, min_frac):
+        """Settings that define a saturation map."""
+        stop = self.step_names.index('saturation')
+        segs = 'all' if sorted(segments) == list(range(len(self.files))) else sorted(segments)
+        return plain(dict(segments=segs, min_frac=min_frac,
+                          steps={s.name: dict(s.kwargs) for s in self.recipe[:stop + 1]
+                                 if not s.skip and not s.is_custom}))
+
+    def _nint_total(self):
+        n = 0
+        for f in self.files:
+            h = fits.getheader(f, 0)
+            n += int(h['INTEND']) - int(h['INTSTART']) + 1 if 'INTEND' in h else int(h.get('NINTS', 0))
+        return n
+
+    def _load_saturation_map(self, segments, min_frac):
+        """Load the map on disk if it covers ``segments`` (or the whole exposure). Returns success."""
+        fn = self._satmap_file()
+        need = ('SATCOUNT', 'STATIC')
+        c = None
+        for segs in (list(segments), list(range(len(self.files)))):
+            want = self._satmap_settings(segs, min_frac)
+            c = self.store.check(fn, want, need=need)
+            if c.status in ('done', 'missing', 'incomplete'):
+                break
+            if c.status == 'unrecorded':
+                with fits.open(fn) as h:
+                    ok = (h[0].header.get('MINFRAC') == min_frac
+                          and h[0].header.get('NINT') == self._nint_total())
+                want = self._satmap_settings(range(len(self.files)), min_frac)
+                if not ok:              # cannot tell which segments it was made from
+                    c = Check('incomplete', fn, [], None)
+                break
+        if c.status in ('missing', 'incomplete'):
+            return False
+        if c.status == 'different':
+            # a map of other segments (a test) is replaced; other settings are not
+            if all(d.startswith('segments') for d in c.diffs):
+                return False
+            ProductStore.refuse(c)
+        with fits.open(fn) as h:
+            self.saturation_map = np.asarray(h[0].data, np.int16)
+            self._saturation_counts = (np.asarray(h['SATCOUNT'].data, np.int32), int(h[0].header['NINT']))
+            self._saturation_static = np.asarray(h['STATIC'].data, np.int16)
+        self._satmap_info = (want, self.store.uid(fn))
+        self._auto_satmap = content_id(self.saturation_map)
+        if self.verbose:
+            n = int((self.saturation_map < self._saturation_counts[0].shape[0]).sum())
+            print(f'  {loaded_message(c)}: {n} pixels saturate')
+        return True
+
+    def _satmap_expected(self):
+        """``(description, identifier)`` of the exposure-wide saturation map a run uses, or None."""
+        spec = next((s for s in self.recipe if s.name == 'consistent_saturation'), None)
+        if (spec is None or spec.skip or spec.kwargs.get('saturation_map') is not None
+                or spec.kwargs.get('scope', 'exposure') != 'exposure'):
+            return None
+        if self.saturation_map is not None:
+            h = content_id(np.asarray(self.saturation_map, np.int16))
+            if h != self._auto_satmap:
+                return f'user {h}', None
+            return {k: self._satmap_info[0][k] for k in ('segments', 'min_frac')}, self._satmap_info[1]
+        want = self._satmap_settings(range(len(self.files)), spec.kwargs.get('min_frac', 0.01))
+        fn = self._satmap_file()
+        uid = self.store.uid(fn) if self.store.check(fn, want).status == 'done' else None
+        return {k: want[k] for k in ('segments', 'min_frac')}, uid
+
+    def compute_saturation_map(self, segments=None, min_frac=0.01, save=True, overwrite=False):
         """Pre-pass: first consistently saturated group of every pixel over the exposure.
 
         Runs only the recipe steps up to and including ``saturation`` (with
@@ -507,6 +771,10 @@ class Stage1:
         extraction (``min_groups`` would otherwise blank whole columns);
         they are saved in the ``STATIC`` extension.
 
+        With ``overwrite=False`` a saved map made with the same settings is
+        loaded instead, if it was made from ``segments`` or from the whole
+        exposure (a map made from other segments only is replaced).
+
         Returns
         -------
         ndarray
@@ -514,6 +782,8 @@ class Stage1:
             (``ngroup`` = never).
         """
         segments = list(range(len(self.files))) if segments is None else list(segments)
+        if not overwrite and self._load_saturation_map(segments, min_frac):
+            return self.saturation_map
         names = self.step_names
         stop = names.index('saturation')
         counts, nint, static_dq = None, 0, None
@@ -539,6 +809,9 @@ class Stage1:
         self.saturation_map = np.where(static < ngroup, ngroup, full).astype(np.int16)
         self._saturation_static = static
         self._saturation_counts = (counts, nint)
+        self._auto_satmap = content_id(self.saturation_map)
+        uid = content_id(self.saturation_map, static)
+        self._satmap_info = (self._satmap_settings(segments, min_frac), uid)
         n = int((self.saturation_map < ngroup).sum())
         ns = int((static < ngroup).sum())
         if self.verbose:
@@ -548,7 +821,8 @@ class Stage1:
                 print(f'  saturation map: {ns} more pixels are static bad pixels (DO_NOT_USE) or '
                       f'flagged only by growth around them; left out (STATIC extension)')
         if save:
-            fn = os.path.join(self.outdir, f'{self.exposure}_saturation_map.fits')
+            fn = self._satmap_file()
+            self.store.begin(fn)
             hdr = fits.Header()
             hdr['MINFRAC'] = (min_frac, 'min fraction of integrations saturated')
             hdr['NINT'] = nint
@@ -557,6 +831,7 @@ class Stage1:
             fits.HDUList([fits.PrimaryHDU(self.saturation_map, header=hdr),
                           fits.ImageHDU(counts, name='SATCOUNT'),
                           fits.ImageHDU(static, name='STATIC')]).writeto(fn, overwrite=True)
+            self.store.done(fn, self._satmap_info[0], uid=uid)
         self.log.add('compute_saturation_map', segment=None, min_frac=min_frac, n_pixels=n,
                      n_static=ns)
         return self.saturation_map
@@ -617,7 +892,7 @@ class Stage1:
             if self.saturation_map is None:
                 if self.verbose:
                     print('  consistent_saturation: building the exposure-wide saturation map')
-                self.compute_saturation_map(min_frac=min_frac)
+                self.compute_saturation_map(min_frac=min_frac, overwrite=self._overwrite)
             smap = self.saturation_map
             static = getattr(self, '_saturation_static', None)
             if static is not None:                   # static bad pixels stay consistent too
@@ -753,7 +1028,7 @@ class Stage1:
                                    wing_max=wing_max, wing_frac=wing_frac,
                                    wing_min_pixels=wing_min_pixels)
         if wing_frac is not None and self.wing_threshold is None:
-            self.wing_threshold = info['wing_threshold']
+            self.wing_threshold = self._auto_wing = info['wing_threshold']
             if self.verbose:
                 print(f'  group_bkg: wing threshold {self.wing_threshold:.0f} DN/group '
                       f'({wing_frac:g} x peak {info["wing_peak"]:.0f} DN/group)')

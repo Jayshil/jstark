@@ -135,6 +135,9 @@ mask.
 - **Mode detection and recipe:** the mode is read from the header. Each mode
   has an ordered recipe of `StepSpec`s: jwst steps wrapped one by one and run
   via `Step.call(..., configure_log=False)`, plus four jstark steps.
+- **`overwrite=False` (default since 2026-11-22, all stages):** finished
+  products made with the same settings and inputs are loaded; others raise
+  `ProductMismatchError`. See extraction_notes.md §5.18.
 - **Recipe controls:** `s1.show()`, `s1.set(step, skip=..., **kwargs)`,
   `s1.add_step(...)`. Enabling `custom_bias` automatically skips `superbias`.
 - **Running:** `s1.run(segments=None, start=None, stop=None, model=None,

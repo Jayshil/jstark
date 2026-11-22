@@ -30,6 +30,7 @@ Two classes:
 import json
 import os
 import time
+import uuid
 import warnings
 
 import numpy as np
@@ -40,6 +41,9 @@ from scipy.interpolate import RectBivariateSpline
 from tqdm import tqdm
 
 from ..reduction.io import StepLog, output_filename
+from ..reduction.products import (Check, ProductStore, content_id, differences, fits_complete,
+                                  input_differences, load_result, loaded_message, plain,
+                                  save_result)
 from ..reduction.robust import MAD_TO_SIGMA
 from .metrics import p2p_sigma, p2p_noise
 from .source import ExposureSource
@@ -148,6 +152,10 @@ class Photometry:
         os.makedirs(self.outdir, exist_ok=True)
         self.verbose = verbose
         self.log = StepLog(os.path.join(self.outdir, f'{self.src.exposure}_photometry_log.json'))
+        self.store = ProductStore(self.outdir, self.src.exposure)
+        self._psf_record = None      # identifier and settings of the PSF in memory
+        self._psf_silent = False     # PSF loaded by run(), not by the user
+        self._maps = None
         self.center = None
         self.psf_image = None
         self.var_mean = None
@@ -245,13 +253,21 @@ class Photometry:
         return dict(bkg=bmean, var_bkg=vb, yc=yc, xc=xc)
 
     # ------------------------------------------------------------------
-    def fit_psf(self):
+    def fit_psf(self, overwrite=False):
         """Empirical PSF: mean of the sky-subtracted, flux-normalised images (all integrations).
 
         Also accumulates the time-averaged variance of every pixel.
+        ``overwrite=False`` (default) loads a PSF made earlier with the same
+        settings from the same integrations (``<exposure>_phot_model.fits``).
+        With other settings it is made again, and saved unless existing
+        photometry was made from the saved one.
         """
         if self.center is None:
             self.find_center()
+        self._psf_silent = False
+        settings, inputs = self._psf_settings(), self._inputs()
+        if not overwrite and self._restore_psf(settings, inputs):
+            return self.psf_image
         t0 = time.time()
         src = self.src
         h = self.params['psf']['halfwidth']
@@ -291,7 +307,154 @@ class Photometry:
         self.log.add('fit_psf', nint=nint, halfwidth=h, psf_radius=R)
         if self.verbose:
             print(f'  empirical PSF from {nint} integrations ({time.time() - t0:.0f} s)')
+        self._psf_record = dict(id=uuid.uuid4().hex[:12], settings=settings, inputs=inputs,
+                                time=time.strftime('%Y-%m-%dT%H:%M:%S'))
+        if overwrite or not self._model_protected():
+            self.save_model()
+        elif self.verbose:
+            print(f'  PSF not saved: {os.path.basename(self.photometry_file())} was made from the '
+                  f'saved one (overwrite=True to replace them)')
         return self.psf_image
+
+    # ------------------------------------------------------------------
+    # Products of earlier runs (see jstark.reduction.products)
+    # ------------------------------------------------------------------
+    def photometry_file(self):
+        return os.path.join(self.outdir, f'{self.src.exposure}_photometry.fits')
+
+    def model_file(self):
+        return os.path.join(self.outdir, f'{self.src.exposure}_phot_model.fits')
+
+    def _phot_file(self, k):
+        return output_filename(self.src.files[k], self.outdir, 'phot')
+
+    def _inputs(self):
+        return ProductStore.ids(self.src.files, self.src.exposure)
+
+    def _maps_id(self):
+        if self._maps is None:
+            self._maps = content_id(self.src.median, self.src.badpix)
+        return self._maps
+
+    def _psf_settings(self):
+        p = self.params
+        return plain(dict(mode=self.src.mode, centroid=p['centroid'], background=p['background'],
+                          psf=p['psf'], psf_radius=p['extract']['psf_radius'], maps=self._maps_id(),
+                          center=None if self.center is None else [round(float(c), 6) for c in self.center]))
+
+    def _run_settings(self):
+        rec = self._psf_record if self.psf_image is not None else None
+        return plain(dict(mode=self.src.mode, params=self.params, maps=self._maps_id(),
+                          center=None if self.center is None else [round(float(c), 6) for c in self.center],
+                          psf=rec['settings'] if rec else self._psf_settings()))
+
+    def _run_inputs(self):
+        rec = self._psf_record if self.psf_image is not None else None
+        return dict(self._inputs(), psf=rec['id'] if rec else None)
+
+    def save_model(self, fname=None):
+        """Save the empirical PSF, the mean-variance map and the star position."""
+        fname = fname or self.model_file()
+        sy, sx = self.psf_box
+        par = json.dumps(dict(psf_record=self._psf_record, center=[float(c) for c in self.psf_center],
+                              box=[sy.start, sy.stop, sx.start, sx.stop], params=self.params))
+        store = ProductStore(os.path.dirname(os.path.abspath(fname)), self.src.exposure)
+        store.begin(fname)
+        fits.HDUList([fits.PrimaryHDU(), fits.ImageHDU(np.asarray(self.psf_image, float), name='PSF'),
+                      fits.ImageHDU(np.where(np.isfinite(self.var_mean), self.var_mean, 0.), name='VARMEAN'),
+                      fits.BinTableHDU.from_columns(
+                          [fits.Column(name='params', format=f'{len(par)}A', array=np.array([par]))],
+                          name='PARAMS')]).writeto(fname, overwrite=True)
+        store.done(fname, uid=(self._psf_record or {}).get('id'))
+        return fname
+
+    def _restore_psf(self, settings, inputs, verbose=None):
+        """Load the saved PSF if it was made with ``settings`` from ``inputs``. Returns success."""
+        fn = self.model_file()
+        rec = self.store.get(fn)
+        if not os.path.isfile(fn) or (rec is not None and rec['status'] != 'done') \
+                or not fits_complete(fn, ('PSF', 'VARMEAN', 'PARAMS')):
+            return False
+        with fits.open(fn) as h:
+            par = json.loads(h['PARAMS'].data['params'][0])
+            r = par.get('psf_record')
+            if r is None or differences(r['settings'], settings) or \
+                    input_differences(r['inputs'], inputs):
+                return False
+            self.psf_image = np.asarray(h['PSF'].data, float)
+            v = np.asarray(h['VARMEAN'].data, float)
+        self.var_mean = np.where(v > 0, v, np.inf)
+        y0, y1, x0, x1 = par['box']
+        self.psf_box = (slice(y0, y1), slice(x0, x1))
+        self.psf_center = tuple(par['center'])
+        self._psf_spline = RectBivariateSpline(np.arange(y0, y1, dtype=float),
+                                               np.arange(x0, x1, dtype=float), self.psf_image, kx=3, ky=3)
+        self._psf_record = r
+        if self.verbose if verbose is None else verbose:
+            print(f'  {loaded_message(Check("done", fn, [], r))}: PSF')
+        return True
+
+    def _model_protected(self):
+        """Whether existing photometry was made from the saved PSF (and not from the current one)."""
+        fn, ph = self.model_file(), self.photometry_file()
+        rec = self.store.get(ph)
+        if not (os.path.isfile(fn) and os.path.isfile(ph)) or rec is None or rec['status'] != 'done':
+            return False
+        psf = (rec.get('inputs') or {}).get('psf')
+        return psf != (self._psf_record or {}).get('id') and psf == self.store.uid(fn)
+
+    def _covers(self, gidx, segs):
+        have = np.isin(np.arange(self.src.nint), gidx)
+        return all(have[self.src.seg_start[k]:self.src.seg_start[k] + self.src.seg_nint[k]].all()
+                   for k in segs)
+
+    def _load_finished(self, segs):
+        """``(check, PhotometryResult)`` of the combined file; the result is None if it must be made."""
+        fn = self.photometry_file()
+        c = self.store.check(fn, self._run_settings(), self._run_inputs(), need=('PHOT', 'PARAMS'),
+                             input_files=self.src.files)
+        if c.status == 'unrecorded':             # compare the parameters stored in the file
+            with fits.open(fn) as h:
+                old = json.loads(h['PARAMS'].data['params'][0])['params']
+            old = {s: dict(v, **old.get(s, {})) for s, v in self.DEFAULTS.items()}
+            diffs = differences(old, self.params)
+            c = c._replace(status='different' if diffs else 'unrecorded', diffs=diffs)
+        ProductStore.refuse(c)
+        if c.status not in ('done', 'unrecorded'):
+            return c, None
+        res = PhotometryResult(fn)
+        if not self._covers(res.table['gidx'], segs):
+            return c, None
+        for k in range(self.src.nseg):
+            f = self._phot_file(k)
+            if k not in self.outputs and os.path.isfile(f) and self._covers(res.table['gidx'], [k]):
+                self.outputs[k] = f
+        if self.verbose:
+            print(loaded_message(c, compared=True))
+        return c, res
+
+    def _find_finished(self, segs, combined, overwrite):
+        """Segments of ``segs`` whose photometry exists (``{segment: check}``); updates ``outputs``."""
+        settings, inputs = self._run_settings(), self._run_inputs()
+        checks = {k: self.store.check(self._phot_file(k), settings, inputs, need=('PHOT', 'PIXINDEX'),
+                                      input_files=self.src.files) for k in range(self.src.nseg)}
+        gidx = []
+        if combined is not None and combined.status == 'unrecorded':
+            gidx = PhotometryResult(combined.path).table['gidx']
+
+        def usable(k):
+            return checks[k].status == 'done' or (checks[k].status == 'unrecorded' and not overwrite
+                                                  and len(gidx) and self._covers(gidx, [k]))
+        finished = {}
+        if not overwrite:
+            ProductStore.refuse([checks[k] for k in segs])
+            finished = {k: checks[k] for k in segs if usable(k)}
+        for k in range(self.src.nseg):
+            if k in finished or (k not in segs and usable(k)):
+                self.outputs[k] = checks[k].path
+            elif k not in segs:
+                self.outputs.pop(k, None)          # made with other settings
+        return finished
 
     def _psf_at(self, yc, xc, deriv=False):
         """PSF image shifted to centroid ``(yc, xc)`` on the PSF box (and its derivatives)."""
@@ -396,7 +559,8 @@ class Photometry:
         out = {key: np.concatenate([p[key] for p in parts]) for key in parts[0] if key != 'pix_index'}
         out['pix_index'] = parts[0]['pix_index']
         if save:
-            fn = output_filename(self.src.files[k], self.outdir, 'phot')
+            fn = self._phot_file(k)
+            self.store.begin(fn)
             cols = [fits.Column(name='gidx', format='K', array=gidx)]
             if self.src.times is not None:
                 cols.append(fits.Column(name='int_mid_BJD_TDB', format='D', array=self.src.times[gidx]))
@@ -406,32 +570,59 @@ class Photometry:
                           fits.ImageHDU(out['pix'].astype(np.float32), name='PIXELS'),
                           fits.ImageHDU(out['pix_index'].astype(np.int32), name='PIXINDEX')]
                          ).writeto(fn, overwrite=True)
+            self.store.done(fn, self._run_settings(), self._run_inputs())
             self.outputs[k] = fn
         if self.verbose:
             print(f'  segment {k + 1}/{self.src.nseg}: {len(gidx)} integrations')
         return gidx, out
 
-    def run(self, segments=None, keep_segments=True):
+    def run(self, segments=None, keep_segments=True, overwrite=False):
         """Photometry of all (or the given) segments; returns the combined :class:`PhotometryResult`.
 
         ``keep_segments=False`` deletes the per-segment files (``*_phot.fits``)
         after combining (the combined file holds the same data).
+
+        ``overwrite=False`` (default): photometry made earlier with the same
+        settings, PSF and inputs is loaded, and only missing segments are
+        done; existing photometry made with other settings raises an error.
+        ``True``: do it again (with a new PSF, unless :meth:`fit_psf` was
+        called before).
         """
         t0 = time.time()
+        segs = list(range(self.src.nseg) if segments is None else segments)
+        if self.center is None:
+            self.find_center()
+        if overwrite and self._psf_silent:
+            self.psf_image = None
+        if self.psf_image is None and not overwrite and \
+                self._restore_psf(self._psf_settings(), self._inputs(), verbose=False):
+            self._psf_silent = True
+        combined = None
+        if not overwrite:
+            combined, res = self._load_finished(segs)
+            if res is not None:
+                return res
         if self.psf_image is None:
-            self.fit_psf()
-        segs = range(self.src.nseg) if segments is None else segments
+            self.fit_psf(overwrite=overwrite)
+        finished = self._find_finished(segs, combined, overwrite)
+        if any(k not in finished for k in segs) and (overwrite or not self._model_protected()):
+            self.save_model()
         for k in segs:
-            self.extract_segment(k)
-        self.log.add('run', segments=list(segs), params=self.params, seconds=time.time() - t0)
+            if k not in finished:
+                self.extract_segment(k)
+            elif self.verbose:
+                print(f'  segment {k + 1}/{self.src.nseg}: {loaded_message(finished[k])}')
+        self.log.add('run', segments=segs, loaded=sorted(finished), params=self.params,
+                     seconds=time.time() - t0)
         out = self.combine()
         if not keep_segments:
             from .extractor import remove_files
+            self.store.forget(*self.outputs.values())
             remove_files(self.outputs, self.verbose)
         return out
 
     def combine(self, fname=None):
-        fname = fname or os.path.join(self.outdir, f'{self.src.exposure}_photometry.fits')
+        fname = fname or self.photometry_file()
         tabs, pix = [], []
         for k in sorted(self.outputs):
             with fits.open(self.outputs[k]) as h:
@@ -446,6 +637,8 @@ class Photometry:
         hdr['EXPOSURE'] = self.src.exposure
         par = json.dumps({'params': self.params, 'center': list(self.center),
                           'optimisation': self.optimisation})
+        store = ProductStore(os.path.dirname(os.path.abspath(fname)), self.src.exposure)
+        store.begin(fname)
         fits.HDUList([fits.PrimaryHDU(header=hdr), fits.BinTableHDU.from_columns(cols, name='PHOT'),
                       fits.ImageHDU(np.concatenate(pix), name='PIXELS'),
                       fits.ImageHDU(pidx.astype(np.int32), name='PIXINDEX'),
@@ -453,17 +646,20 @@ class Photometry:
                       fits.BinTableHDU.from_columns(
                           [fits.Column(name='params', format=f'{len(par)}A', array=np.array([par]))],
                           name='PARAMS')]).writeto(fname, overwrite=True)
+        store.done(fname, self._run_settings(), self._run_inputs(), segments=sorted(self.outputs))
         if self.verbose:
             print(f'Saved photometry to {fname}')
         return PhotometryResult(fname)
 
     # ------------------------------------------------------------------
     def optimise(self, radii=None, psf_radii=None, nblocks=3, block_len=300, segments=None,
-                 apply=True):
+                 apply=True, overwrite=False):
         """Choose the aperture and PSF-weighting radii by robust point-to-point scatter.
 
         Uses blocks of consecutive integrations spread over the exposure
         (``segments='all'`` for everything), each normalised by its median.
+        ``overwrite=False`` (default) loads the result of the same test made
+        earlier (``<exposure>_phot_optimise.json``).
         """
         if self.psf_image is None:
             self.fit_psf()
@@ -481,6 +677,33 @@ class Photometry:
                 a = int(np.clip(c - src.seg_start[k] - block_len // 2, 0, max(0, n - block_len)))
                 if (k, slice(a, min(n, a + block_len))) not in blocks:
                     blocks.append((k, slice(a, min(n, a + block_len))))
+        key = plain(dict(self._run_settings(), inputs=self._run_inputs(), radii=radii,
+                         psf_radii=psf_radii, blocks=[(k, sl.start, sl.stop) for k, sl in blocks]))
+        fn = os.path.join(self.outdir, f'{self.src.exposure}_phot_optimise.json')
+        res = None if overwrite else load_result(fn, key)
+        if res is not None:
+            for name in ('aperture', 'psf'):
+                res[name] = [tuple(x) for x in res[name]]
+            if self.verbose:
+                print(f'  Loaded existing result from {os.path.basename(fn)}')
+        else:
+            res = self._optimise_test(radii, psf_radii, blocks)
+            save_result(fn, key, res)
+        self.optimisation = res
+        best_ap, best_ps = res['best']['radius'], res['best']['psf_radius']
+        if self.verbose:
+            print('  aperture radius : ' + ', '.join(f'{r}: {1e6 * s:.0f} ppm ({q:.2f})'
+                                                    for r, (s, q) in zip(radii, res['aperture'])))
+            print('  PSF radius      : ' + ', '.join(f'{r}: {1e6 * s:.0f} ppm ({q:.2f})'
+                                                    for r, (s, q) in zip(psf_radii, res['psf'])))
+        if apply:
+            self.params['aperture']['radius'] = best_ap
+            self.params['extract']['psf_radius'] = best_ps
+        self.log.add('optimise', **{k: v for k, v in res.items()})
+        return res
+
+    def _optimise_test(self, radii, psf_radii, blocks):
+        src = self.src
         ap = {r: ([], []) for r in radii}
         ps = {r: ([], []) for r in psf_radii}
         for k, sl in blocks:
@@ -499,16 +722,6 @@ class Photometry:
         best_ap = radii[int(np.argmin([x[0] for x in res['aperture']]))]
         best_ps = psf_radii[int(np.argmin([x[0] for x in res['psf']]))]
         res['best'] = {'radius': best_ap, 'psf_radius': best_ps}
-        self.optimisation = res
-        if self.verbose:
-            print('  aperture radius : ' + ', '.join(f'{r}: {1e6 * s:.0f} ppm ({q:.2f})'
-                                                    for r, (s, q) in zip(radii, res['aperture'])))
-            print('  PSF radius      : ' + ', '.join(f'{r}: {1e6 * s:.0f} ppm ({q:.2f})'
-                                                    for r, (s, q) in zip(psf_radii, res['psf'])))
-        if apply:
-            self.params['aperture']['radius'] = best_ap
-            self.params['extract']['psf_radius'] = best_ps
-        self.log.add('optimise', **{k: v for k, v in res.items()})
         return res
 
 

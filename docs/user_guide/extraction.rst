@@ -187,6 +187,11 @@ pixel-response map, contaminant mask, field-star model and parameters, so a
 run can be resumed with
 :meth:`~jstark.extraction.SpectralExtractor.load_model`.
 
+Run again (e.g. in a re-opened notebook), ``fit_psf``, ``optimise`` and ``run``
+load what was made with the same settings; an extraction from the reloaded PSF
+is identical. ``overwrite=True`` makes it again (see :ref:`overwrite`).
+``optimise`` results are kept in ``<exposure>_optimise.json``.
+
 For quick tests, ``ex.set('psf', ints=300)`` fits the PSF on 300 integrations
 spread over the exposure and ``ex.run(segments=[0])`` extracts one segment.
 

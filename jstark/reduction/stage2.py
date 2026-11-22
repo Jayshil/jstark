@@ -26,6 +26,7 @@ from astropy.io import fits
 
 from .instruments import identify_mode, get_mode_config
 from .io import find_exposures, select_exposure, output_filename, StepLog
+from .products import (ProductStore, content_id, input_exposures, loaded_message, plain)
 
 __all__ = ['Stage2', 'wavelength_map']
 
@@ -164,15 +165,18 @@ class Stage2:
 
     def __init__(self, inputs, outdir=None, mode=None, exposure=None, suffix='rateints',
                  verbose=True):
-        exps = find_exposures(inputs, suffix=suffix)
-        self.exposure, self.files = select_exposure(exps, exposure, verbose=verbose)
-        self.header = fits.getheader(self.files[0], 0)
-        self.mode = mode or identify_mode(self.header)
+        exps, info = input_exposures(inputs, suffix, outdir)
+        self.exposure, self.files = select_exposure(
+            exps, exposure, verbose=verbose, nints={k: sum(v['nint']) for k, v in info.items()})
+        self.header = (info[self.exposure]['header'] if self.exposure in info
+                       else fits.getheader(self.files[0], 0))
+        self.mode = mode or self.header.get('JSMODE') or identify_mode(self.header)
         self.config = get_mode_config(self.mode)
         self.outdir = outdir or os.path.dirname(os.path.abspath(self.files[0]))
         os.makedirs(self.outdir, exist_ok=True)
         self.verbose = verbose
         self.log = StepLog(os.path.join(self.outdir, f'{self.exposure}_stage2_log.json'))
+        self.store = ProductStore(self.outdir, self.exposure)
         self.wavelength = None
         self.wavelength_info = {}
         for name in ('stpipe', 'jwst', 'stcal'):
@@ -180,6 +184,7 @@ class Stage2:
 
     def compute_wavelength(self, segment=0):
         """Compute (and store) the wavelength map from one segment."""
+        self._need_inputs([segment])
         self.wavelength, self.wavelength_info = wavelength_map(self.files[segment], self.mode)
         self.log.add('wavelength_map', segment=segment)
         if self.verbose and self.wavelength is not None:
@@ -192,7 +197,7 @@ class Stage2:
         if self.wavelength is None:
             self.compute_wavelength()
         if fname is None:
-            fname = os.path.join(self.outdir, f'{self.exposure}_wavelength.fits')
+            fname = self.wavelength_file()
         hdr = fits.Header()
         hdr['JSMODE'] = self.mode
         hdr['EXPOSURE'] = self.exposure
@@ -208,13 +213,43 @@ class Stage2:
                 hdus.append(fits.ImageHDU(tr, name=f'TRACE_O{k + 1}'))
         if 'pwcpos' in info:
             hdus[0].header['PWCPOS'] = info['pwcpos']
+        store = ProductStore(os.path.dirname(os.path.abspath(fname)), self.exposure)
+        if overwrite or not os.path.isfile(fname):
+            store.begin(fname)
         fits.HDUList(hdus).writeto(fname, overwrite=overwrite)
+        store.done(fname, dict(mode=self.mode), uid=content_id(np.asarray(self.wavelength, np.float32)))
         if self.verbose:
             print(f'Saved wavelength map to {fname}')
         return fname
 
-    def run(self, steps=('assign_wcs',), segments=None, save_wavelength=True, overwrite=True):
-        """Run Stage 2.
+    def wavelength_file(self):
+        return os.path.join(self.outdir, f'{self.exposure}_wavelength.fits')
+
+    def load_wavelength(self, fname=None):
+        """Restore the wavelength map (and the trace positions etc.) from its file."""
+        fname = fname or self.wavelength_file()
+        info = {}
+        with fits.open(fname) as h:
+            self.wavelength = np.asarray(h['WAVELENGTH'].data, np.float32)
+            for key in ('in_slit', 'in_bbox'):
+                if key.upper() in h:
+                    info[key] = np.asarray(h[key.upper()].data, bool)
+            traces = [np.asarray(hdu.data, float) for hdu in h if hdu.name.startswith('TRACE_O')]
+            if traces:
+                info['traces'] = traces
+            if 'PWCPOS' in h[0].header:
+                info['pwcpos'] = h[0].header['PWCPOS']
+        self.wavelength_info = info
+        return self.wavelength
+
+    def _need_inputs(self, segments):
+        gone = [os.path.basename(self.files[i]) for i in segments if not os.path.isfile(self.files[i])]
+        if gone:
+            raise FileNotFoundError(f'{", ".join(gone)} no longer exist (removed after cleaning?); '
+                                    'run Stage 1 with overwrite=True to make them again.')
+
+    def run(self, steps=('assign_wcs',), segments=None, save_wavelength=True, overwrite=False):
+        """Run Stage 2 (existing products are loaded).
 
         Parameters
         ----------
@@ -227,6 +262,10 @@ class Stage2:
             ``extract_2d``, which crops the data.
         segments : list of int or None
             Segments to process (default: all).
+        overwrite : bool
+            ``False`` (default): load the wavelength map (and skip the
+            ``calints`` files) if they exist and were made with the same
+            settings and inputs; ``True``: make them again.
 
         Returns
         -------
@@ -235,22 +274,50 @@ class Stage2:
         """
         out = {'wavelength': None, 'calints': []}
         if 'assign_wcs' in steps:
-            self.compute_wavelength()
-            if save_wavelength and self.wavelength is not None:
-                out['wavelength'] = self.save_wavelength(overwrite=overwrite)
+            fn = self.wavelength_file()
+            # the map depends on the WCS only, not on the Stage 1 data
+            c = None if overwrite else self.store.check(fn, dict(mode=self.mode), need=('WAVELENGTH',))
+            if c is not None:
+                ProductStore.refuse(c)
+            if c is not None and c.status in ('done', 'unrecorded'):
+                self.load_wavelength(fn)
+                out['wavelength'] = fn
+                if self.verbose:
+                    print(loaded_message(c))
+            else:
+                self.compute_wavelength()
+                if save_wavelength and self.wavelength is not None:
+                    out['wavelength'] = self.save_wavelength()
         extra = [s for s in steps if s != 'assign_wcs']
         if not extra:
             return out
         from stdatamodels.jwst import datamodels
-        segments = range(len(self.files)) if segments is None else segments
+        segments = list(range(len(self.files)) if segments is None else segments)
+        settings = plain(dict(mode=self.mode, steps=extra))
+        checks = {}
+        if not overwrite:
+            for seg in segments:
+                checks[seg] = self.store.check(
+                    output_filename(self.files[seg], self.outdir, 'calints'), settings,
+                    ProductStore.ids([self.files[seg]], self.exposure), need=('SCI', 'ERR', 'DQ'),
+                    input_files=[self.files[seg]])
+            ProductStore.refuse(list(checks.values()))
         for seg in segments:
+            fn = output_filename(self.files[seg], self.outdir, 'calints')
+            if seg in checks and checks[seg].status in ('done', 'unrecorded'):
+                out['calints'].append(fn)
+                if self.verbose:
+                    print(f'Segment {seg}: {loaded_message(checks[seg])}')
+                continue
+            self._need_inputs([seg])
             m = datamodels.open(self.files[seg])
             m = _call('assign_wcs', m)
             for s in extra:
                 m = _call(s, m)
                 self.log.add(s, segment=seg)
-            fn = output_filename(self.files[seg], self.outdir, 'calints')
-            m.save(fn, overwrite=overwrite)
+            self.store.begin(fn)
+            m.save(fn, overwrite=True)
+            self.store.done(fn, settings, ProductStore.ids([self.files[seg]], self.exposure))
             out['calints'].append(fn)
             if self.verbose:
                 print(f'Segment {seg}: {", ".join(extra)} -> {fn}')
