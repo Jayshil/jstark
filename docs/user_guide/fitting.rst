@@ -3,7 +3,7 @@ Light-curve fitting
 
 ``jstark.fitting`` fits light curves with `juliet
 <https://juliet.readthedocs.io>`_ (it needs the ``fitting`` extra: juliet,
-corner). It takes the products of :mod:`jstark.extraction` (or any arrays)
+corner, radvel). It takes the products of :mod:`jstark.extraction` (or any arrays)
 and fits one or several *datasets* jointly: several visits of a planet, both
 NIRSpec detectors, or observations with different instruments.
 
@@ -27,6 +27,8 @@ named *regressors* (per-integration time series)::
     lc = LightCurves.from_spectra('<exposure>_spectra.fits', order=1)
     # photometry (one channel); regressors xc, yc, width, bkg (+ PLD with pld=n)
     ph = LightCurves.from_photometry('<exposure>_photometry.fits', method='psf')
+    # any other observatory, from a table (see below)
+    ts = LightCurves.from_table('TESS51.dat', 0, 1, 2)
     # anything else
     lc = LightCurves(times, flux2d, err2d, wavelength=wave, regressors={'roll': roll})
 
@@ -44,7 +46,11 @@ a new dataset:
   number (e.g. the start of a visit, a high-gain-antenna move), or by
   ``time_range``.
 * ``clip(nsigma=5, window=31)``: remove outliers against a running median
-  of the white light.
+  of the white light. The window (in integrations) must be short compared
+  with the ingress: at long cadences it is not, and the transit itself is
+  removed (there is a warning); use ``protect=(t0, per, half_width)``.
+* ``around(t0, per, half_width)``: keep only the data near the transits (or
+  eclipses) of a long time series.
 * ``split()``: a dict with one dataset per channel group (NIRCam: per readout
   amplifier, ``A1`` ... ``A4``).
 
@@ -90,10 +96,46 @@ be in both (e.g. a linear slope in time plus a GP in time).
   ``'sho'``) only sets the default priors added when you give none. A 1D
   input that is not sorted (e.g. a centroid) is handled by ordering the
   dataset by it, as celerite requires.
+* **Non-linear**: your own function of regressors and parameters, per
+  dataset (next section).
 * **Ramp**: ``ramp={'V1': 1}`` multiplies the model of a dataset by
   ``1 + A exp(-t / tau)`` (``ramp=2``: two terms), with ``t`` the time since
   its first integration; for start-of-visit settling (MIRI) when the start
   is not trimmed.
+
+Non-linear models
+-----------------
+
+::
+
+    def roll_model(x, parameters):           # at the top level of the script
+        phi = np.radians(x) + parameters['phase_CHEOPS']
+        return 1. + parameters['amp_CHEOPS'] * np.sin(phi)
+
+    pri.update({'amp_CHEOPS': ('uniform', [0., 0.01]), 'phase_CHEOPS': ('uniform', [-3.14, 3.14])})
+    fit = BroadbandFit(lcs, priors=pri, out_folder='fit',
+                       non_linear={'CHEOPS': {'function': roll_model, 'regressor': 'roll',
+                                              'multiplicative': True}})
+
+The function gets the regressor (a stored or built-in name, a list of names
+for a ``(nint, k)`` array, or an array with one row per integration) and a
+dict with the value of every parameter; it returns the model of each
+integration. The regressor follows the data when integrations are dropped,
+binned or sorted. The model is ``(planet + linear) * f`` with
+``multiplicative=True`` and ``planet + linear + f`` otherwise (juliet's
+default). Choose parameter names yourself (with a dataset suffix, so they do
+not look like juliet parameters) and give their priors; a missing prior is
+reported before the fit starts.
+
+* juliet allows one function per dataset: ``ramp`` can be combined with a
+  multiplicative function, not with an additive one.
+* The source text of the function is part of the fit's fingerprint (changing
+  even a comment makes it a different fit); data it reads from global
+  variables is not.
+* With ``nthreads > 1`` the function must be importable by the worker
+  processes: define it in a module, or at the top level of a script.
+* ``BroadbandFit.load('fit', non_linear={'CHEOPS': roll_model})``: the
+  functions are not stored, so give them again.
 
 Priors
 ------
@@ -121,7 +163,101 @@ Change these defaults with ``nuisance={'sigma_w': ('loguniform', [1, 1e4]),
 only if a ``q1``/``u1``/``c1`` prior names it. Eclipse-only data need none;
 for transits give e.g. ``q1_V1_V2`` / ``q2_V1_V2`` (shared) or one pair per
 dataset. ``BroadbandFit`` prints the model of each dataset and warns when an
-``Rp/R*`` prior applies to a dataset without limb-darkening priors.
+``Rp/R*`` prior applies to a dataset without limb-darkening priors. It also
+warns about priors that name no dataset of the fit (juliet ignores them;
+free ones are only unused dimensions).
+
+**Groups** (optional) are short names for several datasets::
+
+    groups={'TESS': ['TESS51', 'TESS91']}
+
+In a prior name a group is one parameter *shared* by its datasets:
+``q1_TESS`` is ``q1_TESS51_TESS91``. In the per-dataset options (``linear``,
+``gp``, ``ramp``, ``supersample``, ``ld_laws``, ``non_linear``, ``nuisance``)
+the setting goes to each of the datasets; a dataset's own entry takes
+precedence. Full names always work, alone or mixed with groups, and give the
+same fit. Results accept group names too (``fit.values('p_p1_TESS')``,
+``phase_folded_lc(instruments='TESS')``).
+
+Joint fits with other observatories
+-----------------------------------
+
+Photometry of other observatories (TESS, CHEOPS, ground-based, ...) is
+fitted like any other dataset. You prepare the data; ``from_table`` reads
+them from a file (text, CSV, FITS, ...), an astropy or pandas table, or a
+dict of columns, with any columns as regressors. Columns are given by name
+or number::
+
+    from astropy.table import Table
+    tab = Table.read('tess2022112184951-s0051-..._lc.fits', hdu=1)
+    tab = tab[tab['QUALITY'] == 0]                       # quality cuts are yours
+    tess51 = LightCurves.from_table(tab, 'TIME', 'PDCSAP_FLUX', 'PDCSAP_FLUX_ERR',
+                                    time_offset=2457000.)    # BTJD -> BJD
+    tess51 = tess51.around(T0, P, 0.35)                  # days around the transits
+    cheops = LightCurves.from_table('visit.fits', 'BJD_TIME', 'FLUX', 'FLUXERR',
+                                    regressors={'roll': 'ROLL', 'bg': 'BG', 'pca': ['U0', 'U1']})
+
+    lcs = {'NRS1': nrs1, 'NRS2': nrs2, 'TESS51': tess51, 'TESS91': tess91, 'CHEOPS': cheops}
+    fit = BroadbandFit(lcs, priors=pri, out_folder='joint',
+                       groups={'NRS': ['NRS1', 'NRS2'], 'TESS': ['TESS51', 'TESS91']},
+                       linear={'NRS': ['time', 'dy'], 'CHEOPS': ['bg', 'pca']},
+                       gp={'TESS': 'time', 'CHEOPS': 'roll'})
+
+* **Times must be BJD_TDB in all datasets.** Times that are not full Julian
+  dates raise an error; whether they are TDB cannot be checked (UTC differs
+  by 69 s). TESS ``TIME`` is BJD_TDB - 2457000. The ``BJD_TIME`` of CHEOPS
+  DRP and PIPE files is BJD_TDB (``MJD_TIME`` is TT and not barycentric).
+* **Long exposures**: ``supersample={'TESS': (15, 30 / 1440)}`` evaluates the
+  planet model on 15 points per 30-min exposure (exposure time in days;
+  without it the median cadence is used). There is a warning from about 10
+  min without supersampling.
+* **Bandpasses**: give each its own ``p_p1_<dataset or group>`` (or one
+  ``p_p1``) and limb darkening. A shared orbit and ``P``, ``t0`` need no suffix.
+* **Run time** grows with the number of datasets: each has an offset, a
+  jitter and its systematics. Above about 20 parameters dynesty switches to
+  slice sampling; ``sample='rwalk'`` is usually faster. Many visits (tens
+  of CHEOPS visits) are too many for one nested-sampling fit.
+* Independent normal priors from a fit of the other data are not a
+  substitute for a joint fit: they lose the correlation of ``a/R*`` and ``b``.
+* Plots: use ``phase_folded_lc(instruments='TESS', one_plot=True)`` and so on, one
+  bandpass (and one kind of event) at a time.
+* ``beta`` in :meth:`~jstark.fitting.BroadbandFit.diagnostics` bins
+  consecutive points and ignores gaps, so it is only indicative for data with
+  gaps (CHEOPS) or cut around transits.
+* ``SpectroscopicFit`` stays a JWST fit:
+  ``fit.channel_priors(datasets=['NRS1', 'NRS2'])`` gives the priors of the joint fit that
+  apply to the JWST datasets.
+
+Transit timing variations are not supported.
+
+Radial velocities
+-----------------
+
+::
+
+    fit = BroadbandFit(lcs, priors=dict(pri, K_p1=('uniform', [0., 200.])), out_folder='joint_rv',
+                       rvs={'SOPHIE': (t, rv, err), 'CORALIE': (t2, rv2, err2)})
+    fit.fit(nthreads=8)
+    fit.rv_diagnostics()          # per instrument: offset, rms, error, jitter, chi2
+    fit.rv_residuals('SOPHIE')    # velocities, model, residuals
+    fit.plots().plot_rv()         # time series and phase-folded orbit of every planet
+
+Times are BJD_TDB, velocities in m/s (or any unit, then also that of ``K``,
+the offsets and the jitters). The orbit uses the ``P``, ``t0`` and
+eccentricity priors of the planet; a ``K_p<n>`` prior is required. Missing
+offsets ``mu_<instrument>`` and jitters ``sigma_w_<instrument>`` are added (the
+latter in the unit of the velocities, not ppm). Names must differ from those
+of the datasets.
+
+* Planets without ``p_p<n>`` are fitted to the velocities only. juliet
+  requires increasing periods (``P_p1 < P_p2 < ...``).
+* ``rv_slope`` (and ``rv_quad``) priors add a linear (quadratic) trend, per
+  day (per day squared), about the middle of the RV times (or ``fit(ta=...)``);
+  ``rv_intercept`` is fixed to 0, as it is degenerate with the offsets.
+* With a free eccentricity, keep it below about 0.9 through the priors or
+  ``fit(ecclim=...)``: batman fails near 1. ``summary`` derives ``ecc`` and
+  ``omega`` from ``secosomega``/``sesinomega``.
+* GPs and linear regressors are not available for the velocities.
 
 Running the fit
 ---------------

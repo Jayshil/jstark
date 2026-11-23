@@ -13,6 +13,10 @@ dataset needs and you did not give:
 * GP hyperparameters for the chosen kernel, when the dataset has a GP;
 * ``ramp[k]amp_<ds>`` uniform(-0.1, 0.1) and ``ramp[k]tau_<ds>`` log-uniform
   (2 cadences, duration) for each exponential ramp term;
+* for radial velocities, ``mu_<instrument>`` uniform (the range of the data,
+  extended by five times its width on both sides) and ``sigma_w_<instrument>``
+  log-uniform (1% of the median error to ten times the scatter), in the unit
+  of the velocities; ``rv_intercept`` fixed to 0 when you give a trend;
 * ``C2``/``D2`` fixed to 0 when you give a Cowan & Agol phase curve
   (``C1``, ``D1``) without them: the first-order model (juliet always
   evaluates the second-order terms).
@@ -31,12 +35,14 @@ Prior formats accepted wherever priors are passed: juliet's dict
 ``{name: (distribution, hyperparameters)}``, or the path of a juliet prior
 file.
 """
+import re
 import warnings
 
 import numpy as np
 
 __all__ = ['normalise_priors', 'build_priors', 'model_report', 'GP_KERNELS', 'covers',
-           'priors_to_text', 'check_phase_curves']
+           'priors_to_text', 'check_phase_curves', 'check_groups', 'expand_group_priors',
+           'expand_group_options', 'stray_priors']
 
 # juliet kernel variables (celerite kernels take a 1D regressor)
 GP_KERNELS = {
@@ -74,6 +80,127 @@ def normalise_priors(priors):
         return {k: {'distribution': v['distribution'].lower(),
                     'hyperparameters': v['hyperparameters']} for k, v in out.items()}
     return {k: _one(v) for k, v in priors.items()}
+
+
+def check_groups(groups, names):
+    """Validate dataset groups; returns ``{group: [dataset, ...]}``.
+
+    ``names`` are the datasets of the fit. A group name follows the rules of
+    dataset names and must differ from all of them; groups may overlap.
+    """
+    from .lightcurve import check_name
+    out = {}
+    for g, members in (groups or {}).items():
+        check_name(g)
+        if g in names:
+            raise ValueError(f'Group {g!r} has the name of a dataset.')
+        members = [members] if isinstance(members, str) else list(members)
+        unknown = [m for m in members if m not in names]
+        if unknown:
+            raise ValueError(f'Group {g!r}: unknown dataset(s) {unknown}; datasets are {list(names)}.')
+        if not members or len(set(members)) < len(members):
+            raise ValueError(f'Group {g!r} is empty or names a dataset twice.')
+        out[g] = members
+    return out
+
+
+def expand_group_priors(priors, groups, names):
+    """Replace group names in parameter names by their datasets.
+
+    A group is one *shared* parameter: ``q1_TESS`` becomes
+    ``q1_TESS51_TESS91``. Names without a group are kept as they are.
+
+    Returns
+    -------
+    priors : dict
+    aliases : dict
+        ``{name as given: full juliet name}`` of the expanded parameters.
+    """
+    out, aliases = {}, {}
+    for k, v in priors.items():
+        parts = k.split('_')
+        if not any(x in groups for x in parts[1:]):
+            full = k
+        else:
+            if parts[0] in ('T', 'dt'):
+                raise ValueError(f'Prior {k!r}: transit times belong to one dataset, not to a group.')
+            new = parts[:1]
+            for x in parts[1:]:
+                new += [m for m in groups.get(x, [x]) if m not in new[1:] or m not in names]
+            full = '_'.join(new)
+            aliases[k] = full
+        if full in out:
+            raise ValueError(f'Prior {k!r} is given twice (as {full!r}).')
+        out[full] = v
+
+    def kind(key):
+        return tuple(x for x in key.split('_') if x not in names)
+
+    for k, full in aliases.items():
+        ds = {x for x in full.split('_') if x in names}
+        for other in out:
+            both = ds & set(other.split('_')[1:])
+            if other != full and both and kind(other) == kind(full):
+                raise ValueError(f'Priors {k!r} (= {full!r}) and {other!r} both apply to {sorted(both)}.')
+    return out, aliases
+
+
+def expand_group_options(value, groups):
+    """Per-dataset options with group keys: the value of a group goes to each of its datasets.
+
+    A dataset's own key takes precedence. Anything but a dict is returned
+    unchanged.
+    """
+    if not isinstance(value, dict) or not groups:
+        return value
+    out = {}
+    for k, v in value.items():
+        for m in groups.get(k, []):
+            if m in out and m not in value:
+                raise ValueError(f'Dataset {m} gets a value from more than one group.')
+            out[m] = value.get(m, v)
+        if k not in groups:
+            out[k] = v
+    return out
+
+
+_DATASET_PARAMETER = re.compile(r'(q[1-4]|u[12]|c[1-4]|mdilution|mflux|theta\d+|ramp\d*(amp|tau))')
+
+
+def stray_priors(priors, names, rv_names=()):
+    """Priors that juliet ignores because the datasets they name are not in the fit.
+
+    Only parameter names that juliet (or jstark) ties to datasets are judged
+    (limb darkening, offsets, jitters, linear, GP and ramp terms, planet
+    parameters with a dataset suffix); parameters of your own non-linear
+    functions may have any name.
+    """
+    names, rv_names = set(names), set(rv_names)
+    out = []
+    for k in priors:
+        known = names
+        parts = k.split('_')
+        if parts[0] == 'sigma' and parts[1:2] == ['w']:
+            ds, known = parts[2:], names | rv_names
+        elif parts[0] == 'GP':
+            ds = parts[2:]
+            if ds in (['lc'], ['rv']):            # juliet's global GPs
+                continue
+        elif parts[0] == 'mu':
+            ds, known = parts[1:], rv_names
+        elif _DATASET_PARAMETER.fullmatch(parts[0]):
+            ds = parts[1:]
+        elif len(parts) > 2 and re.fullmatch(r'p\d+', parts[1]):
+            ds = parts[2:]
+        elif (parts[0] == 'K' and len(parts) == 2) or k in ('rv_slope', 'rv_quad', 'rv_intercept'):
+            if not rv_names:                       # these need RV data
+                out.append(k)
+            continue
+        else:
+            continue
+        if ds and not known & set(ds):
+            out.append(k)
+    return out
 
 
 def covers(priors, prefix, name):
@@ -128,7 +255,7 @@ def _ramp_defaults(k, x):
             f'ramp{sfx}tau': ('loguniform', [2. * dt, max(np.ptp(x), 4. * dt)])}
 
 
-def build_priors(priors, datasets, nuisance=None, verbose=True):
+def build_priors(priors, datasets, nuisance=None, verbose=True, rvs=None):
     """Complete a set of priors for the given datasets.
 
     Parameters
@@ -146,6 +273,8 @@ def build_priors(priors, datasets, nuisance=None, verbose=True):
         Overrides of the default nuisance priors, keyed ``mdilution``,
         ``mflux``, ``sigma_w`` and ``theta`` (applied to every dataset), or
         a full parameter name (e.g. ``'sigma_w_V1'``).
+    rvs : dict or None
+        Radial velocities ``{instrument: {'t', 'rv', 'err'}}``.
 
     Returns
     -------
@@ -193,11 +322,22 @@ def build_priors(priors, datasets, nuisance=None, verbose=True):
                 for v in GP_KERNELS[kern]:
                     if v not in have:
                         add(f'GP_{v}_{ds}', d[v])
+    if rvs:
+        if not any(re.fullmatch(r'K_p\d+', k) for k in out):
+            raise ValueError('Radial velocities need a prior on the semi-amplitude (K_p1).')
+        if 'rv_quad' in out and 'rv_slope' not in out:
+            raise ValueError('rv_quad needs rv_slope (it may be fixed to 0).')
+        for n, v in rvs.items():
+            lo, hi, err = np.min(v['rv']), np.max(v['rv']), float(np.median(v['err']))
+            w = max(hi - lo, 3. * err)
+            add(f'mu_{n}', ('uniform', [float(lo - 5. * w), float(hi + 5. * w)]))
+            add(f'sigma_w_{n}', ('loguniform', [0.01 * err, float(10. * max(np.std(v['rv']), err))]))
+        if 'rv_slope' in out:
+            add('rv_intercept', ('fixed', 0.0))        # degenerate with the offsets mu
     for k in [k for k in out if k.split('_')[0] == 'C1']:
         sfx = k[len('C1'):]
         for c in ('C2', 'D2'):
             add(c + sfx, ('fixed', 0.0))
-    # Parameters that name no fitted dataset are a typo (juliet would fail later)
     if verbose and added:
         print(f'Added {len(added)} priors: ' + ', '.join(added))
     return out, added

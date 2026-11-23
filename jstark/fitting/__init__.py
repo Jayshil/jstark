@@ -1,17 +1,19 @@
-"""Light-curve fitting with juliet (needs the ``fitting`` extra: juliet, corner).
+"""Light-curve fitting with juliet (needs the ``fitting`` extra: juliet, corner, radvel).
 
 Main classes
 ------------
 LightCurves
     One dataset (one visit x one mode/order/detector): times, flux and
     errors per channel, and a pool of named regressors. Read from jstark
-    spectra (``from_spectra``) or photometry (``from_photometry``) files, or
-    built from arrays.
+    spectra (``from_spectra``) or photometry (``from_photometry``) files, from
+    tables of other observatories (``from_table``), or built from arrays.
 BroadbandFit
     Joint juliet fit of the broadband light curve (white light of the
     spectra, or the photometric light curve) of every dataset in a dict
     ``{name: LightCurves}``. The fit decides which regressors enter the
-    linear model (``linear=``) and which is the GP input (``gp=``).
+    linear model (``linear=``), which is the GP input (``gp=``) and which
+    enter your own functions (``non_linear=``). Optionally with radial
+    velocities (``rvs=``).
 SpectroscopicFit
     One joint fit per wavelength bin over all datasets that cover it
     (parallel, resumable); results as a :class:`Spectrum` table.

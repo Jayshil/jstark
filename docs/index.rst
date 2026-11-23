@@ -82,7 +82,7 @@ jstark needs Python 3.11 or later. A fresh environment is recommended:
    conda activate jstark
    pip install "jwstark[fitting] @ git+https://github.com/Jayshil/jstark.git"
 
-The ``fitting`` extra installs juliet and corner, needed for
+The ``fitting`` extra installs juliet, corner and radvel, needed for
 :mod:`jstark.fitting`; leave it out (``pip install git+https://github.com/Jayshil/jstark.git``) if
 you only reduce and extract. The package is installed as ``jwstark`` (the
 name ``jstark`` is taken on PyPI) and imported as ``jstark``.

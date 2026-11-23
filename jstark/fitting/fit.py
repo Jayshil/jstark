@@ -6,39 +6,54 @@ dataset, or the light curve itself of a photometric one. Planet and orbit
 parameters are shared or per dataset as your priors say (juliet naming);
 every dataset gets its own flux offset, jitter and systematics model.
 """
+import ast
+import contextlib
+import functools
 import glob
 import hashlib
+import inspect
 import json
 import os
+import pickle
 import re
 import warnings
 
 import numpy as np
 
-from .lightcurve import as_lightcurves, check_name
-from .priors import build_priors, model_report, normalise_priors, priors_to_text
+from .lightcurve import as_lightcurves, check_bjd, check_name
+from .priors import (build_priors, check_groups, expand_group_options, expand_group_priors,
+                     model_report, normalise_priors, priors_to_text, stray_priors)
 from .utils import b_to_inc, rho_to_ar, phase_curve_quantities
 from ..extraction.metrics import p2p_sigma
 
-__all__ = ['BroadbandFit', 'ExpRamp', 'red_noise_beta', 'JULIET_FILES']
+__all__ = ['BroadbandFit', 'ExpRamp', 'NonLinear', 'red_noise_beta', 'JULIET_FILES']
 
 # Files juliet writes into its output folder (removed by ``overwrite=True``)
-JULIET_FILES = ('lc.dat', 'priors.dat', 'LM_lc_regressors.dat', 'GP_lc_regressors.dat',
+JULIET_FILES = ('lc.dat', 'rvs.dat', 'priors.dat', 'LM_lc_regressors.dat', 'GP_lc_regressors.dat',
                 'posteriors.dat', '*posteriors.pkl', '*_checkpoint.pkl', '_dynesty_*',
                 'jomnest_*', 'model_resids.dat')
 JSTARK_FILES = ('jstark_fit.json', 'jstark_summary.ecsv', 'jstark_diagnostics.ecsv',
-                'jstark_residuals.npz')
+                'jstark_residuals.npz', 'jstark_nonlinear.npz', 'jstark_rv_diagnostics.ecsv')
+
+# juliet.fit options that change the model (needed again when a fit is reloaded)
+_MODEL_OPTIONS = ('light_travel_delay', 'stellar_radius', 'ta', 'ecclim', 'pl', 'pu')
+# Cadence (days) from which a dataset without supersampling gets a warning (about 10 min)
+_LONG_CADENCE = 9.5 / 1440.
+# Column of array regressors of non-linear functions while the dataset is clipped and binned
+_NL_ARRAY = 'nonlinearinput'
 
 _PLANET_GEOMETRY = ('P', 't0', 'a', 'rho', 'b', 'inc', 'ecc', 'omega', 'secosomega',
                     'sesinomega', 'esinomega', 'ecosomega', 'dt', 'T', 't_secondary')
 
 
-def _per_dataset(value, names, what):
-    """Expand a setting to ``{name: value}`` (dict: per dataset; anything else: for all)."""
+def _per_dataset(value, names, what, groups=None):
+    """Expand a setting to ``{name: value}`` (dict: per dataset or group; anything else: for all)."""
     if isinstance(value, dict):
-        unknown = set(value) - set(names)
+        unknown = set(value) - set(names) - set(groups or {})
         if unknown:
-            raise ValueError(f'{what}: unknown dataset(s) {sorted(unknown)}; datasets are {names}.')
+            raise ValueError(f'{what}: unknown dataset(s) {sorted(unknown)}; datasets are {names}'
+                             + (f', groups {list(groups)}.' if groups else '.'))
+        value = expand_group_options(value, groups or {})
         return {n: value.get(n) for n in names}
     return {n: value for n in names}
 
@@ -70,14 +85,20 @@ class ExpRamp:
     pickled for multiprocessing).
     """
 
-    def __init__(self, name, nterms=1):
+    def __init__(self, name, nterms=1, priors=None):
         self.name, self.nterms = name, int(nterms)
+        self.params = {}
+        for k in priors or {}:                 # shared by several datasets: ramptau_V1_V2
+            parts = k.split('_')
+            if name in parts[1:]:
+                self.params[parts[0]] = k
 
     def names(self):
         out = []
         for k in range(1, self.nterms + 1):
             sfx = '' if k == 1 else str(k)
-            out += [f'ramp{sfx}amp_{self.name}', f'ramp{sfx}tau_{self.name}']
+            out += [self.params.get(f'ramp{sfx}{q}', f'ramp{sfx}{q}_{self.name}')
+                    for q in ('amp', 'tau')]
         return out
 
     def neutral(self):
@@ -90,6 +111,97 @@ class ExpRamp:
         for k in range(self.nterms):
             r = r + pv[n[2 * k]] * np.exp(-x / pv[n[2 * k + 1]])
         return r
+
+
+class NonLinear:
+    """Your non-linear function of one dataset, in the form juliet calls it.
+
+    ``function(x, parameters)`` gets the regressor(s) and a dict with the
+    value of every parameter of the fit, and returns the model of each
+    integration. juliet allows one function per dataset, so a multiplicative
+    function also carries the exponential ramp of the dataset, if any (then
+    ``x`` is ``(ramp time, regressor)``). ``aliases`` lets the function use
+    group names (``amp_TESS`` for ``amp_TESS51_TESS91``).
+    """
+
+    def __init__(self, function, multiplicative=False, ramp=None, aliases=None):
+        if ramp is not None and not multiplicative:
+            raise ValueError('A ramp cannot be combined with an additive non-linear function '
+                             '(juliet allows one function per dataset).')
+        self.function, self.multiplicative, self.ramp = function, bool(multiplicative), ramp
+        self.aliases = dict(aliases or {})
+        self.enabled = True
+
+    def neutral(self):
+        return self.ramp.neutral() if self.ramp is not None else {}
+
+    def __call__(self, x, pv):
+        if not self.enabled:
+            return 1. if self.multiplicative else 0.
+        if self.aliases:
+            pv = dict(pv, **{a: pv[k] for a, k in self.aliases.items() if k in pv})
+        if self.ramp is None:
+            return self.function(x, pv)
+        return self.ramp(x[0], pv) * self.function(x[1], pv)
+
+
+@contextlib.contextmanager
+def _without_non_linear(dataset):
+    """Switch off the user's non-linear functions of a juliet dataset (planet-only models)."""
+    funcs = [f['function'] for f in (getattr(dataset, 'non_linear_functions', None) or {}).values()
+             if isinstance(f['function'], NonLinear)]
+    try:
+        for f in funcs:
+            f.enabled = False
+        yield
+    finally:
+        for f in funcs:
+            f.enabled = True
+
+
+def _describe_function(f):
+    """``(name, text)`` identifying a function: its source code and simple stored values."""
+    def values(x):
+        if isinstance(x, np.ndarray):
+            return hashlib.sha1(np.ascontiguousarray(x).tobytes()).hexdigest()
+        if isinstance(x, (list, tuple)):
+            return [values(i) for i in x]
+        if isinstance(x, dict):
+            return {str(k): values(v) for k, v in sorted(x.items(), key=lambda i: str(i[0]))}
+        if callable(x):
+            return list(_describe_function(x))
+        return repr(x) if isinstance(x, (str, bytes, int, float, bool, type(None), np.generic)) \
+            else type(x).__name__
+    if isinstance(f, functools.partial):
+        name, text = _describe_function(f.func)
+        return name, text + repr(values([f.args, f.keywords]))
+    target = f if inspect.isroutine(f) else type(f)
+    name = getattr(target, '__qualname__', type(f).__name__)
+    try:
+        text = inspect.getsource(target)
+    except (OSError, TypeError):               # e.g. defined in an interactive session
+        code = getattr(f, '__code__', None)
+        text = repr((code.co_code, code.co_consts, code.co_names)) if code is not None else ''
+    extra = []
+    if inspect.isfunction(f):
+        extra = [f.__defaults__, f.__kwdefaults__] + [c.cell_contents for c in f.__closure__ or ()]
+        extra = [e for e in extra if e is not None]
+    elif not inspect.isroutine(f):
+        extra = [vars(f)] if hasattr(f, '__dict__') else []
+    return name, text + (repr(values(extra)) if extra else '')
+
+
+def _prior_centre(p):
+    """A typical value of a parameter under its prior."""
+    h = np.atleast_1d(np.asarray(p['hyperparameters'], float))
+    d = p['distribution']
+    if d == 'uniform':
+        return float(0.5 * (h[0] + h[1]))
+    if d in ('loguniform', 'jeffreys'):
+        return float(np.sqrt(h[0] * h[1]))
+    if d == 'beta':
+        return float(h[0] / (h[0] + h[1]))
+    return float(h[0])                          # fixed, normal, truncatednormal, ...
 
 
 def red_noise_beta(resid, bins=(8, 16, 32, 64, 128)):
@@ -116,7 +228,9 @@ class BroadbandFit:
     datasets : dict
         ``{name: LightCurves}`` (or anything :func:`as_lightcurves`
         accepts). Names are juliet instrument names: letters and digits
-        only (e.g. ``'V1'``, ``'V4a'``, ``'NRS2'``).
+        only (e.g. ``'V1'``, ``'V4a'``, ``'NRS2'``). Data of other
+        observatories are read with :meth:`LightCurves.from_table`. The
+        times of every dataset must be full Julian dates (BJD_TDB).
     priors : dict, str or None
         Astrophysical priors in juliet naming, e.g. ``{'P_p1': ('fixed',
         4.055), 't0_p1': ('normal', [t0, 0.001]), 'fp_p1': ('uniform', [0,
@@ -140,6 +254,27 @@ class BroadbandFit:
         Number of multiplicative exponential ramp terms (:class:`ExpRamp`;
         0, 1 or 2), for every dataset or ``{name: n}`` (e.g. MIRI start-of-
         visit settling).
+    non_linear : dict or None
+        Your own non-linear models, ``{dataset: {'function': f, 'regressor':
+        ..., 'multiplicative': bool}}`` (or ``{dataset: f}``).
+        ``f(x, parameters)`` returns the model of each integration from the
+        regressor ``x`` and the dict ``parameters`` of all parameter values;
+        give priors for the parameters it uses. ``regressor`` is a regressor
+        name (default ``'time'``), a list of names (``x`` is then ``(nint,
+        k)``), or an array with one row per integration of the dataset as
+        passed in. The full model is ``(planet + linear) * f``
+        (``multiplicative=True``) or ``planet + linear + f`` (default, as in
+        juliet). juliet allows one function per dataset: a ``ramp`` can be
+        combined with a multiplicative function, not with an additive one.
+        For ``nthreads > 1`` define ``f`` at the top level of a module or
+        script. :meth:`load` needs the functions again.
+    groups : dict or None
+        Optional short names for several datasets, e.g. ``{'TESS':
+        ['TESS51', 'TESS91']}``. In a prior name, a group is one parameter
+        *shared* by its datasets (``q1_TESS`` is ``q1_TESS51_TESS91``); in
+        ``linear``, ``gp``, ``ramp`` and the other per-dataset options
+        (``nuisance`` included) the setting goes to each of its datasets.
+        Full juliet names always work too.
     gp_kernel : str or dict
         Kernel used to add default GP priors when you give none
         (``'matern'``, ``'exp'``, ``'matern-exp'``, ``'sho'``). The kernel
@@ -151,6 +286,19 @@ class BroadbandFit:
         ``theta``, ``mdilution`` or full parameter names).
     standardise : bool
         Standardise the linear regressors (mean 0, standard deviation 1).
+    rvs : dict or None
+        Radial velocities fitted jointly, ``{instrument: (times, rv, err)}``
+        (BJD_TDB; m/s, or any unit, then used for ``K`` and the jitters too),
+        or ``{instrument: {'times': ..., 'rv': ..., 'err': ...}}``. Needs a
+        ``K_p<n>`` prior (Keplerian orbits with the ``P``, ``t0`` and
+        eccentricity priors of the planet; planets without a radius-ratio
+        prior are fitted to the RVs only, with increasing periods ``p1``,
+        ``p2``, ...). Missing offsets ``mu_<instrument>`` and jitters
+        ``sigma_w_<instrument>`` are added. ``rv_slope`` (and ``rv_quad``)
+        priors, per day, add a linear (quadratic) trend about the middle of
+        the RV times. Names must differ from the dataset names. Needs the
+        radvel package. See :meth:`rv_diagnostics` and
+        :meth:`julietPlots.plot_rv`.
     clip : dict or None
         If given, :meth:`LightCurves.clip` is applied with these keywords
         before fitting (e.g. ``{'nsigma': 5, 'window': 31}``).
@@ -162,11 +310,13 @@ class BroadbandFit:
         fitting (:meth:`LightCurves.bin_time`; after ``clip``), for every
         dataset or ``{name: n}``. For a bin width in time, bin the
         :class:`LightCurves` yourself (``bin_time(dt=...)``).
-    supersample : int, dict or None
+    supersample : int, tuple, dict or None
         Off by default. Evaluate the planet model on this many
         sub-exposures per point (juliet's supersampling), for every dataset
         or ``{name: n}``; the exposure time is the bin span of time-binned
-        data, else the median cadence. Use it with long bins.
+        data, else the median cadence, or give it: ``(n, exposure time in
+        days)``. Use it with long bins or exposures (there is a warning
+        from about 10 min).
 
     Examples
     --------
@@ -179,14 +329,25 @@ class BroadbandFit:
     def __init__(self, datasets, priors=None, out_folder='broadband', linear=None, gp=None,
                  ramp=None, gp_kernel='matern', ld_laws='quadratic', nuisance=None,
                  standardise=True, clip=None, max_nan_frac=0.5, bin_time=None, supersample=None,
-                 verbose=True):
+                 verbose=True, non_linear=None, groups=None, rvs=None):
         if not datasets:
             raise ValueError('No datasets given.')
         self.datasets = {}
-        bt = _per_dataset(bin_time, list(datasets), 'bin_time')
-        for name, obj in datasets.items():
+        for name in datasets:
             check_name(name)
+        self.groups = check_groups(groups, list(datasets))
+        self.rvs = self._check_rvs(rvs, list(datasets) + list(self.groups))
+        self.rv_names = list(self.rvs)
+        self.non_linear = self._check_non_linear(non_linear, list(datasets))
+        bt = _per_dataset(bin_time, list(datasets), 'bin_time', self.groups)
+        for name, obj in datasets.items():
             lc = as_lightcurves(obj, name=name)
+            check_bjd(lc.times, name)
+            nl = self.non_linear.get(name)
+            if nl and not isinstance(nl['regressor'], list):
+                # an array: keep it aligned with the data while clipping and binning
+                lc = lc.subset(np.ones(lc.nint, bool))
+                lc.add_regressor(_NL_ARRAY, nl['regressor'])
             if clip:
                 lc = lc.clip(verbose=verbose, **clip)
             if bt[name]:
@@ -195,27 +356,37 @@ class BroadbandFit:
         names = list(self.datasets)
         self.names = names
         self.supersample = {}
-        for n, k in _per_dataset(supersample, names, 'supersample').items():
+        for n, k in _per_dataset(supersample, names, 'supersample', self.groups).items():
+            exp = None
+            if isinstance(k, (tuple, list)):
+                k, exp = k
+                if not 0 < exp < 1:
+                    raise ValueError(f'supersample of {n}: exposure time {exp} (it must be in days).')
             if k and int(k) > 1:
-                lc = self.datasets[n]
-                exp = lc.meta.get('bin_time', {}).get('exptime')
-                if exp is None:
-                    dt = np.diff(np.sort(lc.times))
-                    exp = float(np.median(dt[dt > 0]))
-                self.supersample[n] = (int(k), float(exp))
-        self.linear = {n: _as_list(v) for n, v in _per_dataset(linear, names, 'linear').items()}
-        self.gp = {n: _as_list(v) for n, v in _per_dataset(gp, names, 'gp').items()}
-        self.gp_kernel = _per_dataset(gp_kernel, names, 'gp_kernel')
-        self.ramp = {n: int(v or 0) for n, v in _per_dataset(ramp, names, 'ramp').items()}
+                self.supersample[n] = (int(k), float(exp) if exp is not None
+                                       else self._exposure_time(n))
+
+        def option(value, what):
+            return _per_dataset(value, names, what, self.groups)
+
+        self.linear = {n: _as_list(v) for n, v in option(linear, 'linear').items()}
+        self.gp = {n: _as_list(v) for n, v in option(gp, 'gp').items()}
+        self.gp_kernel = option(gp_kernel, 'gp_kernel')
+        self.ramp = {n: int(v or 0) for n, v in option(ramp, 'ramp').items()}
         if any(v not in (0, 1, 2) for v in self.ramp.values()):
             raise ValueError('ramp: 0, 1 or 2 exponential terms per dataset.')
-        self.ld_laws = ld_laws
+        for n, nl in self.non_linear.items():
+            if self.ramp[n] and not nl['multiplicative']:
+                raise ValueError(f'Dataset {n}: a ramp cannot be combined with an additive non-linear '
+                                 'function (juliet allows one function per dataset). Put the ramp '
+                                 'in your function or make the function multiplicative.')
+        self.ld_laws = expand_group_options(ld_laws, self.groups)
         self.out_folder = os.path.abspath(out_folder)
         self.standardise = standardise
         self.max_nan_frac = max_nan_frac
         self.verbose = verbose
-        self.user_priors = normalise_priors(priors)
-        self.nuisance = nuisance
+        self.user_priors, self.aliases = expand_group_priors(normalise_priors(priors), self.groups, names)
+        self.nuisance = self._expand_nuisance(nuisance)
         self.dataset = self.results = None
         self.sampler = None
         self.prepare()
@@ -223,6 +394,115 @@ class BroadbandFit:
     # ------------------------------------------------------------------
     # Inputs
     # ------------------------------------------------------------------
+    def _check_non_linear(self, non_linear, names):
+        """``{dataset: {'function', 'regressor' (list of names or array), 'multiplicative'}}``."""
+        if non_linear is None:
+            return {}
+        if not isinstance(non_linear, dict) or 'function' in non_linear:
+            raise ValueError("non_linear: give {dataset: {'function': ..., 'regressor': ..., "
+                             "'multiplicative': ...}}.")
+        out = {}
+        for n, spec in _per_dataset(non_linear, names, 'non_linear', self.groups).items():
+            if spec is None:
+                continue
+            spec = dict(spec) if isinstance(spec, dict) else {'function': spec}
+            unknown = set(spec) - {'function', 'regressor', 'multiplicative'}
+            if unknown:
+                raise ValueError(f'non_linear of {n}: unknown key(s) {sorted(unknown)}.')
+            if not callable(spec.get('function')):
+                raise ValueError(f"non_linear of {n}: 'function' must be a function f(x, parameters).")
+            reg = spec.get('regressor', 'time')
+            if isinstance(reg, str) or (isinstance(reg, (list, tuple)) and len(reg)
+                                        and all(isinstance(r, str) for r in reg)):
+                reg = _as_list(reg)
+            else:
+                reg = np.asarray(reg, float)
+            out[n] = dict(function=spec['function'], regressor=reg,
+                          multiplicative=bool(spec.get('multiplicative', False)))
+        return out
+
+    @staticmethod
+    def _check_rvs(rvs, taken):
+        """``{instrument: {'t', 'rv', 'err'}}``, finite and sorted in time."""
+        out = {}
+        for n, v in (rvs or {}).items():
+            check_name(n)
+            if n in taken:
+                raise ValueError(f'RV instrument {n!r} has the name of a dataset or group (juliet uses '
+                                 'one sigma_w per name).')
+            if isinstance(v, dict):
+                unknown = set(v) - {'times', 'rv', 'err'}
+                if unknown or len(v) < 3:
+                    raise ValueError(f'RVs of {n}: give times, rv and err (got {sorted(v)}).')
+                v = (v['times'], v['rv'], v['err'])
+            if len(v) != 3:
+                raise ValueError(f'RVs of {n}: give (times, rv, err).')
+            t, y, e = (np.asarray(x, float).ravel() for x in v)
+            if not t.size == y.size == e.size:
+                raise ValueError(f'RVs of {n}: {t.size} times, {y.size} velocities, {e.size} errors.')
+            ok = np.isfinite(t) & np.isfinite(y) & np.isfinite(e) & (e > 0)
+            if not ok.any():
+                raise ValueError(f'RVs of {n}: no usable point.')
+            check_bjd(t[ok], n)
+            o = np.flatnonzero(ok)[np.argsort(t[ok], kind='stable')]
+            out[n] = dict(t=t[o], rv=y[o], err=e[o])
+        return out
+
+    def _expand_nuisance(self, nuisance):
+        """Full parameter names with a group (``sigma_w_TESS``): one entry per dataset."""
+        if not nuisance or not self.groups:
+            return nuisance
+        out = {}
+        for k, v in nuisance.items():
+            parts = k.split('_')
+            g = [x for x in parts[1:] if x in self.groups]
+            for m in self.groups[g[0]] if g else [None]:
+                key = k if m is None else '_'.join(m if x == g[0] else x for x in parts)
+                if key == k or key not in nuisance:
+                    out[key] = v
+        return out
+
+    def _exposure_time(self, n):
+        """Time span of one point (days): the bin span of time-binned data, else the cadence."""
+        lc = self.datasets[n]
+        exp = lc.meta.get('bin_time', {}).get('exptime')
+        if exp is None:
+            dt = np.diff(np.sort(lc.times))
+            dt = dt[dt > 0]
+            exp = np.median(dt) if dt.size else 0.
+        return float(exp)
+
+    def _check_non_linear_functions(self):
+        """Call every non-linear function once with typical parameter values."""
+        pv = {k: _prior_centre(p) for k, p in self.priors.items()}
+        for n, f in self._non_linear_functions().items():
+            if n not in self.non_linear:
+                continue
+            try:
+                r = np.asarray(f['function'](f['regressor'], pv))
+            except KeyError as exc:
+                raise ValueError(f'The non-linear function of {n} uses the parameter {exc}, which has '
+                                 'no prior.') from exc
+            nint = self.data[n]['t'].size
+            if r.shape not in ((), (nint,)) or not np.issubdtype(r.dtype, np.floating):
+                raise ValueError(f'The non-linear function of {n} returned shape {r.shape} '
+                                 f'({r.dtype}) for {nint} integrations.')
+
+    def _non_linear_functions(self):
+        """juliet's ``non_linear_functions``: your functions and the exponential ramps."""
+        out = {}
+        for n in self.names:
+            ramp = ExpRamp(n, self.ramp[n], self.priors) if self.ramp[n] else None
+            nl = self.non_linear.get(n)
+            if nl:
+                f = NonLinear(nl['function'], nl['multiplicative'], ramp=ramp, aliases=self.aliases)
+                x = self.data[n]['N']
+                out[n] = dict(function=f, multiplicative=nl['multiplicative'],
+                              regressor=x if ramp is None else (self.data[n]['ramp_x'], x))
+            elif ramp:
+                out[n] = dict(function=ramp, regressor=self.data[n]['ramp_x'], multiplicative=True)
+        return out
+
     def prepare(self):
         """Build the light curves, regressor matrices and complete priors."""
         self.data = {}
@@ -233,38 +513,64 @@ class BroadbandFit:
             G = None
             if self.gp[n]:
                 G = np.concatenate([lc.regressor(g)[0] for g in self.gp[n]], axis=1)
+            N = None
+            if n in self.non_linear:
+                reg = self.non_linear[n]['regressor']
+                N = np.concatenate([lc.regressor(r)[0] for r in
+                                    (reg if isinstance(reg, list) else [_NL_ARRAY])], axis=1)
             ok = np.isfinite(y) & np.isfinite(e) & (e > 0) & np.all(np.isfinite(X), axis=1)
-            if G is not None:
-                ok &= np.all(np.isfinite(G), axis=1)
+            for R in (G, N):
+                if R is not None:
+                    ok &= np.all(np.isfinite(R), axis=1)
             if ok.sum() < 10:
                 raise ValueError(f'Dataset {n}: only {int(ok.sum())} usable integrations.')
             m = np.median(y[ok])
             d = dict(t=lc.times[ok], y=y[ok] / m, e=e[ok] / m, X=X[ok], labels=labels,
                      stats=stats, index=lc.index[ok], nint_input=lc.nint, norm=float(m))
             d['ramp_x'] = d['t'] - d['t'].min()
+            if N is not None:
+                d['N'] = N[ok][:, 0] if N.shape[1] == 1 else N[ok]
             if G is not None:
                 G = G[ok]
                 d['G'] = G[:, 0] if G.shape[1] == 1 else G
                 if d['G'].ndim == 1 and np.any(np.diff(d['G']) < 0):
                     # celerite needs a sorted regressor: order the dataset by it
                     o = np.argsort(d['G'], kind='stable')
-                    for k in ('t', 'y', 'e', 'X', 'index', 'G', 'ramp_x'):
-                        d[k] = d[k][o]
+                    for k in ('t', 'y', 'e', 'X', 'index', 'G', 'ramp_x', 'N'):
+                        if k in d:
+                            d[k] = d[k][o]
                     d['sorted_by_gp'] = True
             self.data[n] = d
             info[n] = dict(nlin=X.shape[1], gp_kernel=self.gp_kernel[n] if G is not None else None,
                            gp_x=d.get('G'), ramp=self.ramp[n], ramp_x=d['ramp_x'])
             if self.verbose:
                 r = f'; ramp {self.ramp[n]} exp' if self.ramp[n] else ''
+                if n in self.non_linear:
+                    nl = self.non_linear[n]
+                    r += (f"; non-linear {_describe_function(nl['function'])[0]}"
+                          f"({', '.join(nl['regressor']) if isinstance(nl['regressor'], list) else 'array'})")
                 print(f'{n}: {ok.sum()} of {lc.nint} integrations; linear {labels or "none"}; '
                       f'GP {self.gp[n] or "none"}{r}')
+        if self.verbose:
+            for n, v in self.rvs.items():
+                print(f'{n}: {v["t"].size} radial velocities')
         self.priors, self.added = build_priors(self.user_priors, info, nuisance=self.nuisance,
-                                               verbose=self.verbose)
+                                               verbose=self.verbose, rvs=self.rvs)
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter('always')
             self.models = model_report(self.priors, self.names)
         for x in w:
             warnings.warn(str(x.message))
+        stray = stray_priors(self.priors, self.names, self.rv_names)
+        if stray:
+            warnings.warn(f'Priors of datasets that are not in this fit: {stray}. juliet ignores them '
+                          '(free ones only add unused dimensions); check the names, or remove them.')
+        for n, r in self.models.items():
+            exp = self._exposure_time(n)
+            if exp > _LONG_CADENCE and n not in self.supersample and (r['transit'] or r['eclipse']):
+                warnings.warn(f'Dataset {n}: one point covers {exp * 1440:.3g} min and the planet model '
+                              f'is not supersampled; consider supersample={{{n!r}: 10}}.')
+        self._check_non_linear_functions()
         if self.verbose:
             for n, r in self.models.items():
                 kinds = [k for k in ('transit', 'eclipse', 'phasecurve') if r[k]] or ['systematics only']
@@ -291,6 +597,13 @@ class BroadbandFit:
         h.update(json.dumps(self.ramp, sort_keys=True).encode())
         if getattr(self, 'supersample', None):
             h.update(json.dumps(self.supersample, sort_keys=True).encode())
+        for n, v in self.rvs.items():
+            h.update(f'RV {n}'.encode())
+            for k in ('t', 'rv', 'err'):
+                h.update(np.ascontiguousarray(v[k], float).tobytes())
+        for n, nl in self.non_linear.items():
+            h.update(f"{n} {nl['multiplicative']} {_describe_function(nl['function'])}".encode())
+            h.update(np.ascontiguousarray(self.data[n]['N'], float).tobytes())
         return h.hexdigest()
 
     def _juliet_files(self):
@@ -329,7 +642,15 @@ class BroadbandFit:
         rec = dict(fingerprint=self.fingerprint(), sampler=sampler,
                    fit_kwargs={k: repr(v) for k, v in fit_kwargs.items()},
                    ld_laws=self._ld_string(), added_priors=self.added, ramp=self.ramp,
-                   supersample=self.supersample,
+                   model_options={k: fit_kwargs[k] for k in _MODEL_OPTIONS
+                                  if isinstance(fit_kwargs.get(k), (bool, int, float))},
+                   rvs={n: int(v['t'].size) for n, v in self.rvs.items()},
+                   supersample=self.supersample, groups=self.groups, aliases=self.aliases,
+                   non_linear={n: dict(zip(('function', 'source'), _describe_function(nl['function'])),
+                                       multiplicative=nl['multiplicative'],
+                                       regressor=nl['regressor'] if isinstance(nl['regressor'], list)
+                                       else 'array')
+                               for n, nl in self.non_linear.items()},
                    datasets={n: dict(n_fit=int(self.data[n]['t'].size),
                                      n_input=int(self.data[n]['nint_input']),
                                      linear=self.data[n]['labels'],
@@ -343,6 +664,9 @@ class BroadbandFit:
                              for n in self.names})
         if extra:
             rec.update(extra)
+        if self.non_linear:                    # juliet does not save the regressors
+            np.savez(os.path.join(self.out_folder, 'jstark_nonlinear.npz'),
+                     **{n: self.data[n]['N'] for n in self.non_linear})
         with open(os.path.join(self.out_folder, 'jstark_fit.json'), 'w') as f:
             json.dump(rec, f, indent=1, default=str)
 
@@ -358,9 +682,13 @@ class BroadbandFit:
         e = {n: d['e'] for n, d in self.data.items()}
         lin = {n: d['X'] for n, d in self.data.items() if d['X'].shape[1] > 0} or None
         gp = {n: d['G'] for n, d in self.data.items() if 'G' in d} or None
-        nlf = {n: dict(function=ExpRamp(n, self.ramp[n]), regressor=self.data[n]['ramp_x'],
-                       multiplicative=True) for n in self.names if self.ramp[n]}
-        self.dataset = juliet.load(priors=self.priors, t_lc=t, y_lc=y, yerr_lc=e,
+        nlf = self._non_linear_functions()
+        rv = {}
+        if self.rvs:
+            rv = dict(t_rv={n: v['t'] for n, v in self.rvs.items()},
+                      y_rv={n: v['rv'] for n, v in self.rvs.items()},
+                      yerr_rv={n: v['err'] for n, v in self.rvs.items()})
+        self.dataset = juliet.load(priors=self.priors, t_lc=t, y_lc=y, yerr_lc=e, **rv,
                                    linear_regressors_lc=lin, GP_regressors_lc=gp,
                                    out_folder=self.out_folder, ld_laws=self._ld_string(),
                                    non_linear_functions=nlf, verbose=False,
@@ -393,6 +721,18 @@ class BroadbandFit:
         juliet.fit
         """
         self._check_eclipse_timing(fit_kwargs)
+        if self.rvs:
+            # reference time of RV trends
+            tr = np.concatenate([v['t'] for v in self.rvs.values()])
+            fit_kwargs.setdefault('ta', float(0.5 * (tr.min() + tr.max())))
+        if (fit_kwargs.get('nthreads') or 1) > 1:
+            for n, nl in self.non_linear.items():
+                try:
+                    pickle.dumps(nl['function'])
+                except Exception as exc:
+                    raise ValueError(f'The non-linear function of {n} cannot be sent to other processes '
+                                     f'(nthreads > 1): define it at the top level of a module or script '
+                                     f'({exc}).') from exc
         self._check_folder(overwrite)
         self.load_juliet()
         self._write_json(sampler, fit_kwargs)
@@ -448,8 +788,11 @@ class BroadbandFit:
                     'light_travel_delay=True, stellar_radius=<R*/Rsun>.')
 
     @classmethod
-    def load(cls, out_folder, verbose=False):
+    def load(cls, out_folder, verbose=False, non_linear=None):
         """Reload a finished fit from its folder (no data objects needed).
+
+        A fit with non-linear functions needs them again (only their source
+        text is stored, for reference): ``non_linear={dataset: function}``.
 
         Returns an object with ``dataset``, ``results`` and the
         result methods (:meth:`summary`, :meth:`diagnostics`, :meth:`plots`,
@@ -464,6 +807,11 @@ class BroadbandFit:
         self.datasets, self.data = None, None
         self.sampler = rec['sampler']
         self.ramp = rec.get('ramp', {})
+        self.groups, self.aliases = rec.get('groups') or {}, rec.get('aliases') or {}
+        functions = cls._reload_non_linear(rec, non_linear, self.groups)
+        self.non_linear = {}
+        with open(os.path.join(out_folder, 'priors.dat')) as f:
+            priors = [line.split()[0] for line in f if line.strip() and line.strip()[0] != '#']
         nlf = {}
         if any(self.ramp.values()):
             # juliet does not store non-linear functions: rebuild the ramps from lc.dat
@@ -473,8 +821,19 @@ class BroadbandFit:
             for n, k in self.ramp.items():
                 if k:
                     tn = tl[inst == n]
-                    nlf[n] = dict(function=ExpRamp(n, k), regressor=tn - tn.min(),
+                    nlf[n] = dict(function=ExpRamp(n, k, priors), regressor=tn - tn.min(),
                                   multiplicative=True)
+        if functions:
+            with np.load(os.path.join(out_folder, 'jstark_nonlinear.npz')) as z:
+                for n, f in functions.items():
+                    mult, x = rec['non_linear'][n]['multiplicative'], z[n]
+                    ramp = nlf.get(n)
+                    self.non_linear[n] = dict(function=f, multiplicative=mult,
+                                              regressor=rec['non_linear'][n]['regressor'])
+                    nlf[n] = dict(function=NonLinear(f, mult, ramp=ramp and ramp['function'],
+                                                     aliases=self.aliases),
+                                  regressor=x if ramp is None else (ramp['regressor'], x),
+                                  multiplicative=mult)
         self.supersample = {k: tuple(v) for k, v in rec.get('supersample', {}).items()}
         self.dataset = juliet.load(input_folder=out_folder, ld_laws=rec.get('ld_laws', 'quadratic'),
                                    non_linear_functions=nlf, verbose=False,
@@ -484,9 +843,41 @@ class BroadbandFit:
             self.dataset.nlm_lc_boolean[n] = True
         self.names = list(self.dataset.inames_lc)
         self.priors = self.dataset.priors
-        self.results = self.dataset.fit(sampler=rec['sampler'])
+        self.rv_names = list(self.dataset.inames_rv if rec.get('rvs') else [])
+        self.results = self.dataset.fit(sampler=rec['sampler'], **cls._model_options(rec))
         self.record = rec
         return self
+
+    @staticmethod
+    def _model_options(rec):
+        """juliet.fit options of a stored fit that change the model (e.g. light_travel_delay)."""
+        out = rec.get('model_options')
+        if out is None:                        # fits before 2026-11-23: only the repr of the options
+            out = {}
+            for k in _MODEL_OPTIONS:
+                try:
+                    v = ast.literal_eval(rec.get('fit_kwargs', {}).get(k, ''))
+                except (ValueError, SyntaxError):
+                    continue
+                if isinstance(v, (bool, int, float)):
+                    out[k] = v
+        return out
+
+    @staticmethod
+    def _reload_non_linear(rec, non_linear, groups):
+        """Functions of the stored fit ``{dataset: function}``, checked against the record."""
+        stored = rec.get('non_linear') or {}
+        given = expand_group_options(dict(non_linear or {}), groups)
+        given = {n: (f['function'] if isinstance(f, dict) else f) for n, f in given.items()}
+        if set(given) != set(stored):
+            raise ValueError('This fit has non-linear functions for the datasets '
+                             f'{sorted(stored)} (got {sorted(given)}): pass them as '
+                             'load(..., non_linear={dataset: function}).')
+        for n, f in given.items():
+            if list(_describe_function(f)) != [stored[n]['function'], stored[n]['source']]:
+                warnings.warn(f'The non-linear function of {n} differs from the one that was fitted '
+                              '(see jstark_fit.json).')
+        return given
 
     # ------------------------------------------------------------------
     # Results
@@ -502,8 +893,9 @@ class BroadbandFit:
         return self.results.posteriors['posterior_samples']
 
     def values(self, name):
-        """Posterior samples of ``name``, or its fixed value, or None."""
+        """Posterior samples of ``name`` (group names allowed), or its fixed value, or None."""
         post = self.posteriors
+        name = getattr(self, 'aliases', {}).get(name, name)
         if name in post:
             return np.asarray(post[name])
         p = self.priors.get(name)
@@ -562,11 +954,14 @@ class BroadbandFit:
                 a = rho_to_ar(rho, per)
             b = self.values(f'b_{pl}')
             if a is not None and b is not None and (np.size(a) > 1 or np.size(b) > 1):
-                ecc = self.values(f'ecc_{pl}')
-                om = self.values(f'omega_{pl}')
+                ecc, om = self._eccentricity(pl)
                 inc = b_to_inc(b, a, ecc=0. if ecc is None else ecc,
                                omega=90. if om is None else om)
                 rows.append((f'inc_{pl}', *q(inc), 'derived'))
+            if self.values(f'ecc_{pl}') is None:
+                for k, v in zip(('ecc', 'omega'), self._eccentricity(pl)):
+                    if np.size(v) > 1:
+                        rows.append((f'{k}_{pl}', *q(v), 'derived'))
         rows += self._phase_curve_rows(q)
         tab = Table(rows=rows, names=('name', 'median', 'err_plus', 'err_minus', 'kind'),
                     dtype=(str, float, float, float, str))
@@ -577,6 +972,61 @@ class BroadbandFit:
         tab.meta['sampler'] = self.sampler
         if save:
             tab.write(os.path.join(self.out_folder, 'jstark_summary.ecsv'), overwrite=True)
+        return tab
+
+    def _eccentricity(self, planet):
+        """Eccentricity and omega (degrees, stellar orbit) of a planet, whatever the
+        parametrisation; (None, None) if there is none."""
+        ecc, om = self.values(f'ecc_{planet}'), self.values(f'omega_{planet}')
+        if ecc is not None:
+            return ecc, om
+        for c, s, power in (('secosomega', 'sesinomega', 2), ('ecosomega', 'esinomega', 1)):
+            c, s = self.values(f'{c}_{planet}'), self.values(f'{s}_{planet}')
+            if c is not None and s is not None:
+                return np.sqrt(c ** 2 + s ** 2) ** power, np.degrees(np.arctan2(s, c))
+        return None, None
+
+    # ------------------------------------------------------------------
+    # Radial velocities
+    # ------------------------------------------------------------------
+    def rv_residuals(self, name, nsamples=1000):
+        """Radial velocities, median model and residuals of one RV instrument.
+
+        Returns a dict with ``t``, ``rv``, ``err``, ``model`` (offset, trend
+        and Keplerian orbits) and ``resid``.
+        """
+        self._require()
+        if name not in self.rv_names:
+            raise ValueError(f'No RV instrument {name!r} in this fit ({self.rv_names}).')
+        t, y, e = (np.asarray(getattr(self.dataset, k)[name])
+                   for k in ('times_rv', 'data_rv', 'errors_rv'))
+        m = np.asarray(self.results.rv.evaluate(name, nsamples=nsamples), float)
+        return dict(t=t, rv=y, err=e, model=m, resid=y - m)
+
+    def rv_diagnostics(self, save=True):
+        """Residuals of the radial velocities per instrument (in their unit, e.g. m/s).
+
+        Columns: number of points, offset ``mu``, rms of the residuals,
+        median error, fitted jitter ``sigma_w``, and the reduced chi2 of the
+        median model with the errors alone and with the jitter added.
+        Saved to ``<out_folder>/jstark_rv_diagnostics.ecsv``.
+        """
+        from astropy.table import Table
+        self._require()
+        if not self.rv_names:
+            raise ValueError('This fit has no radial velocities.')
+        rows = []
+        for n in self.rv_names:
+            r = self.rv_residuals(n)
+            sw = float(np.median(self.values(f'sigma_w_{n}')))
+            rows.append([n, r['t'].size, float(np.median(self.values(f'mu_{n}'))),
+                         np.std(r['resid']), np.median(r['err']), sw,
+                         np.mean((r['resid'] / r['err']) ** 2),
+                         np.mean(r['resid'] ** 2 / (r['err'] ** 2 + sw ** 2))])
+        tab = Table(rows=rows, names=['instrument', 'n', 'mu', 'rms', 'err', 'sigma_w',
+                                      'chi2_err', 'chi2_total'])
+        if save:
+            tab.write(os.path.join(self.out_folder, 'jstark_rv_diagnostics.ecsv'), overwrite=True)
         return tab
 
     def phase_curve(self, suffix='_p1'):
@@ -742,9 +1192,11 @@ class BroadbandFit:
         """:class:`jstark.fitting.plots.julietPlots` for this fit."""
         from .plots import julietPlots
         self._require()
-        return julietPlots(input_folder=self.out_folder, dataset=self.dataset, res=self.results, N=N, **kwargs)
+        pl = julietPlots(input_folder=self.out_folder, dataset=self.dataset, res=self.results, N=N, **kwargs)
+        pl.groups, pl.fit = getattr(self, 'groups', {}), self
+        return pl
 
-    def channel_priors(self, fix=_PLANET_GEOMETRY, mode='fixed', planet=None):
+    def channel_priors(self, fix=_PLANET_GEOMETRY, mode='fixed', planet=None, datasets=None):
         """Priors for spectroscopic channels from this fit.
 
         Parameters
@@ -763,6 +1215,12 @@ class BroadbandFit:
         planet : str or None
             Only this planet's parameters (e.g. ``'p1'``); default all.
             Dataset parameters (GP, ramp, ...) are not affected.
+        datasets : sequence or None
+            Only parameters that apply to these datasets (or groups), e.g.
+            the JWST datasets of a joint fit with other observatories that
+            go into a :class:`SpectroscopicFit`. Names shared with other
+            datasets are shortened (``GP_rho_V1_TESS51`` becomes
+            ``GP_rho_V1``). Default all.
 
         Returns
         -------
@@ -786,4 +1244,14 @@ class BroadbandFit:
                           else ('normal', [float(np.median(v)), float(np.std(v))]))
             else:
                 out[k] = (p['distribution'], p['hyperparameters'])
+        if datasets is not None:
+            from .spectroscopic import restrict_priors
+            groups = getattr(self, 'groups', {})
+            keep = [m for d in _as_list(datasets) for m in groups.get(d, [d])]
+            unknown = [d for d in keep if d not in self.names]
+            if unknown:
+                raise ValueError(f'Unknown dataset(s) {unknown}; datasets are {list(self.names)}.')
+            rv = list(getattr(self, 'rv_names', []))
+            out = {k: v for k, v in restrict_priors(out, keep, list(self.names) + rv).items()
+                   if k.split('_')[0] not in ('K', 'rv')}
         return out

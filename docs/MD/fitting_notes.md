@@ -1,6 +1,6 @@
 # jstark light-curve fitting: development notes
 
-As of 2026-11-20. The record of what was discussed, decided, implemented
+As of 2026-11-23. The record of what was discussed, decided, implemented
 and measured while building the light-curve fitting stage of jstark
 (`jstark/fitting/`), for anyone continuing the work, including future work
 sessions. The code and its docstrings remain the reference for details;
@@ -45,7 +45,7 @@ one: `docs/detector_processing_notes.md` and `docs/extraction_notes.md`.
 | --- | --- |
 | `lightcurve.py` | `LightCurves` (one dataset): `from_spectra`, `from_photometry`, `white_light` (sum), `select_channels`, `bin` (sum), `exclude`, `outliers`/`clip`, `add_regressor` (also per channel), `regressor`, `design_matrix` (standardised); built-ins `time`, `time2`, `time3`, `phase4`; `check_name`, `as_lightcurves`, `MIRI_PIVOT` |
 | `priors.py` | `normalise_priors` (short form, juliet dict or prior file), `build_priors` (adds nuisance priors), `model_report` (what juliet will fit per dataset), `covers`, `GP_KERNELS`, `priors_to_text` |
-| `fit.py` | `BroadbandFit`, `ExpRamp`, `red_noise_beta` |
+| `fit.py` | `BroadbandFit`, `ExpRamp`, `NonLinear`, `red_noise_beta` |
 | `spectroscopic.py` | `SpectroscopicFit` (one `BroadbandFit` per wavelength bin, parallel, resumable), `Spectrum` (astropy `Table` subclass), `make_bins`, `restrict_priors` |
 | `plots.py` | `julietPlots` (moved from `jstark.py`, fixed) |
 | `utils.py` | helpers moved from `jstark/utils.py`: `t14`, `b_to_inc`, `inc_to_b`, `rho_to_ar`, `lcbin`, `pipe_mad`, `rms`, `fake_allan_deviation`, `corner_plot`, `make_psd`, `psd_fitting_kernel`, `planck_func`, `BrightnessTemperatureCalculator` |
@@ -1325,6 +1325,96 @@ numbers: `Outputs/comparison/spectrum_bins_scale1.png/.json`.
   underestimated errors here. At R100 the two error sets agree (0.98-1.00).
   Not followed up.
 
+### 5.9 Other observatories and radial velocities in `BroadbandFit` (2026-11-23)
+
+**Decisions (2026-11-22/23).** No TESS or CHEOPS readers and no downloads:
+the user prepares the data, `LightCurves.from_table` reads them. Roles of
+regressors (linear, GP, non-linear) are decided in `BroadbandFit` as before.
+`groups` is optional. RVs in a basic version (no GP, no linear regressors).
+TTVs left out. `SpectroscopicFit` is not changed. Validation on WASP-39 b
+only. Phase-folded plots are not changed: `instruments=` selects one bandpass
+and kind of event (checked on a TESS transit + eclipse-only fit; only
+`one_plot=False` without `instruments` puts an eclipse in a transit window).
+
+**Implementation.**
+- `LightCurves.from_table`, `around`, `clip(protect=)`; `check_bjd` (error in
+  `BroadbandFit` for times that are not full JD; BTJD was accepted silently
+  before). `clip` is unchanged by default but warns: 31 integrations of 30
+  min removed all 35 in-transit points of a synthetic TESS sector.
+- `groups`: `check_groups`, `expand_group_priors` (a group in a prior name is
+  one shared parameter; overlaps and transit times refused),
+  `expand_group_options` (per-dataset options; `nuisance` full names go to
+  every member). Same fingerprint as the full names.
+- `non_linear`: `NonLinear` wraps the user function (ramp x function when
+  multiplicative; juliet has one function per dataset; additive + ramp
+  refused; aliases for group names). Called once at construction with prior
+  centres. Fingerprint: source text, simple state, regressor values.
+  Regressors saved in `jstark_nonlinear.npz`; `load(non_linear=)` needs the
+  functions. Planet-only plots switch the functions off
+  (`_without_non_linear`).
+- `ExpRamp` finds parameters shared by several datasets (`ramptau_V1_V2`
+  would have failed in juliet with a KeyError).
+- `stray_priors` warning. juliet ignores priors of absent datasets (ten kinds
+  tested, free and fixed: Rp/R* unchanged); free ones are unused dimensions and
+  prior-only `Spectrum` columns. Not dropped, to keep fingerprints.
+  `channel_priors(datasets=)` leaves them out.
+- `supersample=(n, exposure time)`; warning for points of >= ~10 min.
+- `rvs`: passed to juliet as `t_rv`, ...; `mu` and `sigma_w` priors added,
+  `rv_intercept` fixed to 0 with a trend, `ta` = middle of the RV times;
+  `rv_residuals`, `rv_diagnostics`, `julietPlots.plot_rv`; `radvel` added to
+  the `fitting` extra. `summary` derives `ecc`, `omega` for all
+  parametrisations, and the inclination now uses them (with
+  `secosomega`/`sesinomega` it assumed e = 0).
+- `BroadbandFit.load` failed (KeyError `t_secondary_p1`) for fits made with
+  `light_travel_delay=True`: the options that change the model are now stored
+  (`model_options`; older records are parsed) and passed on.
+
+**Checks.** 13 new tests; the fingerprint of a deterministic fit is pinned to the
+value of the 2026-11-22 code, and the G395H white-light fits and 59 R100 bins
+still match their stored fingerprints. Noise-free RVs: juliet's model within
+0.03 m/s of a sine; eccentric two-planet RVs recovered (truth from an
+independent Kepler solver). CHEOPS `BJD_TIME` (DRP, PIPE) is BJD_TDB to 0.01 s
+(recomputed with astropy), `MJD_TIME` is TT.
+Synthetic NRS1 + NRS2 + 2 TESS sectors + CHEOPS: 33-37 free parameters, 6-9
+min on 4 processes (static dynesty, rwalk), recovered within 2.2 sigma.
+
+**WASP-39 b** (`Outputs/scripts/fit_joint_g395h_tess_rv.py`,
+`compare_joint.py`; `NRSG395H/Outputs/joint/`). A: jstark NRS1 + NRS2 (data and
+systematics of 5.8); B: + TESS 51 and 91 (SPOC PDCSAP 2 min, quality 0, +-0.35
+d around 3 + 5 transits, Matern GP in time with shared hyperparameters); C: +
+the ERS RVs (CORALIE 9, SOPHIE 8). ERS priors on the orbit and RVs. Dynamic
+dynesty, rwalk, 8 processes: 150 / 532 / 617 s (20 / 29 / 34 parameters).
+Reference: the ERS joint fit (all JWST modes, TESS 51, NGTS, RVs). The data
+overlap, so differences in combined sigma are only indicative.
+
+| | ERS joint | A | B | C |
+| --- | --- | --- | --- | --- |
+| P (d) | 4.0552843 +- 36e-7 | prior (7e-4) | 4.0552770 +- 9e-7 | 4.0552770 +- 9e-7 |
+| t0 - 2459791.612 (d) | 68.4e-6 +- 9 | 63e-6 +- 14 | 62e-6 +- 14 | 61e-6 +- 13 |
+| a/R* | 11.390 +- 0.012 | 11.411 +- 0.019 | 11.411 +- 0.019 | 11.410 +- 0.019 |
+| b | 0.4498 +- 0.0022 | 0.4466 +- 0.0038 | 0.4467 +- 0.0037 | 0.4468 +- 0.0037 |
+| Rp/R* NRS1 | 0.14613 +- 0.00010 | 0.14620 +- 0.00013 | 0.14621 +- 0.00012 | 0.14621 +- 0.00013 |
+| Rp/R* NRS2 | 0.14678 +- 0.00011 | 0.14683 +- 0.00014 | 0.14683 +- 0.00014 | 0.14684 +- 0.00014 |
+| Rp/R* TESS | 0.14364 +- 0.00071 | | 0.14363 +- 0.00072 | 0.14365 +- 0.00071 |
+| K (m/s) | 36.2 +- 4.4 | | | 36.8 +- 5.4 |
+
+- Geometry, depths, limb darkening and RV terms agree within 1 sigma. TESS
+  and the RVs do not change the geometry (A = B = C): JWST sets it; TESS adds P
+  and its own depth.
+- **K error**: ours is larger than ERS's for the same RVs; an independent
+  emcee fit of the RVs alone gives 36.6 +- 5.3. Why ERS's is smaller is not known.
+- **P is 2.0 sigma below ERS**, and 3.6 sigma below Kokori et al. (2023;
+  4.05528043 +- 3.2e-7, consistent with their T0 and our t0). It comes from the
+  sector 91 transits. `check_tess_times.py` (per-transit times on a grid, linear
+  baseline, no GP) gives the same: 4.0552768 +- 9e-7, so it is in the data as
+  we used them and not from the joint fit. The sector 91 times scatter more than
+  their errors (chi2 14.4 for 4; epoch 246 is 283 s early against the ERS
+  ephemeris, epoch 247 78 s), although transits injected out of transit scatter
+  as the errors say (36 vs 38 s). Not explained; the quoted error on P is
+  probably too small by about the square root of 14.4 / 4 (1.9).
+- The GP timescale differs from ERS (0.51 vs 1.56 d, 2 sigma): other data
+  (sector 91, only the windows around transits).
+
 ## 6. Open issues and next steps
 
 - [x] Phase 2: `SpectroscopicFit` (per bin, all datasets covering it,
@@ -1368,6 +1458,10 @@ numbers: `Outputs/comparison/spectrum_bins_scale1.png/.json`.
       -219) at no cost in errors.
 - [x] `SpectroscopicFit.run(bins=...)`: bins without data are now skipped
       with a message instead of raising.
+- [x] Joint fits with other observatories and RVs (5.9).
+- [ ] WASP-39 b sector 91: transit times scatter more than their errors (5.9).
+- [ ] TTVs: `channel_priors` would need P and t0 derived from the `T_`
+      parametrisation. GPs and linear regressors on RVs.
 - [ ] Report the juliet `non_linear_functions` / `input_folder` bug.
 - [ ] `phase_folded_lc` y-limits: include the binned data (low-S/N
       eclipses).

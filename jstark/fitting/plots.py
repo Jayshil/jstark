@@ -4,6 +4,7 @@ noise versus bin size and corner plots.
 ``julietPlots`` was moved here from ``jstark/jstark.py``.
 """
 import os
+import re
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -11,7 +12,7 @@ import matplotlib.gridspec as gd
 from scipy.interpolate import interp1d
 import juliet
 
-from ..plotting import styled
+from ..plotting import styled, INK2, MUTED, PALETTE, WIDTH
 from .utils import t14, inc_to_b, rho_to_ar, pipe_mad, lcbin, fake_allan_deviation, corner_plot
 
 __all__ = ['julietPlots']
@@ -132,13 +133,18 @@ class julietPlots(object):
         x = np.asarray(self._gp[instrument])
         return x if x.ndim == 1 else x[:, 0]
 
+    #: The :class:`BroadbandFit` the plots belong to (for :meth:`plot_rv`)
+    fit = None
+    #: Dataset groups of the fit (:class:`BroadbandFit`), accepted wherever instruments are given
+    groups = {}
+
     def _instruments(self, instruments):
-        """List of instrument names (None: all; a single name is accepted)."""
+        """List of instrument names (None: all; a single name or a group is accepted)."""
         if instruments is None:
             return list(self.dataset.inames_lc)
         if isinstance(instruments, str):
-            return [instruments]
-        return list(instruments)
+            instruments = [instruments]
+        return [m for i in instruments for m in self.groups.get(i, [i])]
 
     def _samples(self, prefix, instrument, default):
         """Posterior samples of an instrument parameter (``prefix_..._instrument``), its fixed
@@ -348,6 +354,114 @@ class julietPlots(object):
         
         return all_fig, all_axs1, all_axs2
     
+    @styled
+    def plot_rv(self, nrandom=300, save=False):
+        """Radial velocities: time series, and phase-folded orbit of every planet.
+
+        Offsets are subtracted; the folded panels also have the trend and the
+        other planets subtracted (all at the posterior medians). Errors
+        include the jitter. Lines are the median model, bands its 68%
+        interval. Phase 0 is the transit (conjunction).
+
+        Parameters
+        ----------
+        nrandom : int
+            Posterior samples for the models.
+        save : bool
+            Save the figure as ``<input_folder>/rv.png``.
+
+        Returns
+        -------
+        fig, axes : matplotlib figure and the array of axes (first row data
+            and models, second row residuals; first column the time series).
+        """
+        import radvel
+        if self.fit is None or not self.fit.rv_names:
+            raise ValueError('No radial velocities: use BroadbandFit(..., rvs=...).plots().plot_rv().')
+        fit = self.fit
+        post = self.res.posteriors['posterior_samples']
+        nall = max(np.size(v) for k, v in post.items() if k != 'unnamed' and np.ndim(v) == 1)
+        idx = np.random.default_rng(0).choice(nall, size=min(int(nrandom), nall), replace=False)
+
+        def get(name, default=0.):
+            v = fit.values(name)
+            v = np.full(1, default) if v is None else np.asarray(v, float)
+            return v[idx] if v.size == nall else np.full(idx.size, v[0])
+
+        planets = sorted(k.split('_')[1] for k in self.dataset.priors if re.fullmatch(r'K_p\d+', k))
+        par = {}
+        for pl in planets:
+            e, w = fit._eccentricity(pl)
+            e, w = (np.full(idx.size, d) if x is None else (x[idx] if np.size(x) == nall
+                    else np.full(idx.size, np.ravel(x)[0])) for x, d in ((e, 0.), (w, 90.)))
+            par[pl] = [get(f'P_{pl}'), get(f't0_{pl}'), e, np.radians(w), get(f'K_{pl}')]
+
+        def orbit(pl, t):
+            out = np.empty((idx.size, t.size))
+            for i, (P, t0, e, w, K) in enumerate(zip(*par[pl])):
+                tp = radvel.orbit.timetrans_to_timeperi(t0, P, e, w)
+                out[i] = radvel.kepler.rv_drive(t, np.array([P, tp, e, w, K]))
+            return out
+
+        ta = getattr(self.res, 'ta', None)
+        ta = fit.results.rv.ta if ta is None else ta
+
+        def trend(t):
+            d = t[None, :] - ta
+            return get('rv_intercept')[:, None] + get('rv_slope')[:, None] * d \
+                + get('rv_quad')[:, None] * d ** 2
+
+        fig, axes = plt.subplots(2, 1 + len(planets), figsize=(WIDTH, 4.6), sharex='col', sharey='row',
+                                 gridspec_kw=dict(height_ratios=[2, 1], hspace=0.08, wspace=0.1),
+                                 squeeze=False)
+        data = {n: fit.rv_residuals(n) for n in fit.rv_names}
+        allt = np.concatenate([r['t'] for r in data.values()])
+        tref = np.floor(allt.min())
+        pad = 0.02 * max(np.ptp(allt), 1.)
+        per = min(np.median(par[pl][0]) for pl in planets)
+        ngrid = int(np.clip(30 * (np.ptp(allt) + 2 * pad) / per, 500, 6000))
+        tg = np.linspace(allt.min() - pad, allt.max() + pad, ngrid)
+        mod = np.median(trend(tg) + sum(orbit(pl, tg) for pl in planets), axis=0)
+        axes[0, 0].plot(tg - tref, mod, color=MUTED,
+                        lw=float(np.clip(1500. / ngrid, 0.5, 1.5)), alpha=0.8, zorder=1)
+        for j, pl in enumerate(planets, start=1):
+            ph = np.linspace(-0.5, 0.5, 301)
+            P, t0 = np.median(par[pl][0]), np.median(par[pl][1])
+            m = np.empty((idx.size, ph.size))
+            for i, (Pi, ti, e, w, K) in enumerate(zip(*par[pl])):
+                tp = radvel.orbit.timetrans_to_timeperi(ti, Pi, e, w)
+                m[i] = radvel.kepler.rv_drive(ti + ph * Pi, np.array([Pi, tp, e, w, K]))
+            lo, md, hi = np.percentile(m, [15.865, 50., 84.135], axis=0)
+            axes[0, j].fill_between(ph, lo, hi, color=MUTED, alpha=0.35, lw=0, zorder=1)
+            axes[0, j].plot(ph, md, color=INK2, lw=1.5, zorder=2)
+            axes[1, j].set_xlabel('Orbital phase')
+            axes[1, j].set_xticks([-0.4, -0.2, 0., 0.2, 0.4])
+            axes[0, j].set_xlim(-0.53, 0.53)
+            axes[0, j].text(0.97, 0.96, f'Planet {pl[1:]}', transform=axes[0, j].transAxes,
+                            ha='right', va='top')
+        for i, (n, r) in enumerate(data.items()):
+            mu = float(np.median(fit.values(f'mu_{n}')))
+            err = np.hypot(r['err'], float(np.median(fit.values(f'sigma_w_{n}'))))
+            kw = dict(fmt='osD^vPX*'[i % 8], color=PALETTE[i % len(PALETTE)], ms=5, elinewidth=1,
+                      mec='white', mew=0.6, zorder=5)
+            axes[0, 0].errorbar(r['t'] - tref, r['rv'] - mu, err, label=n, **kw)
+            axes[1, 0].errorbar(r['t'] - tref, r['resid'], err, **kw)
+            for j, pl in enumerate(planets, start=1):
+                P, t0 = np.median(par[pl][0]), np.median(par[pl][1])
+                x = (r['t'] - t0 + 0.5 * P) % P / P - 0.5
+                axes[0, j].errorbar(x, r['resid'] + np.median(orbit(pl, r['t']), axis=0), err, **kw)
+                axes[1, j].errorbar(x, r['resid'], err, **kw)
+        for ax in axes[1]:
+            ax.axhline(0., color=MUTED, ls='--', lw=1, zorder=1)
+        axes[0, 0].set_ylabel('Radial velocity - offset')
+        axes[1, 0].set_ylabel('Residual')
+        axes[1, 0].set_xlabel(f'Time [BJD - {tref:.0f}]')
+        fig.legend(*axes[0, 0].get_legend_handles_labels(), loc='lower center',
+                   bbox_to_anchor=(0.5, 0.89), ncols=min(len(data), 5))
+        if save:
+            fig.savefig(os.path.join(self.input_folder, 'rv.png'), dpi=250)
+        return fig, axes
+
     def detrend_data(self, phmin, instruments, planet='p1'):
         """This function will generate detrended data from the raw data. It will also generate phases."""
         instruments = self._instruments(instruments)
@@ -439,6 +553,11 @@ class julietPlots(object):
 
     
     def detrend_model(self, instruments, phmin, highres, planet='p1'):
+        from .fit import _without_non_linear
+        with _without_non_linear(self.dataset):
+            self._detrend_model(instruments, phmin, highres, planet)
+
+    def _detrend_model(self, instruments, phmin, highres, planet='p1'):
         # If we want to create high-resolution model (highres=True), then we will use the same times for all instruments
         # If not, then we will use different times for different instruments
         instruments = self._instruments(instruments)

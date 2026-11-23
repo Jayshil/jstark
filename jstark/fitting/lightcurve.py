@@ -14,6 +14,7 @@ G395H visit, or one MIRI F1500W eclipse). It contains
 Several datasets are combined in a fit through a dict ``{name: LightCurves}``;
 the names become juliet instrument names.
 """
+import os
 import re
 import warnings
 
@@ -21,7 +22,7 @@ import numpy as np
 
 from ..reduction.robust import MAD_TO_SIGMA, running_median
 
-__all__ = ['LightCurves', 'as_lightcurves', 'check_name', 'MIRI_PIVOT']
+__all__ = ['LightCurves', 'as_lightcurves', 'check_name', 'check_bjd', 'MIRI_PIVOT']
 
 # Pivot wavelengths (micron) of the MIRI imaging filters
 MIRI_PIVOT = {'F560W': 5.635, 'F770W': 7.639, 'F1000W': 9.953, 'F1130W': 11.309,
@@ -55,6 +56,47 @@ def check_name(name):
         raise ValueError(f'Dataset name {name!r} clashes with a juliet parameter name; '
                          'choose another (e.g. "V1", "NRS1", "PRISM").')
     return name
+
+
+def check_bjd(times, name='dataset'):
+    """Raise ``ValueError`` unless all ``times`` are full (barycentric) Julian dates.
+
+    Only the zero point is checked (2400000-2500000, years 1858-2132); that
+    the times are barycentric and TDB is up to you (UTC differs by 69 s).
+    """
+    t = np.asarray(times, float)
+    t = t[np.isfinite(t)]
+    if t.size and t.min() > 2400000. and t.max() < 2500000.:
+        return
+    rng = f'{t.min():.6g} to {t.max():.6g}' if t.size else 'no finite value'
+    raise ValueError(f'Dataset {name}: the times ({rng}) are not full Julian dates. All datasets of '
+                     'a fit need BJD_TDB: add the missing offset (e.g. 2457000 for TESS BTJD, '
+                     '2454833 for Kepler BKJD, 2400000.5 for MJD), '
+                     'or use LightCurves.from_table(time_offset=...).')
+
+
+def _near_events(times, t0, per, half_width):
+    """True where ``times`` are within ``half_width`` of ``t0 + n * per`` (``per`` None: of ``t0``)."""
+    if not half_width > 0:
+        raise ValueError('half_width must be positive (days).')
+    if per is not None and not per > 0:
+        raise ValueError('The period must be positive (days).')
+    t = np.asarray(times, float)
+    near = np.zeros(t.shape, bool)
+    for c in np.atleast_1d(np.asarray(t0, float)):
+        d = t - c
+        if per is not None:
+            d = (d + 0.5 * per) % per - 0.5 * per
+        near |= np.abs(d) <= half_width
+    return near
+
+
+def _longest_run(mask):
+    """Length of the longest run of True."""
+    m = np.r_[False, np.asarray(mask, bool), False].astype(int)
+    d = np.diff(m)
+    runs = np.flatnonzero(d == -1) - np.flatnonzero(d == 1)
+    return int(runs.max()) if runs.size else 0
 
 
 class LightCurves:
@@ -201,6 +243,106 @@ class LightCurves:
         meta = dict(mode=mode, method=method, file=fname, exposure=hdr.get('EXPOSURE'))
         return cls(r.times + 2400000.5, r.flux[method], r.err[method], wavelength=wavelength,
                    regressors=regs, index=index, name=name, meta=meta)
+
+    @classmethod
+    def from_table(cls, table, time='time', flux='flux', err='err', regressors=None,
+                   time_offset=0., wavelength=None, name=None, meta=None, **read_kwargs):
+        """Light curve of any other observatory (TESS, CHEOPS, ground-based, ...) from a table.
+
+        Parameters
+        ----------
+        table : str, path or table
+            A file that ``astropy.table.Table.read`` can read (FITS, ECSV,
+            CSV, ...; anything else is read as text, with or without a
+            header line), an astropy ``Table``, a pandas ``DataFrame``, a
+            structured array or a dict of columns.
+        time, flux, err : str or int
+            Columns, by name or by number (e.g. 0, 1, 2 for a text file
+            without a header).
+        regressors : list, dict or None
+            Columns stored as regressors: a list of column names, or
+            ``{regressor name: column}``; a list of columns gives one
+            multi-column regressor (e.g. principal components, or a
+            multi-dimensional GP input). Use them in a fit by name
+            (``linear=``, ``gp=``).
+        time_offset : float
+            Added to the times (days), e.g. 2457000 for TESS BTJD. Fits need
+            BJD_TDB for every dataset.
+        wavelength : float or None
+            Effective wavelength (micron); only used for labels.
+        name : str or None
+            Default dataset name.
+        meta : dict or None
+            Free-form information, stored with the fit.
+        **read_kwargs
+            Passed to ``Table.read`` (``format=``, ``hdu=``, ...).
+
+        Returns
+        -------
+        LightCurves
+            One channel, sorted by time. Rows without a finite time, flux
+            and error (or with an error <= 0) are dropped; ``index`` is the
+            row number in the table. Apply quality flags before (filter the
+            table); rows with a NaN regressor are dropped by the fits that
+            use that regressor.
+
+        Examples
+        --------
+        >>> LightCurves.from_table('TESS51.dat', 0, 1, 2)
+        >>> LightCurves.from_table('visit.fits', 'BJD_TIME', 'FLUX', 'FLUXERR',
+        ...                        regressors={'roll': 'ROLL', 'bkg': 'BG', 'pca': ['U0', 'U1']})
+        """
+        from astropy.table import Table
+        fname = None
+        if isinstance(table, (str, os.PathLike)):
+            fname = os.fspath(table)
+            if not os.path.isfile(fname):
+                raise FileNotFoundError(fname)
+            table = _read_table(fname, read_kwargs)
+        elif read_kwargs:
+            raise TypeError(f'Unknown arguments {sorted(read_kwargs)} (read options need a file).')
+        elif type(table).__module__.split('.')[0] == 'pandas':
+            table = Table.from_pandas(table)
+        else:
+            table = Table(table)
+
+        def column(c):
+            if isinstance(c, (int, np.integer)) and not isinstance(c, bool):
+                if not -len(table.colnames) <= c < len(table.colnames):
+                    raise KeyError(f'Column {c}: the table has {len(table.colnames)} columns.')
+                c = table.colnames[c]
+            if c not in table.colnames:
+                raise KeyError(f'No column {c!r}; columns: {table.colnames}')
+            v = table[c]
+            try:
+                v = np.ma.filled(np.ma.asarray(v).astype(float), np.nan)
+            except (TypeError, ValueError):
+                raise ValueError(f'Column {c!r} is not numeric ({type(table[c]).__name__}).') from None
+            return np.asarray(v, float)
+
+        t, f, e = column(time) + float(time_offset), column(flux), column(err)
+        if any(v.ndim != 1 for v in (t, f, e)):
+            raise ValueError('Time, flux and error must be 1D columns.')
+        regs = {}
+        if regressors is not None:
+            if not isinstance(regressors, dict):
+                regressors = [regressors] if isinstance(regressors, (str, int)) else list(regressors)
+                regressors = {(c if isinstance(c, str) else table.colnames[c]): c for c in regressors}
+            for k, c in regressors.items():
+                regs[k] = (np.stack([column(x) for x in c], axis=1) if isinstance(c, (list, tuple))
+                           else column(c))
+        with np.errstate(invalid='ignore'):
+            ok = np.isfinite(t) & np.isfinite(f) & np.isfinite(e) & (e > 0)
+        if not ok.any():
+            raise ValueError('The table has no row with a finite time, flux and error.')
+        keep = np.flatnonzero(ok)
+        keep = keep[np.argsort(t[keep], kind='stable')]
+        meta = dict(meta or {}, n_dropped=int(t.size - keep.size))
+        if fname is not None:
+            meta.setdefault('file', fname)
+        return cls(t[keep], f[keep], e[keep], wavelength=wavelength,
+                   regressors={k: v[keep] for k, v in regs.items()}, index=keep, name=name,
+                   meta=meta)
 
     # ------------------------------------------------------------------
     # Basic properties
@@ -566,6 +708,33 @@ class LightCurves:
                                                        n=int(drop.sum())))
         return lc
 
+    def around(self, t0, per, half_width):
+        """New object with only the integrations near the transits (or eclipses).
+
+        Long time series (e.g. TESS sectors) are mostly out of transit; a
+        fit needs only enough of it to fix the baseline.
+
+        Parameters
+        ----------
+        t0 : float or sequence
+            Time of an event (full BJD, as :attr:`times`); several values
+            (e.g. transit and eclipse) keep the data near any of them.
+        per : float or None
+            Period (days); ``None`` for single events.
+        half_width : float
+            Half-width of the kept window (days), e.g. 1.5 times T14.
+        """
+        keep = _near_events(self.times, t0, per, half_width)
+        if not keep.any():
+            raise ValueError(f'No integration within {half_width} d of an event '
+                             f'({self.name or "dataset"}: {self.times.min():.4f} - '
+                             f'{self.times.max():.4f}).')
+        lc = self.subset(keep)
+        lc.meta.setdefault('around', []).append(dict(
+            t0=np.atleast_1d(np.asarray(t0, float)).tolist(), per=per,
+            half_width=float(half_width), n=int(keep.sum())))
+        return lc
+
     @classmethod
     def concatenate(cls, lcs, name=None, common_channels=False):
         """Join consecutive exposures of one visit into one dataset.
@@ -732,14 +901,20 @@ class LightCurves:
         lc.meta['bin_time'] = dict(n=n, dt=dt, nbins=int(nb), exptime=float(np.median(span)))
         return lc
 
-    def outliers(self, nsigma=5., window=31, channel=None):
+    def outliers(self, nsigma=5., window=31, channel=None, protect=None):
         """Mask of outlying integrations in the white light (or one channel).
 
         An integration is an outlier when it deviates from the running
         median of ``window`` integrations by more than ``nsigma`` robust
         standard deviations of the point-to-point-free residuals. The window
         must be short compared with the transit or eclipse ingress so that
-        the running median follows the event.
+        the running median follows the event; this fails for long cadences
+        (31 integrations of 30 min are 15 h, and whole transits become
+        outliers): use a short window or ``protect``.
+
+        ``protect=(t0, per, half_width)`` (days; ``per`` may be None; a list
+        of such tuples for several events) never flags integrations within
+        ``half_width`` of an event, unless they are NaN.
         """
         if channel is None:
             y, _ = self.white_light()
@@ -747,11 +922,30 @@ class LightCurves:
             y = self.flux[:, channel] / np.nanmedian(self.flux[:, channel])
         r = y - running_median(y, window)
         s = MAD_TO_SIGMA * np.nanmedian(np.abs(r - np.nanmedian(r)))
-        return ~np.isfinite(r) | (np.abs(r) > nsigma * s)
+        bad = np.abs(r) > nsigma * s
+        if protect is not None:
+            events = [protect] if np.isscalar(protect[0]) else list(protect)
+            for t0, per, half_width in events:
+                bad &= ~_near_events(self.times, t0, per, half_width)
+        return ~np.isfinite(r) | bad
 
-    def clip(self, nsigma=5., window=31, channel=None, verbose=True):
-        """New object without the outliers found by :meth:`outliers`."""
-        bad = self.outliers(nsigma, window, channel)
+    def clip(self, nsigma=5., window=31, channel=None, verbose=True, protect=None):
+        """New object without the outliers found by :meth:`outliers`.
+
+        Warns when several consecutive integrations, or a large part of the
+        dataset, are removed: that is rarely noise, and may be the transit
+        (see ``protect`` in :meth:`outliers`).
+        """
+        bad = self.outliers(nsigma, window, channel, protect)
+        good = self.good_channels() if channel is None else np.arange(self.nchan) == channel
+        real = bad & np.all(np.isfinite(self.flux[:, good]), axis=1)   # not just NaN
+        run = _longest_run(real[np.argsort(self.times, kind='stable')])
+        if run >= 3 or real.sum() > max(0.02 * self.nint, 3):
+            warnings.warn(f'{self.name or "LightCurves"}: clip removed {int(real.sum())} of '
+                          f'{self.nint} integrations (up to {run} consecutive ones). Check that '
+                          'these are not a transit or eclipse: the window '
+                          f'({window} integrations) must be short compared with the ingress; use '
+                          'a smaller window or protect=(t0, per, half_width).')
         if verbose:
             print(f'{self.name or "LightCurves"}: removed {int(bad.sum())} of {self.nint} '
                   f'integrations (> {nsigma} sigma from a {window}-integration running median)')
@@ -759,6 +953,29 @@ class LightCurves:
         lc.meta.setdefault('clipped', []).append(dict(nsigma=nsigma, window=window,
                                                       n=int(bad.sum())))
         return lc
+
+
+def _is_number(x):
+    try:
+        float(x)
+    except ValueError:
+        return False
+    return True
+
+
+def _read_table(fname, read_kwargs):
+    """``Table.read``, with text guessing for unknown file types and headerless files."""
+    from astropy.io.registry import IORegistryError
+    from astropy.table import Table
+    try:
+        table = Table.read(fname, **read_kwargs)
+        # a text file without a header read as one with a header: its first row became the names
+        if 'format' in read_kwargs or not all(_is_number(c) for c in table.colnames):
+            return table
+    except IORegistryError:
+        if 'format' in read_kwargs:
+            raise
+    return Table.read(fname, format='ascii', **read_kwargs)
 
 
 def as_lightcurves(obj, name=None):

@@ -30,6 +30,7 @@ fitting = [
     "juliet",
     "photutils",
     "corner",
+    "radvel",
 ]
 test = [
     "pytest",
