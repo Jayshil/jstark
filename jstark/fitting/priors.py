@@ -6,7 +6,7 @@ dataset needs and you did not give:
 
 * ``mdilution_<ds>``: fixed to 1;
 * ``mflux_<ds>``: normal(0, 0.1) (relative flux offset);
-* ``sigma_w_<ds>``: log-uniform(0.1, 1e5) ppm (extra white noise);
+* ``sigma_w_<ds>``: log-uniform(0.1, 1e4) ppm (extra white noise);
 * ``theta<i>_<ds>``: uniform(-1, 1) for each linear-regressor column
   (regressors are standardised, so ``theta`` is the flux change for a
   one-sigma change of the regressor);
@@ -56,7 +56,7 @@ GP_KERNELS = {
 DEFAULT_NUISANCE = {
     'mdilution': ('fixed', 1.0),
     'mflux': ('normal', [0.0, 0.1]),
-    'sigma_w': ('loguniform', [0.1, 1e5]),
+    'sigma_w': ('loguniform', [0.1, 1e4]),
     'theta': ('uniform', [-1.0, 1.0]),
 }
 

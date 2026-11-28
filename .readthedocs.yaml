@@ -18,3 +18,4 @@ python:
       extra_requirements:
         - docs
         - fitting     # jstark.fitting imports juliet; needed for its API pages
+        - jax         # jstark.fitting.jaxfit API pages

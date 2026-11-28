@@ -150,7 +150,7 @@ For every dataset, jstark adds what you did not give:
 =========================  ==========================================
 ``mdilution_<ds>``         fixed to 1
 ``mflux_<ds>``             normal(0, 0.1)
-``sigma_w_<ds>``           log-uniform(0.1, 1e5) ppm
+``sigma_w_<ds>``           log-uniform(0.1, 1e4) ppm
 ``theta<i>_<ds>``          uniform(-1, 1), one per linear column
 ``GP_*_<ds>``              broad priors for the chosen kernel
 ``ramp[2]amp/tau_<ds>``    uniform(-0.1, 0.1); log-uniform(2 cadences, duration)
@@ -158,6 +158,14 @@ For every dataset, jstark adds what you did not give:
 
 Change these defaults with ``nuisance={'sigma_w': ('loguniform', [1, 1e4]),
 'theta_V1': ...}`` or by giving the prior yourself.
+
+**Long ramps.** A ramp whose timescale is as long as the visit is almost a
+straight line, so it trades off against the flux offset and the linear
+time term. On faint eclipses this ridge makes ``tau`` (and through it the
+depth) sampler dependent: on GJ 3929 b, dynesty and NUTS gave depths up to
+2 sd apart. If the ``ramptau`` posterior runs up to the top of its prior,
+cap it below the visit length, e.g. ``'ramptau_V1': ('loguniform', [2 *
+cadence, 0.1])`` (in days). Your own prior replaces the default.
 
 **Limb darkening is never added.** In juliet a dataset gets a transit model
 only if a ``q1``/``u1``/``c1`` prior names it. Eclipse-only data need none;
@@ -271,6 +279,9 @@ Running the fit
 The default sampler is ``dynamic_dynesty``. Keyword arguments go to
 ``juliet.load.fit``: juliet's own options and any keyword of the sampler
 (juliet forwards the ones the sampler accepts).
+The sampler names ``'blackjax-nuts'``, ``'numpyro-nuts'`` and
+``'blackjax-nss'`` fit the same model with JAX instead (see `JAX samplers
+(optional)`_).
 
 Eclipse timing: with ``light_travel_delay=True`` juliet computes the eclipse
 time from ``t0``, ``ecc`` and ``omega`` (plus the light-travel time). To fit
@@ -574,3 +585,159 @@ Results:
 The ``Spectrum`` table has one row per finished bin, with every fitted or
 derived planet and limb-darkening parameter ``x`` as ``x``, ``x_errp`` and
 ``x_errm``; ``Spectrum.read('spectrum/spectrum.ecsv')`` reads it back.
+
+JAX samplers (optional)
+-----------------------
+
+jstark can fit the same model with JAX instead of juliet: NUTS (a
+gradient-based MCMC sampler) from `blackjax <https://blackjax-devs.github.io/blackjax/>`_
+or `numpyro <https://num.pyro.ai>`_, or blackjax's nested slice sampler for
+the evidence. Choose it by the sampler name; datasets, priors, systematics
+and every result method stay the same:
+
+::
+
+    fit.fit(sampler='blackjax-nuts')
+    fit.fit(sampler='numpyro-nuts', nchains=4, nwarmup=1000, nsamples=1000)
+    fit.fit(sampler='blackjax-nss', nlive=500)     # nested sampling: lnZ
+
+Install the extra packages (jax, jaxoplanet, blackjax, numpyro, tinygp)
+with ``pip install "jwstark[fitting,jax] @ git+https://github.com/Jayshil/jstark.git"``;
+for an NVIDIA GPU add ``pip install "jax[cuda12]"``. Importing the JAX
+backend switches JAX to double precision, which BJD times and ppm-level
+light curves need.
+
+**The model.** The JAX model reproduces juliet's: transits (every
+limb-darkening law and parametrisation), eclipses, the Cowan & Agol and
+sinusoidal phase curves, several planets, dilution, the flux offset, linear
+regressors, ramps, supersampling, the jitter, juliet's GP kernels (in
+`tinygp <https://tinygp.readthedocs.io>`_), radial velocities and the
+light-travel delay. On random parameter draws, transits with the quadratic
+and linear laws, eclipses and phase curves agree with juliet to better than
+0.1 ppm. The other laws differ from juliet's batman by 3-8 ppm, because
+batman integrates them less accurately (with a tighter batman tolerance
+they agree to 0.15 ppm). batman's exponential law is off by up to 30 ppm
+near the limb, where the JAX model is exact. TTVs, catwoman
+transits, Lambertian and kelp phase curves, juliet's global models, and
+GPs or linear models on radial velocities are not available (an error
+says so before fitting). Non-linear functions (``non_linear``) must be
+written with ``jax.numpy`` instead of ``numpy``, so that JAX can
+differentiate them.
+
+**How NUTS starts.** The posterior maximum is found from ``nstart`` (8)
+L-BFGS runs (from the prior centre and from prior draws). The chains start
+around it and sample in coordinates whitened by the Laplace approximation
+there, so that every parameter has a scale of about 1. Parameters are
+sampled in an unconstrained space (logit of uniform priors, and so on), so
+chains never hit a prior boundary.
+
+Options of the NUTS samplers (``blackjax-nuts``, ``numpyro-nuts``):
+
+==================  ==============  =====================================================
+``nchains``         4               chains (run together, vmapped)
+``nwarmup``         1000            warmup steps per chain (step size and mass matrix)
+``nsamples``        1000            draws per chain
+``target_accept``   0.9             raise to 0.95-0.99 if there are divergences
+``max_tree_depth``  10              up to 2^10 gradient evaluations per draw
+``dense_mass``      True            full mass matrix (correlated b, a/R*, Rp/R*, LD)
+``chain_method``    vectorized      ``'sequential'``: one chain after the other
+``init``            ``'map'``       ``'prior'`` (chains from prior draws), or ``{name: value}``
+``nstart``          8               optimiser starts for ``init='map'``
+``seed``            0
+``progress``        True
+==================  ==============  =====================================================
+
+``blackjax-nss``: ``nlive`` (500; juliet's ``n_live_points`` works too),
+``num_delete`` (``nlive / 10`` points replaced per step),
+``num_inner_steps`` (5 x dimension slice steps per new point), ``dlogz``
+(0.01), ``max_steps``, ``nsamples`` (posterior draws; default the effective
+sample size), ``seed``, ``progress``. juliet's model options ``pl``, ``pu``,
+``ecclim``, ``light_travel_delay``, ``stellar_radius`` and ``ta`` work with
+every JAX sampler; other juliet options are ignored with a warning.
+
+**Results.** ``fit.results`` is a :class:`~jstark.fitting.jaxfit.JaxResults`:
+
+::
+
+    res = fit.fit(sampler='blackjax-nuts')
+    print(res.report())       # times, R-hat, ESS, divergences, with warnings
+    res.diagnostics()         # per parameter: mean, sd, R-hat, bulk and tail ESS
+    res.chains('p_p1')        # (nchains, ndraws)
+
+``summary``, ``values``, ``diagnostics``, ``residuals``, ``plots``,
+``channel_priors`` and ``BroadbandFit.load`` work as for juliet fits, and
+compute every model with the JAX model. Check the report: R-hat below 1.01,
+an effective sample size (ESS) of at least 400 for every parameter, and no
+divergences; otherwise run longer (``nwarmup``, ``nsamples``), raise
+``target_accept``, or look at the priors. NUTS gives no evidence: for
+``lnZ`` use ``blackjax-nss`` or dynesty. The draws are saved in
+``jstark_jax_posteriors.npz`` and the diagnostics in
+``jstark_jax_diagnostics.ecsv``; a finished fit is loaded instead of
+re-run, as with juliet.
+
+**Spectroscopic fits** take the same sampler names:
+
+::
+
+    spec = sf.run(sampler='blackjax-nuts')               # one process
+    spec = sf.run(sampler='blackjax-nuts', nproc=4)      # CPU: 4 worker processes
+    spec = sf.run(sampler='blackjax-nuts', batch=64)     # GPU: 64 bins at once
+
+With ``blackjax-nuts`` all bins with the same model (datasets, parameters
+and prior types) share one compiled program, and each bin gets its own
+adaptation. ``batch`` is the number of bins vmapped at once. The default
+is all bins on a GPU, where they run in parallel, and 1 on a CPU: vmapped
+NUTS chains wait for the longest tree, so on a CPU the bins are faster one
+after the other inside the compiled program. One JAX process keeps only
+about 3 CPU cores busy, so on a CPU use ``nproc`` of 2-4 (each worker needs
+1-1.5 GB of memory; 12 R100 bins on 14 cores: 577 s with ``nproc=1``, 239 s
+with ``nproc=4``). On a GPU keep ``nproc=1``. With a JAX sampler,
+``run(nsamples=...)`` sets both the draws per chain and the number of draws
+for the saved median models.
+
+**Tests on real data** (dynesty, 500 live points, 8 processes, against
+``blackjax-nuts`` and ``numpyro-nuts`` on a 14-core Apple M4 Pro CPU):
+
+* WASP-39 b NIRSpec G395H white light curves and R = 100 spectra, the
+  WASP-43 b MIRI LRS phase curve, and a joint WASP-39 b fit with TESS and
+  radial velocities: posteriors agree with dynesty within 0.12 sd (widths
+  within ~8%).
+* Speed: about the same as 8-process dynesty for one fit (faster for small
+  fits, up to 1.6x slower for 40 parameters), on about a third of the CPU.
+  An R = 100 spectrum ran faster with dynesty's 8 processes. GPUs are
+  untested so far; see the benchmark below.
+
+**Limitations.**
+
+* NUTS explores one mode. The chains start at the posterior maximum and do
+  not jump between separated modes: for example, a free eclipse time on
+  faint eclipses, where each visit prefers its own time. R-hat flags chains
+  that end in different modes, but not all chains missing one. Check
+  multimodal problems with dynesty (``sample='rslice'``) or with starts in
+  each mode (``init={...}``).
+* Strong degeneracies mix slowly, and dynesty and NUTS can then weight them
+  differently. On faint MIRI eclipses (GJ 3929 b), ramps as long as the
+  visit traded off against the offset and slope (see Priors).
+* ``blackjax-nss`` is slow on a CPU (a 39-parameter fit needed an estimated
+  6 h), and its ``lnZ`` was ~1 lower than the exact value on a test
+  problem. Use dynesty for evidences for now.
+
+**GPU benchmark.** On a GPU machine, run::
+
+    python -m jstark.fitting.jaxfit.benchmark                 # all tests
+    python -m jstark.fitting.jaxfit.benchmark --quick         # smaller: ~5 min on a 14-core CPU
+    JAX_PLATFORMS=cpu python -m jstark.fitting.jaxfit.benchmark   # the same on its CPU
+
+It fits synthetic data (a transit with a ramp, two regressors and white
+noise), so nothing has to be downloaded, and times three things:
+
+* one log density and gradient for light curves of 1e3-1e5 points, alone
+  and vmapped over up to 1024 parameter vectors;
+* one white-light fit with each NUTS sampler (``--dynesty`` adds juliet for
+  reference);
+* a 64-bin spectroscopic fit for several ``batch`` sizes (``--nbins``,
+  ``--batches``).
+
+The timings, the device and the package versions are printed and saved to
+``jstark_jax_benchmark/benchmark_<backend>.json``. Consumer GPUs are much
+slower in double precision than data-centre GPUs (A100, H100).

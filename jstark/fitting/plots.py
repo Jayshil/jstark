@@ -1,7 +1,9 @@
-"""Plots of juliet fits: full models, phase-folded light curves, GP components,
-noise versus bin size and corner plots.
+"""Plots of light-curve fits: full models, phase-folded light curves, GP components,
+noise versus bin size, corner plots and radial velocities.
 
-``julietPlots`` was moved here from ``jstark/jstark.py``.
+The models come from the evaluator of the fit (:mod:`jstark.fitting.evaluators`):
+juliet's models for juliet fits, the JAX model for JAX fits. ``julietPlots`` was
+moved here from ``jstark/jstark.py``.
 """
 import os
 import re
@@ -9,11 +11,10 @@ import re
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gd
-from scipy.interpolate import interp1d
 import juliet
 
 from ..plotting import styled, INK2, MUTED, PALETTE, WIDTH
-from .utils import t14, inc_to_b, rho_to_ar, pipe_mad, lcbin, fake_allan_deviation, corner_plot
+from .utils import t14, pipe_mad, lcbin, fake_allan_deviation, corner_plot
 
 __all__ = ['julietPlots']
 
@@ -44,26 +45,27 @@ def _robust_ylim(ax, v, k=5.):
 
 
 class julietPlots(object):
-    """Plotting helper for results produced by a `juliet` analysis.
+    """Plots of a light-curve fit: full models, phase-folded light curves, GP
+    components, noise versus bin size, corner plots and radial velocities.
 
-    This class loads a `juliet` input/output folder, computes models from the
-    fitted posterior and provides a collection of convenience plotting and
-    data-processing methods for light-curve visualisation. Typical usage is
-    to instantiate the class with the `input_folder` used for a juliet fit
-    and then call plotting helpers such as :meth:`full_model_lc`,
-    :meth:`plot_gp` or :meth:`detrend_data`.
+    The models come from an evaluator (:mod:`jstark.fitting.evaluators`):
+    juliet's models for juliet fits, the JAX model for JAX fits
+    (:meth:`BroadbandFit.plots` picks it). Without one, the class loads a
+    juliet input/output folder (``input_folder``) or takes juliet's
+    ``dataset`` and ``res``.
 
     Attributes
     ----------
     input_folder : str, optional
-        Path to the juliet input/output folder provided at construction.
-        The user need to provide either input_folder or dataset and res
-    dataset : juliet.load object, optioanl
-        The object returned by ``juliet.load`` for the given input folder.
-    res : juliet.fit, optional
-        The result of calling ``dataset.fit(...)``.
+        Folder of the fit (where figures are saved).
+    dataset : juliet.load object, optional
+        juliet's dataset (juliet fits only).
+    res : juliet.fit or JaxResults, optional
+        Results of the fit.
     N : int
         Number of posterior samples drawn when evaluating sampled models.
+    evaluator : optional
+        Model interface of the fit (default: juliet's, from ``dataset`` and ``res``).
     **kwargs : dict, optional
         Any additional keywords provided to juliet.fit object.
 
@@ -71,62 +73,65 @@ class julietPlots(object):
     ------------
     full_model_lc(instruments=None, save=False, nrandom=50, quantile_models=True)
         Plot observed light curves with the full fitted model and residuals.
-    
+
     phase_folded_lc(phmin=0.8, instruments=None, highres=False, ...)
         Plot phase folder light curve with best-fitted planetary model for one or more instruments.
-    
+
     plot_gp(instruments=None, highres=False, one_plot=False, ...)
         Plot GP components and binned residuals for one or more instruments.
 
     plot_fake_allan_deviation(instruments=None, binmax=10, method='pipe', timeunit=None)
         Plot "allan deviation" plot, which is noise as a function of binning, for one or more instruments
-    
+
     plot_corner(planet_only=False, save=True)
         Plot corner plots for fitted posterior samples, can use planet-only or all parameters.
-    
+
+    plot_rv(nrandom=300, save=False)
+        Radial velocities and the phase-folded orbits (BroadbandFit with ``rvs``).
     """
-    def __init__(self, input_folder=None, dataset=None, res=None, N=1000, **kwargs):
-        # First order of business: loading the juliet folder
-        # We can optinally provide datasets and res directly
-
-        if ( dataset is None ) and ( input_folder is not None ):
-            self.dataset = juliet.load(input_folder=input_folder)
-            self.res = self.dataset.fit(**kwargs)
-        else:
-            self.dataset = dataset
-            self.res = res
-
-        # Saving those kwargs
+    def __init__(self, input_folder=None, dataset=None, res=None, N=1000, evaluator=None, **kwargs):
+        if evaluator is None:
+            if (dataset is None) and (input_folder is not None):
+                dataset = juliet.load(input_folder=input_folder)
+                res = dataset.fit(**kwargs)
+            from .evaluators import JulietEvaluator
+            evaluator = JulietEvaluator(dataset, res, fit_kwargs=kwargs)
+        self.ev = evaluator
+        self.dataset = getattr(evaluator, 'dataset', None)
+        self.res = evaluator.results
         self.fit_kwargs = kwargs
 
         # Location of the input folder (falls back to juliet's output folder)
         self.input_folder = input_folder if input_folder is not None else getattr(self.dataset, 'out_folder', None)
 
-        # juliet keeps these as None when no regressors were given
-        self._lm = self.dataset.lm_lc_arguments or {}
-        self._gp = self.dataset.GP_lc_arguments or {}
+        self.names = list(evaluator.names)
+        self.priors = evaluator.priors
+        self.times, self.flux, self.errs = {}, {}, {}
+        # linear and GP regressors of the datasets that have them
+        self._lm, self._gp = {}, {}
+        for n in self.names:
+            self.times[n], self.flux[n], self.errs[n] = evaluator.data(n)
+            reg = evaluator.regressors(n)
+            if reg['linear'] is not None:
+                self._lm[n] = reg['linear']
+            if reg['gp'] is not None:
+                self._gp[n] = reg['gp']
 
         # Number of samples
         self.nsamps = N
 
-        # Computing all models, for all instruments
-        self.models_all_ins = {}
-        self.all_mods_ins = {}
-        # Sorting indices for all instruments (sometimes GP regressors are not time -- in that case, times 
+        # Models of all datasets: lc_models[name] is the evaluator's dict; models_all_ins[name] is
+        # (samples, median, upper 68%, lower 68%, {'lm': median linear model})
+        self.lc_models, self.models_all_ins = {}, {}
+        # Sorting indices for all instruments (sometimes GP regressors are not time -- in that case, times
         # are sorted according to GP regressors, which will mess-up the time array -- we need to sort it again)
         self.idx_time_sort = {}
-        for i in range(len(self.dataset.inames_lc)):
-            # Evaluating the models
-            ## This will return 5 elements: model samples, median model, upper_CI, lower_CI, and components
-            self.models_all_ins[self.dataset.inames_lc[i]] =\
-                self.res.lc.evaluate(self.dataset.inames_lc[i], nsamples=self.nsamps, return_err=True,\
-                                     return_components=True, return_samples=True)
-
-            # Saving all models
-            self.all_mods_ins[self.dataset.inames_lc[i]] = self.res.lc.model[self.dataset.inames_lc[i]]
-
-            # Sorting array
-            self.idx_time_sort[self.dataset.inames_lc[i]] = np.argsort( self.dataset.times_lc[self.dataset.inames_lc[i]] )
+        for n in self.names:
+            m = evaluator.lc_models(n, nsamples=self.nsamps)
+            self.lc_models[n] = m
+            comp = {} if m['linear'] is None else {'lm': m['linear']}
+            self.models_all_ins[n] = (m['samples'], m['median'], m['upper'], m['lower'], comp)
+            self.idx_time_sort[n] = np.argsort(self.times[n])
 
     def _gpx(self, instrument):
         """First (or only) column of the GP regressor of an instrument."""
@@ -141,7 +146,7 @@ class julietPlots(object):
     def _instruments(self, instruments):
         """List of instrument names (None: all; a single name or a group is accepted)."""
         if instruments is None:
-            return list(self.dataset.inames_lc)
+            return list(self.names)
         if isinstance(instruments, str):
             instruments = [instruments]
         return [m for i in instruments for m in self.groups.get(i, [i])]
@@ -149,113 +154,38 @@ class julietPlots(object):
     def _samples(self, prefix, instrument, default):
         """Posterior samples of an instrument parameter (``prefix_..._instrument``), its fixed
         value, or ``default``."""
-        post = self.res.posteriors['posterior_samples']
+        post = self.ev.posteriors
         n = len(prefix.split('_'))
         for k in post:
             parts = k.split('_')
             if '_'.join(parts[:n]) == prefix and instrument in parts[n:]:
                 return np.asarray(post[k])
-        for k, v in self.dataset.priors.items():
+        for k, v in self.priors.items():
             parts = k.split('_')
             if '_'.join(parts[:n]) == prefix and instrument in parts[n:] and v['distribution'] == 'fixed':
                 return np.atleast_1d(float(np.atleast_1d(v['hyperparameters'])[0]))
         return np.atleast_1d(float(default))
 
     def _nlm(self, instrument):
-        """juliet non-linear model of an instrument at the posterior medians:
-        ``(values, multiplicative)``, or ``(None, False)`` if there is none."""
-        nlf = getattr(self.dataset, 'non_linear_functions', None) or {}
-        if instrument not in nlf:
-            return None, False
-        post = self.res.posteriors['posterior_samples']
-        pv = {k: np.nanmedian(v) for k, v in post.items() if np.ndim(v) == 1}
-        for k, v in self.dataset.priors.items():
-            if v['distribution'] == 'fixed' and k not in pv:
-                pv[k] = float(np.atleast_1d(v['hyperparameters'])[0])
-        f = nlf[instrument]
-        return np.asarray(f['function'](f['regressor'], pv)), bool(f.get('multiplicative', False))
+        """Non-linear model of an instrument at the posterior medians: ``(values,
+        multiplicative)``, or ``(None, False)`` if there is none."""
+        return self.ev.non_linear(instrument)
 
     def _pmed(self, name):
-        """Posterior median of a parameter, else its fixed prior value (KeyError if neither).
+        """Posterior median of a parameter, else its fixed prior value (KeyError if neither)."""
+        from .evaluators import median_or_fixed
+        return median_or_fixed(self.ev.posteriors, self.priors, name)
 
-        Fixed priors are preferred over batman's parameter objects: with a
-        ``t_secondary`` prior, batman shifts ``params.t0`` to the conjunction
-        implied by the eclipse time, which would hide an offset eclipse."""
-        post = self.res.posteriors['posterior_samples']
-        if name in post:
-            return np.nanmedian(post[name])
-        p = self.dataset.priors[name]
-        if p['distribution'] == 'fixed':
-            return float(np.atleast_1d(p['hyperparameters'])[0])
-        raise KeyError(name)
-
-    def _planet_only_samples(self):
-        """Posterior samples with the flux offsets, dilution, linear coefficients and GP set to 0,
-        and non-linear (e.g. ramp) models made neutral, so that only uncertainties of the planet
-        model propagate to the planet-only model."""
-        post = self.res.posteriors['posterior_samples'].copy()
-        for i in post.keys():
-            if ( i[0:5] == 'mflux' ) or ( i[0:9] == 'mdilution' ) or ( i[0:5] == 'theta' ) or ( i[0:2] == 'GP' ):
-                post[i] = np.zeros(len(post[i]))
-        nlf = getattr(self.dataset, 'non_linear_functions', None) or {}
-        for f in nlf.values():
-            neutral = getattr(f['function'], 'neutral', None)
-            if callable(neutral):
-                for k, v in neutral().items():
-                    if k in post:
-                        post[k] = np.full(len(post[k]), v)
-        return post
-
-    def highres_planet_models_workaround(self, instrument, times_highres, GP_reg_highres, lin_reg_highres):
-        """
-        The usual way of generating high time-resolution models
-        is not working with juliet when light_travel_delay=True for
-        occultations and phase curve modelling. This is a workaround for this."""
-        
-        # Creating dictionaries to save high-res times, fluxes, and errors
-        tim_highres, fl_highres, fle_highres = {}, {}, {}
-        ## Actual high-res time array
-        tim_highres[instrument] = times_highres
-        ## For flux and flux error highres array, we will simply use array with ones
-        fl_highres[instrument], fle_highres[instrument] = np.ones(len(times_highres)), np.ones(len(times_highres))
-
-        # GP and linear regressors would be arrays, so creating dictionaries to save them
-        if GP_reg_highres is not None:
-            gp_pars = {}
-            gp_pars[instrument] = GP_reg_highres
-        else:
-            gp_pars = None
-        
-        if lin_reg_highres is not None:
-            lin_pars = {}
-            lin_pars[instrument] = lin_reg_highres
-        else:
-            lin_pars = None
-
-        ## Again, running juliet.load and juliet.fit, in a scratch folder that holds a copy of the
-        ## posteriors (juliet then loads them instead of sampling, and the fit folder is untouched)
-        import glob, shutil, tempfile
-        tmp = tempfile.mkdtemp(prefix='jstark_highres_')
-        for f in glob.glob(os.path.join(self.dataset.out_folder, '*posteriors.pkl')):
-            shutil.copy(f, tmp)
-        fit_kwargs = dict(self.fit_kwargs)
-        fit_kwargs.setdefault('sampler', self.res.sampler)
-        for key in ('light_travel_delay', 'stellar_radius'):
-            if hasattr(self.res, key):
-                fit_kwargs.setdefault(key, getattr(self.res, key))
-        data_highres = juliet.load(priors=self.dataset.priors, t_lc=tim_highres, y_lc=fl_highres, yerr_lc=fle_highres,\
-                                   GP_regressors_lc=gp_pars, linear_regressors_lc=lin_pars, out_folder=tmp)
-        res_highres = data_highres.fit(**fit_kwargs)
-
-        post_samps_new = self._planet_only_samples()
-
-        planet_only_models_highres = \
-            res_highres.lc.evaluate(instrument, nsamples=self.nsamps, return_err=True, parameter_values=post_samps_new,\
-                                    return_components=True, return_samples=True, evaluate_transit=True)
-
-        shutil.rmtree(tmp, ignore_errors=True)
-        return planet_only_models_highres
-        
+    def _period_t0(self, planet, instrument):
+        """Period and time of transit of a planet (posterior medians, fixed values, or the
+        evaluator's orbit)."""
+        out = []
+        for k in ('P', 't0'):
+            try:
+                out.append(self._pmed(f'{k}_{planet}'))
+            except KeyError:
+                out.append(self.ev.orbit(planet, instrument)[k])
+        return tuple(out)
 
     @styled
     def full_model_lc(self, instruments=None, save=False, nrandom=50, quantile_models=True):
@@ -293,7 +223,7 @@ class julietPlots(object):
         -----
         The routine expects that ``self.models_all_ins`` was populated by
         a prior call (see the class constructor) and that the dataset
-        arrays (times, data, errors) are available in ``self.dataset``.
+        arrays (times, data, errors) are in ``self.times``, ``self.flux``, ``self.errs``.
         """
 
         # Computing the model for all instruments (None: all instruments)
@@ -302,9 +232,9 @@ class julietPlots(object):
         all_fig, all_axs1, all_axs2 = [], [], []
         for i in range(len(instruments)):
             # Data
-            tim_ins = self.dataset.times_lc[instruments[i]][self.idx_time_sort[instruments[i]]]
-            fl_ins = self.dataset.data_lc[instruments[i]][self.idx_time_sort[instruments[i]]]
-            fle_ins = self.dataset.errors_lc[instruments[i]][self.idx_time_sort[instruments[i]]]
+            tim_ins = self.times[instruments[i]][self.idx_time_sort[instruments[i]]]
+            fl_ins = self.flux[instruments[i]][self.idx_time_sort[instruments[i]]]
+            fle_ins = self.errs[instruments[i]][self.idx_time_sort[instruments[i]]]
 
             ## Median model
             full_model = self.models_all_ins[instruments[i]][1][self.idx_time_sort[instruments[i]]]
@@ -375,11 +305,10 @@ class julietPlots(object):
         fig, axes : matplotlib figure and the array of axes (first row data
             and models, second row residuals; first column the time series).
         """
-        import radvel
         if self.fit is None or not self.fit.rv_names:
             raise ValueError('No radial velocities: use BroadbandFit(..., rvs=...).plots().plot_rv().')
         fit = self.fit
-        post = self.res.posteriors['posterior_samples']
+        post = self.ev.posteriors
         nall = max(np.size(v) for k, v in post.items() if k != 'unnamed' and np.ndim(v) == 1)
         idx = np.random.default_rng(0).choice(nall, size=min(int(nrandom), nall), replace=False)
 
@@ -388,7 +317,7 @@ class julietPlots(object):
             v = np.full(1, default) if v is None else np.asarray(v, float)
             return v[idx] if v.size == nall else np.full(idx.size, v[0])
 
-        planets = sorted(k.split('_')[1] for k in self.dataset.priors if re.fullmatch(r'K_p\d+', k))
+        planets = sorted(k.split('_')[1] for k in self.priors if re.fullmatch(r'K_p\d+', k))
         par = {}
         for pl in planets:
             e, w = fit._eccentricity(pl)
@@ -397,14 +326,10 @@ class julietPlots(object):
             par[pl] = [get(f'P_{pl}'), get(f't0_{pl}'), e, np.radians(w), get(f'K_{pl}')]
 
         def orbit(pl, t):
-            out = np.empty((idx.size, t.size))
-            for i, (P, t0, e, w, K) in enumerate(zip(*par[pl])):
-                tp = radvel.orbit.timetrans_to_timeperi(t0, P, e, w)
-                out[i] = radvel.kepler.rv_drive(t, np.array([P, tp, e, w, K]))
-            return out
+            P, t0, e, w, K = par[pl]
+            return self.ev.keplerian(t, P, t0, e, w, K)
 
-        ta = getattr(self.res, 'ta', None)
-        ta = fit.results.rv.ta if ta is None else ta
+        ta = self.ev.rv_ta
 
         def trend(t):
             d = t[None, :] - ta
@@ -427,10 +352,8 @@ class julietPlots(object):
         for j, pl in enumerate(planets, start=1):
             ph = np.linspace(-0.5, 0.5, 301)
             P, t0 = np.median(par[pl][0]), np.median(par[pl][1])
-            m = np.empty((idx.size, ph.size))
-            for i, (Pi, ti, e, w, K) in enumerate(zip(*par[pl])):
-                tp = radvel.orbit.timetrans_to_timeperi(ti, Pi, e, w)
-                m[i] = radvel.kepler.rv_drive(ti + ph * Pi, np.array([Pi, tp, e, w, K]))
+            Pi, ti, e, w, K = par[pl]
+            m = self.ev.keplerian(ti[:, None] + ph[None, :] * Pi[:, None], Pi, ti, e, w, K)
             lo, md, hi = np.percentile(m, [15.865, 50., 84.135], axis=0)
             axes[0, j].fill_between(ph, lo, hi, color=MUTED, alpha=0.35, lw=0, zorder=1)
             axes[0, j].plot(ph, md, color=INK2, lw=1.5, zorder=2)
@@ -477,34 +400,11 @@ class julietPlots(object):
         self.F1, self.F2 = {}, {}
 
         for i in range(len(instruments)):
-            # -----------------------------------------
-            #  Our first task is to compute
-            #  period and t0:
-            # -----------------------------------------
-            try:
-                per = self._pmed('P_' + planet)
-            except Exception:
-                per = self.all_mods_ins[instruments[i]]['params'].per
-            
-            try:
-                t0 = self._pmed('t0_' + planet)
-            except Exception:
-                t0 = self.all_mods_ins[instruments[i]]['params'].t0
-            # -----------------------------------------
+            # Period and t0
+            per, t0 = self._period_t0(planet, instruments[i])
 
-            # -----------------------------------------
-            #  Next we would like to compute GP
-            #  and linear models, so that we can 
-            #  detrend the data
-            # -----------------------------------------
-            # GP model
-            if self._gp:
-                if instruments[i] in self._gp.keys():
-                    gp_model = self.all_mods_ins[instruments[i]]['GP']
-                else:
-                    gp_model = 0.
-            else:
-                gp_model = 0.
+            # GP model (GP prediction at the data) and linear model, to detrend the data
+            gp_model = self.lc_models[instruments[i]]['gp'] if instruments[i] in self._gp else 0.
 
             if instruments[i] in self._lm.keys():
                 linear_model = self.models_all_ins[instruments[i]][-1]['lm']
@@ -536,13 +436,13 @@ class julietPlots(object):
             ## Here we create detrended data by subtracting GP (if any) and linear (if any) models from the raw data
             ## (and removing a juliet non-linear model, if any: the full model is (T*F1 + F2 + LM) * NLM + GP)
             nlm, mult = self._nlm(instruments[i])
-            data_i = self.dataset.data_lc[instruments[i]] - gp_model
+            data_i = self.flux[instruments[i]] - gp_model
             if nlm is not None:
                 data_i = data_i / nlm if mult else data_i - nlm
             self.detrended_data[instruments[i]] = ( data_i - linear_model - F2) / F1 
-            self.detrended_errs[instruments[i]] = np.sqrt( self.dataset.errors_lc[instruments[i]]**2 + sigw**2 )
+            self.detrended_errs[instruments[i]] = np.sqrt( self.errs[instruments[i]]**2 + sigw**2 )
 
-            phases_instrument = juliet.utils.get_phases(self.dataset.times_lc[instruments[i]], P=per, t0=t0, phmin=phmin)
+            phases_instrument = juliet.utils.get_phases(self.times[instruments[i]], P=per, t0=t0, phmin=phmin)
             self.phase[instruments[i]] = phases_instrument
             
             # Computing the minimum and maximum of the orbital phases
@@ -553,116 +453,26 @@ class julietPlots(object):
 
     
     def detrend_model(self, instruments, phmin, highres, planet='p1'):
-        from .fit import _without_non_linear
-        with _without_non_linear(self.dataset):
-            self._detrend_model(instruments, phmin, highres, planet)
-
-    def _detrend_model(self, instruments, phmin, highres, planet='p1'):
-        # If we want to create high-resolution model (highres=True), then we will use the same times for all instruments
-        # If not, then we will use different times for different instruments
+        """Planet-only models (no dilution, offsets, systematics or GP; uncertainties of the
+        planet parameters only) at the data, or with ``highres`` at 10000 times over the
+        phases of the data (``self.planet_only_models``: samples, median, upper, lower)."""
         instruments = self._instruments(instruments)
         self.times_model, self.phases_model = {}, {}
-        self.planet_only_models = {} 
-        
-        # -----------------------------------------
-        #  Our first task is to compute
-        #  period and t0:
-        # -----------------------------------------
-        try:
-            per = self._pmed('P_' + planet)
-        except Exception:
-            per = self.all_mods_ins[instruments[0]]['params'].per
-        
-        try:
-            t0 = self._pmed('t0_' + planet)
-        except Exception:
-            t0 = self.all_mods_ins[instruments[0]]['params'].t0
-
-        # We also have to create a new posterior array since when we compute detrended model,
-        # we only want uncertainties from planetary parameters to be propagated to the model uncertainties
-        # So, we will make posteriors of mflux, theta, and GP to zero, such that any uncertainties
-        # in them would not propagate to model uncertainties.
-
-        post_samps_new = self._planet_only_samples()
-        
+        self.planet_only_models = {}
+        per, t0 = self._period_t0(planet, instruments[0])
         if highres:
-            ## First selecting the times
-            ## This this is a high time resolution scenario so we will create a dummy time array
-            dummy_phs_highres = np.linspace(self.ph_minimum, self.ph_maximum, 10000)
-            dummy_time_highres = t0 + (dummy_phs_highres * per)
+            phs = np.linspace(self.ph_minimum, self.ph_maximum, 10000)
+            tim = t0 + phs * per
+        for ins in instruments:
+            if highres:
+                m = self.ev.planet_models(ins, nsamples=self.nsamps, t=tim)
+                self.times_model[ins], self.phases_model[ins] = tim, phs
+            else:
+                m = self.ev.planet_models(ins, nsamples=self.nsamps)
+                self.times_model[ins] = self.times[ins]
+                self.phases_model[ins] = juliet.utils.get_phases(t=self.times[ins], P=per, t0=t0, phmin=phmin)
+            self.planet_only_models[ins] = (m['samples'], m['median'], m['upper'], m['lower'])
 
-            # Now loop over all instruments to create high time-resolution planet-only models
-            for ins in range(len(instruments)):
-                
-                ## First we have to check if there are GP or linear model fitted to the data
-                ## Because, we have to create high-resolution GP and linear regressors as well.
-                ## We will do this by interpolating the original GP and linear regressors
-
-                ### High resolution GP regressors
-                ### (we have to remember that everything is sorted according to GP regressors)
-                ### (while dummy time is sorted according to times)
-                ### (we will perform interpolation to arrays sorted according to time)
-                if self._gp:
-                    if instruments[ins] in self._gp.keys():
-                        #! Try/except because it is possible that not all instruments have GP model
-                        try:
-                            inter_gp = interp1d(x=self.dataset.times_lc[instruments[ins]][self.idx_time_sort[instruments[ins]]],\
-                                                y=self._gpx(instruments[ins])[self.idx_time_sort[instruments[ins]]],\
-                                                kind='cubic')
-                            gp_reg_highres = inter_gp(x=dummy_time_highres)
-
-                            #### Now, we can sort time, phase, gp regressors according to GP regressors
-                            idx_gp = np.argsort( gp_reg_highres )
-                            dummy_time_highres, dummy_phs_highres = dummy_time_highres[idx_gp], dummy_phs_highres[idx_gp]
-                            gp_reg_highres = gp_reg_highres[idx_gp]
-                        except Exception:
-                            gp_reg_highres = None
-                    else:
-                        gp_reg_highres = None
-                else:
-                    gp_reg_highres = None
-
-                ### High resolution linear regressors
-                if instruments[ins] in self._lm.keys():
-                    #! Again, try/except because not all instruments might have a linear model
-                    ## (Here, we don't need to sort according to time -- because the dummy_times should have now
-                    ##  sorted according to GP regressors, if applicable)
-                    try:
-                        inter_lin = interp1d(x=self.dataset.times_lc[instruments[ins]],\
-                                             y=self._lm[instruments[ins]],\
-                                             kind='cubic', axis=0)
-                        lin_reg_highres = inter_lin(x=dummy_time_highres)
-                    except Exception:
-                        lin_reg_highres = None
-                else:
-                    lin_reg_highres = None
-
-                try:
-                    # This high-res time models will not work for occultations/phase curves, when light_travel_delay=True
-                    self.planet_only_models[instruments[ins]] = \
-                        self.res.lc.evaluate(instruments[ins], nsamples=self.nsamps, return_err=True, parameter_values=post_samps_new,\
-                                            return_components=True, return_samples=True, evaluate_transit=True,\
-                                            t=dummy_time_highres, GPregressors=gp_reg_highres, LMregressors=lin_reg_highres)
-                except Exception:
-                    # In case when it doesn't work, I have invented a workaround
-                    self.planet_only_models[instruments[ins]] = \
-                        self.highres_planet_models_workaround(instrument=instruments[ins], times_highres=dummy_time_highres,\
-                                                              GP_reg_highres=gp_reg_highres, lin_reg_highres=lin_reg_highres)
-                ## Saving times and phases for model
-                self.times_model[instruments[ins]] = dummy_time_highres
-                self.phases_model[instruments[ins]] = dummy_phs_highres
-        else:
-            for ins in range(len(instruments)):
-                # This should be fairly trivial since we don't need to compute the models at higher time resolution
-                self.planet_only_models[instruments[ins]] = \
-                    self.res.lc.evaluate(instruments[ins], nsamples=self.nsamps, return_err=True, parameter_values=post_samps_new,\
-                                            return_components=True, return_samples=True, evaluate_transit=True)
-                
-                ## Saving times and phases for model
-                self.times_model[instruments[ins]] = self.dataset.times_lc[instruments[ins]]
-                self.phases_model[instruments[ins]] = juliet.utils.get_phases(t=self.dataset.times_lc[instruments[ins]], P=per, t0=t0, phmin=phmin)
-
-    
     @styled
     def phase_folded_lc(self, phmin=0.8, instruments=None, planet='p1', highres=False, nrandom=50, quantile_models=True, one_plot=None, figsize=(9, 5.4), pycheops_binning=False, nos_bin_tra=20, nos_bin_pc=30, window=1.):
         """Plot phase-folded light curves and models for the fitted dataset.
@@ -681,7 +491,7 @@ class julietPlots(object):
             ``0.8``).
         instruments : list or None, optional
             List of instrument names to plot. If ``None``, all instruments
-            in the juliet dataset (``self.dataset.inames_lc``) are used. One plot
+            in the juliet dataset (``self.names``) are used. One plot
             is produced if all instruments are provided; otherwise, one plot
             per instrument is created.
         planet : str, optional
@@ -736,7 +546,7 @@ class julietPlots(object):
         # However, sometimes we want to force one plot, so we have the option one_plot
         instruments = self._instruments(instruments)
         if one_plot is None:
-            one_plot = len(instruments) == len(self.dataset.inames_lc)
+            one_plot = len(instruments) == len(self.names)
 
         # -------------------------------------------
         #               Compute t14
@@ -745,42 +555,10 @@ class julietPlots(object):
         # Let's compute the transit/occultation duration for the planet (that can help setting the xlimits of the plots)
         ## We need several other parameters for that first
 
-        ### Orbital period
-        try:
-            per = self._pmed('P_' + planet)
-        except Exception:
-            per = self.all_mods_ins[instruments[0]]['params'].per
-        
-        ### Rp/R*
-        try:
-            rprs = self._pmed('p_' + planet)
-        except Exception:
-            rprs = self.all_mods_ins[instruments[0]]['params'].rp
-
-        ### a/R*
-        if 'rho' in self.res.model_parameters:
-            ### This would mean that we have fitted for rho. We can convert rho to a/*
-            try:
-                rho = self._pmed('rho')
-                ar = rho_to_ar(rho, per)
-            except Exception:
-                ar = self.all_mods_ins[instruments[0]]['params'].a
-        else:
-            ### That means that we directly fit for a/R*
-            try:
-                ar = self._pmed('a_' + planet)
-            except Exception:
-                ar = self.all_mods_ins[instruments[0]]['params'].a
-        
-        ### b
-        try:
-            b = self._pmed('b_' + planet)
-        except Exception:
-            inc = self.all_mods_ins[instruments[0]]['params'].inc
-            b = inc_to_b(inc=inc, ar=ar, ecc=self.all_mods_ins[instruments[0]]['params'].ecc,\
-                               omega=self.all_mods_ins[instruments[0]]['params'].w)
-        t14_dur = t14(per=per, ar=ar, rprs=rprs, b=b, ecc=self.all_mods_ins[instruments[0]]['params'].ecc,\
-                        omega=self.all_mods_ins[instruments[0]]['params'].w)
+        ### Orbit (posterior medians or fixed values; derived ones from the model)
+        orb = self.ev.orbit(planet, instruments[0])
+        per, rprs, ar, b = orb['P'], orb['p'], orb['a'], orb['b']
+        t14_dur = t14(per=per, ar=ar, rprs=rprs, b=b, ecc=orb['ecc'], omega=orb['w'])
         t14_phs = t14_dur / per
 
         ### Phase of the eclipse centre (0.5 unless an eclipse time was fitted, e.g. eccentric orbits)
@@ -790,11 +568,9 @@ class julietPlots(object):
             t0_ref = self._pmed('t0_' + planet)
             ecl_ph = ((tsec - t0_ref) / per) % 1.
         except KeyError:
-            # light_travel_delay=True: juliet computes t_secondary from the orbit
-            prm = self.all_mods_ins[instruments[0]]['params']
-            tsec = getattr(prm, 't_secondary', None)
-            if tsec is not None and np.isfinite(tsec):
-                ecl_ph = ((tsec - prm.t0) / prm.per) % 1.
+            # light_travel_delay=True: the eclipse time follows from the orbit
+            if orb.get('eclipse_phase') is not None and np.isfinite(orb['eclipse_phase']):
+                ecl_ph = orb['eclipse_phase']
 
         # -------------------------------------------
         #     Computing detrended data and model
@@ -809,9 +585,10 @@ class julietPlots(object):
         phasecurve, transit, eclipse = False, False, False
 
         for ins in range(len(instruments)):
-            if self.dataset.lc_options[instruments[ins]]['TranEclFit']:
+            kind = self.ev.fit_type(instruments[ins])
+            if kind == 'phasecurve':
                 phasecurve = True
-            elif self.dataset.lc_options[instruments[ins]]['EclipseFit']:
+            elif kind == 'eclipse':
                 eclipse = True
             else:
                 transit = True
@@ -917,7 +694,7 @@ class julietPlots(object):
             random_models = sample_models[idx, :]
 
             # Residuals
-            residuals = ( self.dataset.data_lc[instruments[i]] - self.models_all_ins[instruments[i]][1] )[idx_phs]
+            residuals = ( self.flux[instruments[i]] - self.models_all_ins[instruments[i]][1] )[idx_phs]
 
             # If we have phase curve fitting, we will use ppm units for the y-axis
             if phasecurve or eclipse:
@@ -1294,7 +1071,7 @@ class julietPlots(object):
         ----------
         instruments : list or None
             List of instrument names to include. If ``None``, all
-            instruments in the juliet dataset (``self.dataset.inames_lc``)
+            instruments in the juliet dataset (``self.names``)
             are processed.
         binmax : int, optional
             Passed to ``utils.fake_allan_deviation`` to control the maximum
@@ -1334,8 +1111,8 @@ class julietPlots(object):
 
         for ins in range(len(instruments)):
             # Getting the data
-            tim_ins = self.dataset.times_lc[instruments[ins]][self.idx_time_sort[instruments[ins]]]
-            fl_ins = self.dataset.data_lc[instruments[ins]][self.idx_time_sort[instruments[ins]]]
+            tim_ins = self.times[instruments[ins]][self.idx_time_sort[instruments[ins]]]
+            fl_ins = self.flux[instruments[ins]][self.idx_time_sort[instruments[ins]]]
 
             ## Median model
             full_model = self.models_all_ins[instruments[ins]][1][self.idx_time_sort[instruments[ins]]]
@@ -1381,7 +1158,7 @@ class julietPlots(object):
         """
 
         # Access the posteriors
-        post_samps = self.res.posteriors['posterior_samples']
+        post_samps = self.ev.posteriors
 
         # Arrays for posteriors and labels
         posteriors, labels, titles = [], [], []
@@ -1509,7 +1286,7 @@ class julietPlots(object):
         ----------
         instruments : list or None
             List of instrument names to plot. If ``None``, all instruments for
-            which GP regressors exist in ``self.dataset.GP_lc_arguments`` are
+            which GP regressors exist in the fit are
             plotted.
         highres : bool, optional
             If ``True``, compute a high-resolution GP prediction (calls
@@ -1530,10 +1307,13 @@ class julietPlots(object):
             ``compute_gp_model`` instead of using ``juliet`` precomputed errors.
         plot_errorbars : bool, optional
             If ``True``, plot error bars on the GP data points. Default ``False``.
-        parameter_vector : array-like or None, optional
-            If provided, passed to the GP parameter setter before computing
-            predictions (useful for evaluating GP at different parameter
-            values).
+        parameter_vector : dict, array-like or None, optional
+            GP parameters of the predictions of ``compute_gp_model``
+            (default: the posterior medians): ``{prior name: value}``
+            replacing some medians. For juliet fits the GP object's own
+            celerite/george vector is also accepted, used as given (its
+            jitter term should then be negligible: the errors include
+            ``sigma_w``).
         nos_bin : int, optional
             Approximate number of bins to use when computing binned data per
             instrument. Default ``20``.
@@ -1591,7 +1371,7 @@ class julietPlots(object):
             deterministic = ( self.F1[instruments[i]] * self.planet_only_models[instruments[i]][1] ) + self.F2[instruments[i]] + linear_model
             if nlm is not None:
                 deterministic = deterministic * nlm if mult else deterministic + nlm
-            self.gp_data[instruments[i]] = self.dataset.data_lc[instruments[i]] - deterministic
+            self.gp_data[instruments[i]] = self.flux[instruments[i]] - deterministic
             
             # -------------------------------------------
             #  And GP model -- we need to compute them
@@ -1599,9 +1379,9 @@ class julietPlots(object):
             
             if not highres:
                 gp_model_regressor[instruments[i]] = np.copy( self._gpx(instruments[i]) )
-                gp_med_model[instruments[i]] = self.all_mods_ins[instruments[i]]['GP']
+                gp_med_model[instruments[i]] = self.lc_models[instruments[i]]['gp']
                 if not robust_errors:
-                    gp_up68[instruments[i]], gp_lo68[instruments[i]] = self.all_mods_ins[instruments[i]]['GP_uerror'], self.all_mods_ins[instruments[i]]['GP_lerror']
+                    gp_up68[instruments[i]], gp_lo68[instruments[i]] = self.lc_models[instruments[i]]['gp_upper'], self.lc_models[instruments[i]]['gp_lower']
                 else:
                     ## In case of robust errors, we need to compute errors from ``compute_gp_model`` function
                     gp_quantiles = self.compute_gp_model(instrument=instruments[i], highres=False, parameter_vector=parameter_vector)
@@ -1752,7 +1532,13 @@ class julietPlots(object):
             return fig_all, axs_all
         
     def compute_gp_model(self, instrument=None, highres=None, times=None, pred_time=None, resids=None, errors=None, parameter_vector=None):
-        """This function computes the GP models. It accesses the GP object from the juliet files, and then do GP.compute and GP.predict."""
+        """GP mean and 68% band (``(3, n)``: mean, mean + std, mean - std) conditioned on the GP
+        data, from the evaluator's GP at the posterior medians (juliet: its GP object, ``GP.compute``
+        and ``GP.predict``; JAX: the tinygp kernel). The errors are the data errors with
+        ``sigma_w``.
+
+        ``parameter_vector``: ``{prior name: value}`` replacing posterior medians (juliet fits
+        also take the GP object's own parameter vector)."""
         
         # If we compute GP model this way, then the errors will always be robust because we will be using gp.predict
 
@@ -1764,7 +1550,7 @@ class julietPlots(object):
         
         if times is None:
             # When time is None, means that we haven't provided any data, so we need to extract it from self.
-            ## Extracting times (GP regressors) from self.dataset object
+            ## GP regressor of the dataset
             times = self._gpx(instrument)
             ## Similarly, extracting GP data and errors from self
             resids, errors = self.gp_data[instrument], self.detrended_errs[instrument]
@@ -1781,14 +1567,7 @@ class julietPlots(object):
             # but we still need a name of an instrument to access GP object
             instrument = [i for i in self._gp.keys()][0]
 
-        if parameter_vector is not None:
-            self.dataset.lc_options[instrument]['noise_model'].GP.set_parameter_vector(parameter_vector)
-        
-        # GP.compute
-        self.dataset.lc_options[instrument]['noise_model'].GP.compute(t=times, yerr=errors)
-        # And GP prediction
-        gp_mean, gp_var = self.dataset.lc_options[instrument]['noise_model'].GP.predict(y=resids, t=pred_time, return_var=True)
-        gp_std = np.sqrt(gp_var)
+        gp_mean, gp_std = self.ev.gp_predict(instrument, times, resids, errors, pred_time, params=parameter_vector)
 
         gp_quantiles = np.zeros( (3, len(gp_mean)) )
         gp_quantiles[0, :] = gp_mean

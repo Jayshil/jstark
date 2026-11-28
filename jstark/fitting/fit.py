@@ -33,7 +33,13 @@ JULIET_FILES = ('lc.dat', 'rvs.dat', 'priors.dat', 'LM_lc_regressors.dat', 'GP_l
                 'posteriors.dat', '*posteriors.pkl', '*_checkpoint.pkl', '_dynesty_*',
                 'jomnest_*', 'model_resids.dat')
 JSTARK_FILES = ('jstark_fit.json', 'jstark_summary.ecsv', 'jstark_diagnostics.ecsv',
-                'jstark_residuals.npz', 'jstark_nonlinear.npz', 'jstark_rv_diagnostics.ecsv')
+                'jstark_residuals.npz', 'jstark_nonlinear.npz', 'jstark_rv_diagnostics.ecsv',
+                'jstark_jax_posteriors.npz', 'jstark_jax_diagnostics.ecsv', 'jstark_jax_inputs.npz',
+                'jstark_jax_priors.json')
+# Samplers of the JAX models (jstark.fitting.jaxfit); every other sampler name goes to juliet
+JAX_SAMPLERS = ('blackjax-nuts', 'numpyro-nuts', 'blackjax-nss')
+# juliet.fit options that change the JAX model too
+_JAX_MODEL_OPTIONS = ('light_travel_delay', 'stellar_radius', 'ecclim', 'pl', 'pu', 'ta')
 
 # juliet.fit options that change the model (needed again when a fit is reloaded)
 _MODEL_OPTIONS = ('light_travel_delay', 'stellar_radius', 'ta', 'ecclim', 'pl', 'pu')
@@ -41,6 +47,16 @@ _MODEL_OPTIONS = ('light_travel_delay', 'stellar_radius', 'ta', 'ecclim', 'pl', 
 _LONG_CADENCE = 9.5 / 1440.
 # Column of array regressors of non-linear functions while the dataset is clipped and binned
 _NL_ARRAY = 'nonlinearinput'
+
+
+def jax_sampler_name(name):
+    """Standard name of a JAX sampler (``'blackjax_nuts'`` -> ``'blackjax-nuts'``), or None
+    for a juliet sampler."""
+    if not isinstance(name, str):
+        return None
+    s = name.strip().lower().replace('_', '-')
+    return s if s in JAX_SAMPLERS else None
+
 
 _PLANET_GEOMETRY = ('P', 't0', 'a', 'rho', 'b', 'inc', 'ecc', 'omega', 'secosomega',
                     'sesinomega', 'esinomega', 'ecosomega', 'dt', 'T', 't_secondary')
@@ -389,6 +405,7 @@ class BroadbandFit:
         self.nuisance = self._expand_nuisance(nuisance)
         self.dataset = self.results = None
         self.sampler = None
+        self.jax_model = self._evaluator = None
         self.prepare()
 
     # ------------------------------------------------------------------
@@ -696,13 +713,19 @@ class BroadbandFit:
         return self.dataset
 
     def fit(self, sampler='dynamic_dynesty', overwrite=False, **fit_kwargs):
-        """Run juliet (or load the finished fit from ``out_folder``).
+        """Run juliet or a JAX sampler (or load the finished fit from ``out_folder``).
 
         Parameters
         ----------
         sampler : str
             juliet sampler (``'dynamic_dynesty'``, ``'dynesty'``,
-            ``'ultranest'``, ``'emcee'``, ...).
+            ``'ultranest'``, ``'emcee'``, ...), or a JAX sampler:
+            ``'blackjax-nuts'`` or ``'numpyro-nuts'`` (NUTS), or
+            ``'blackjax-nss'`` (nested slice sampling, with the evidence);
+            underscores work too. JAX samplers fit the same model with
+            :mod:`jstark.fitting.jaxfit` (jax, jaxoplanet, blackjax or
+            numpyro); every result method then uses the JAX model.
+            Non-linear functions must be written with ``jax.numpy``.
         overwrite : bool
             ``False`` (default): an identical earlier fit (same data,
             regressors, priors and model settings) in ``out_folder`` is
@@ -710,21 +733,38 @@ class BroadbandFit:
             ``True``: delete the files of any earlier fit and fit again.
             The sampler settings are not compared.
         **fit_kwargs
-            Passed to ``juliet.load.fit``: juliet options (``n_live_points``,
-            ``nthreads``, ``light_travel_delay``, ``stellar_radius``, ...)
-            and any keyword of the sampler (for dynesty e.g. ``bound``,
-            ``sample``, ``dlogz``, ``maxiter``; juliet forwards those it
-            recognises).
+            juliet: passed to ``juliet.load.fit``, juliet options
+            (``n_live_points``, ``nthreads``, ``light_travel_delay``,
+            ``stellar_radius``, ...) and any keyword of the sampler (for
+            dynesty e.g. ``bound``, ``sample``, ``dlogz``, ``maxiter``;
+            juliet forwards those it recognises).
+            JAX NUTS samplers: ``nchains`` (4), ``nwarmup`` (1000), ``nsamples``
+            (1000 per chain), ``seed`` (0), ``target_accept`` (0.9),
+            ``max_tree_depth`` (10), ``dense_mass`` (True),
+            ``chain_method`` (``'vectorized'`` or ``'sequential'``),
+            ``init`` (``'map'``: chains start around the posterior maximum;
+            ``'prior'``; or ``{name: value}``), ``nstart`` (8 optimiser
+            starts), ``progress``. ``blackjax-nss`` (nested slice
+            sampling, gives ``lnZ``): ``nlive`` (500; or juliet's
+            ``n_live_points``), ``num_delete`` (nlive / 10), ``num_inner_steps``
+            (5 x dimension), ``dlogz`` (0.01), ``max_steps``, ``nsamples``
+            (default: the effective sample size), ``seed``, ``progress``.
+            All JAX samplers take juliet's model options ``pl``, ``pu``,
+            ``ecclim``, ``light_travel_delay``, ``stellar_radius``, ``ta``.
+            Other juliet options are ignored with a warning.
 
         Returns
         -------
-        juliet.fit
+        juliet.fit or :class:`jstark.fitting.jaxfit.JaxResults`
         """
         self._check_eclipse_timing(fit_kwargs)
         if self.rvs:
             # reference time of RV trends
             tr = np.concatenate([v['t'] for v in self.rvs.values()])
             fit_kwargs.setdefault('ta', float(0.5 * (tr.min() + tr.max())))
+        name = jax_sampler_name(sampler)
+        if name is not None:
+            return self._fit_jax(name, overwrite, fit_kwargs)
         if (fit_kwargs.get('nthreads') or 1) > 1:
             for n, nl in self.non_linear.items():
                 try:
@@ -737,12 +777,86 @@ class BroadbandFit:
         self.load_juliet()
         self._write_json(sampler, fit_kwargs)
         self.sampler = sampler
+        self.jax_model = self._evaluator = None
         self.results = self.dataset.fit(sampler=sampler, **fit_kwargs)
+        self._write_summary()
+        return self.results
+
+    def _write_summary(self):
         try:
             self.summary(save=True)
-        except Exception as exc:  # the fit itself is saved by juliet; do not lose it
+        except Exception as exc:  # the fit itself is saved; do not lose it
             warnings.warn(f'Could not write the summary: {exc}')
+
+    def _fit_jax(self, sampler, overwrite, fit_kwargs):
+        """Fit with a JAX sampler: same model, priors and files as juliet's fit."""
+        from .jaxfit import run_sampler
+        opts, res = self._jax_prepare(sampler, overwrite, fit_kwargs)
+        new = res is None
+        if new:
+            res = run_sampler(self.jax_model, sampler, **opts)
+        return self._jax_finish(sampler, res, new)
+
+    def _jax_prepare(self, sampler, overwrite, fit_kwargs):
+        """Model, folder and input files of a JAX fit; returns ``(sampler options, results)``,
+        results being the finished fit found in the folder or None."""
+        from .jaxfit import JaxModel, JaxResults
+        from .jaxfit.samplers import check_run, options_of
+        OPTIONS = options_of(sampler)
+        fit_kwargs = dict(fit_kwargs)
+        if sampler == 'blackjax-nss' and 'n_live_points' in fit_kwargs:     # juliet's name
+            fit_kwargs.setdefault('nlive', fit_kwargs.pop('n_live_points'))
+        model_opts = {k: fit_kwargs[k] for k in _JAX_MODEL_OPTIONS if k in fit_kwargs}
+        ignored = sorted(set(fit_kwargs) - set(OPTIONS) - set(_JAX_MODEL_OPTIONS))
+        if ignored:
+            warnings.warn(f'{ignored}: juliet options, ignored by the JAX sampler {sampler} (its '
+                          f'options are {sorted(OPTIONS)}).')
+        sampler_opts = {k: v for k, v in fit_kwargs.items() if k in OPTIONS}
+        # errors (unknown options, features not available in JAX) before the folder is touched
+        check_run(sampler, sampler_opts)
+        self.jax_model = JaxModel.from_fit(self, **model_opts)
+        self._check_folder(overwrite)
+        self._write_json(sampler, fit_kwargs)
+        self._save_jax_inputs()
+        res = None
+        if JaxResults.exists(self.out_folder):
+            res = JaxResults.load(self.out_folder)
+            if res.sampler != sampler or res.names != self.jax_model.prior_set.free:
+                res = None                     # another sampler's run of the same fit: run again
+            elif self.verbose:
+                print(f'Loaded the finished {sampler} fit from {self.out_folder}')
+        return sampler_opts, res
+
+    def _jax_finish(self, sampler, res, new=True):
+        """Save (``new``) and report a JAX run, and make it the results of this fit."""
+        if new:
+            tab = res.save(self.out_folder)
+            report = res.report(tab).split('\n')
+            if self.verbose:
+                print(report[0])
+            for line in report[1:]:
+                warnings.warn(line.replace('WARNING: ', ''))
+        self.dataset, self.results, self.sampler = None, res, sampler
+        self._evaluator = None
+        self._write_summary()
         return self.results
+
+    def _save_jax_inputs(self):
+        """Arrays and priors of a JAX fit (``load`` needs them; juliet keeps its own files)."""
+        arrays = {}
+        for n, d in self.data.items():
+            for k in ('t', 'y', 'e', 'X', 'ramp_x', 'N', 'G', 'index'):
+                if d.get(k) is not None:
+                    arrays[f'{n}__{k}'] = np.asarray(d[k])
+        for n, v in self.rvs.items():
+            for k in ('t', 'rv', 'err'):
+                arrays[f'rv:{n}__{k}'] = np.asarray(v[k])
+        np.savez(os.path.join(self.out_folder, 'jstark_jax_inputs.npz'), **arrays)
+        pri = {k: dict(distribution=p['distribution'],
+                       hyperparameters=np.asarray(p['hyperparameters'], float).tolist())
+               for k, p in self.priors.items()}
+        with open(os.path.join(self.out_folder, 'jstark_jax_priors.json'), 'w') as f:
+            json.dump(pri, f, indent=1)
 
     def _check_eclipse_timing(self, fit_kwargs):
         """juliet reads ``t_secondary_p<n>`` for eclipses only when ``light_travel_delay``
@@ -809,6 +923,9 @@ class BroadbandFit:
         self.ramp = rec.get('ramp', {})
         self.groups, self.aliases = rec.get('groups') or {}, rec.get('aliases') or {}
         functions = cls._reload_non_linear(rec, non_linear, self.groups)
+        self.jax_model = self._evaluator = None
+        if jax_sampler_name(self.sampler):
+            return self._load_jax(rec, functions)
         self.non_linear = {}
         with open(os.path.join(out_folder, 'priors.dat')) as f:
             priors = [line.split()[0] for line in f if line.strip() and line.strip()[0] != '#']
@@ -844,7 +961,42 @@ class BroadbandFit:
         self.names = list(self.dataset.inames_lc)
         self.priors = self.dataset.priors
         self.rv_names = list(self.dataset.inames_rv if rec.get('rvs') else [])
+        # juliet's fit() reads the results when they exist and otherwise starts sampling (in
+        # this folder, perhaps while the real fit is still running): load only finished fits
+        if not glob.glob(os.path.join(glob.escape(out_folder), '*posteriors.pkl')):
+            raise FileNotFoundError(f'{out_folder} holds no finished juliet fit (no *posteriors.pkl): '
+                                    'load() only reads results; use fit() to run it.')
         self.results = self.dataset.fit(sampler=rec['sampler'], **cls._model_options(rec))
+        self.record = rec
+        return self
+
+    def _load_jax(self, rec, functions):
+        """Rebuild the JAX model of a stored fit and read its chains."""
+        from .jaxfit import JaxModel, JaxResults
+        folder = self.out_folder
+        with open(os.path.join(folder, 'jstark_jax_priors.json')) as f:
+            self.priors = json.load(f)
+        self.names = list(rec['datasets'])
+        self.ld_laws = rec.get('ld_laws', 'quadratic')
+        self.supersample = {k: tuple(v) for k, v in rec.get('supersample', {}).items()}
+        self.non_linear = {n: dict(function=f, multiplicative=rec['non_linear'][n]['multiplicative'],
+                                   regressor=rec['non_linear'][n]['regressor'])
+                           for n, f in functions.items()}
+        data = {n: {} for n in self.names}
+        self.rvs = {n: {} for n in rec.get('rvs') or {}}
+        with np.load(os.path.join(folder, 'jstark_jax_inputs.npz')) as z:
+            for k in z.files:
+                n, q = k.split('__', 1)
+                if n.startswith('rv:'):
+                    self.rvs[n[3:]][q] = z[k]
+                else:
+                    data[n][q] = z[k]
+        self.rv_names = list(self.rvs)
+        self._jax_index = {n: d.get('index') for n, d in data.items()}
+        opts = {k: v for k, v in self._model_options(rec).items() if k in _JAX_MODEL_OPTIONS}
+        self.jax_model = JaxModel.from_fit(self, data=data, **opts)
+        self.results = JaxResults.load(folder)
+        self.dataset = None
         self.record = rec
         return self
 
@@ -885,6 +1037,25 @@ class BroadbandFit:
     def _require(self):
         if self.results is None:
             raise RuntimeError('Run fit() first.')
+
+    @property
+    def evaluator(self):
+        """Data and posterior models of the fit (:mod:`jstark.fitting.evaluators`): the juliet
+        model for juliet samplers, the JAX model for JAX samplers."""
+        self._require()
+        ev = getattr(self, '_evaluator', None)
+        if ev is None or ev.results is not self.results:
+            if jax_sampler_name(self.sampler):
+                from .jaxfit import JaxEvaluator
+                index = getattr(self, '_jax_index', None)
+                if self.data is not None:
+                    index = {n: d['index'] for n, d in self.data.items()}
+                ev = JaxEvaluator(self.jax_model, self.results, index=index)
+            else:
+                from .evaluators import JulietEvaluator
+                ev = JulietEvaluator(self.dataset, self.results)
+            self._evaluator = ev
+        return ev
 
     @property
     def posteriors(self):
@@ -998,9 +1169,8 @@ class BroadbandFit:
         self._require()
         if name not in self.rv_names:
             raise ValueError(f'No RV instrument {name!r} in this fit ({self.rv_names}).')
-        t, y, e = (np.asarray(getattr(self.dataset, k)[name])
-                   for k in ('times_rv', 'data_rv', 'errors_rv'))
-        m = np.asarray(self.results.rv.evaluate(name, nsamples=nsamples), float)
+        t, y, e = self.evaluator.rv_data(name)
+        m = self.evaluator.rv(name, nsamples=nsamples)
         return dict(t=t, rv=y, err=e, model=m, resid=y - m)
 
     def rv_diagnostics(self, save=True):
@@ -1066,32 +1236,22 @@ class BroadbandFit:
 
         With ``components=True`` also ``planet`` (the planet model alone,
         1 out of transit/eclipse), ``detrended`` (``y - model + planet``)
-        and ``index`` (integration numbers; only for a fit made in this
-        session, None after :meth:`load`).
+        and ``index`` (integration numbers; None after :meth:`load` of a
+        juliet fit). JAX fits evaluate the JAX model.
         """
-        self._require()
-        t = np.asarray(self.dataset.times_lc[name])
-        y = np.asarray(self.dataset.data_lc[name])
-        e = np.asarray(self.dataset.errors_lc[name])
-        if components:
-            m, comp = self.results.lc.evaluate(name, nsamples=nsamples, return_components=True)
-            planet = comp.get('transit')
-            if isinstance(planet, dict):
-                planet = planet[name]
-            planet = np.ones_like(t) if planet is None else np.asarray(planet, float)
-        else:
-            m = self.results.lc.evaluate(name, nsamples=nsamples)
-        m = np.asarray(m, float)
+        ev = self.evaluator
+        t, y, e = ev.data(name)
+        r = ev.lc(name, nsamples=nsamples, components=components)
+        m = r['model']
         i = np.argsort(t)
         out = dict(t=t[i], y=y[i], err=e[i], model=m[i], resid=(y - m)[i])
         if components:
+            planet = r['planet']
             out['planet'] = planet[i]
             out['detrended'] = (y - m + planet)[i]
-            idx = None
-            if self.data is not None:
-                # juliet keeps the order of the input arrays
-                idx = np.asarray(self.data[name]['index'])[i]
-            out['index'] = idx
+            # the fit keeps the order of the input arrays
+            idx = self.data[name]['index'] if self.data is not None else ev.index(name)
+            out['index'] = None if idx is None else np.asarray(idx)[i]
         return out
 
     def common_mode(self, name, nsamples=500):
@@ -1192,7 +1352,14 @@ class BroadbandFit:
         """:class:`jstark.fitting.plots.julietPlots` for this fit."""
         from .plots import julietPlots
         self._require()
-        pl = julietPlots(input_folder=self.out_folder, dataset=self.dataset, res=self.results, N=N, **kwargs)
+        if jax_sampler_name(self.sampler):
+            if kwargs:
+                raise TypeError(f'plots() of a JAX fit takes no juliet.fit options ({sorted(kwargs)}).')
+            ev = self.evaluator
+        else:
+            from .evaluators import JulietEvaluator
+            ev = JulietEvaluator(self.dataset, self.results, fit_kwargs=kwargs)
+        pl = julietPlots(input_folder=self.out_folder, N=N, evaluator=ev, **kwargs)
         pl.groups, pl.fit = getattr(self, 'groups', {}), self
         return pl
 

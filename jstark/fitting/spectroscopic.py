@@ -21,7 +21,7 @@ import numpy as np
 from astropy.table import Table
 
 from ..plotting import styled, WIDTH, colorbar
-from .fit import BroadbandFit, _as_list, _per_dataset
+from .fit import BroadbandFit, _as_list, _per_dataset, jax_sampler_name
 from .lightcurve import as_lightcurves, check_name
 from .priors import normalise_priors
 
@@ -361,18 +361,29 @@ class SpectroscopicFit:
     # ------------------------------------------------------------------
     # Running
     # ------------------------------------------------------------------
-    def run(self, nproc=1, sampler='dynamic_dynesty', overwrite=False, bins=None, nsamples=500,
-            **fit_kwargs):
+    def run(self, nproc=1, sampler='dynamic_dynesty', overwrite=False, bins=None, nsamples=None,
+            batch=None, **fit_kwargs):
         """Fit the bins (skipping finished ones) and return the :class:`Spectrum`.
 
         Parameters
         ----------
         nproc : int
-            Bins fitted in parallel (one process each; juliet single-threaded
-            inside). With ``nproc=1`` the bins run one after the other and
-            ``nthreads`` may be passed to juliet.
+            Worker processes fitting bins in parallel (juliet
+            single-threaded inside; JAX on the CPU). With ``nproc=1`` the
+            bins run in this process: one after the other with juliet
+            (``nthreads`` may be passed to juliet), and with JAX on all
+            cores of one process, which keeps only ~3 cores busy on a CPU
+            (``nproc`` of 2-4 is faster there). Each JAX worker needs ~1-1.5
+            GB of memory. On a GPU keep ``nproc=1`` and use ``batch``.
         sampler : str
-            juliet sampler (default ``'dynamic_dynesty'``).
+            juliet sampler (default ``'dynamic_dynesty'``) or a JAX sampler
+            (``'blackjax-nuts'``, ``'numpyro-nuts'``, ``'blackjax-nss'``).
+            ``'blackjax-nuts'`` samples the bins together: bins with the
+            same model (datasets, parameters, prior types) share one
+            compiled program, each with its own adaptation
+            (:func:`jstark.fitting.jaxfit.batch.run_batch`; with ``nproc >
+            1`` one such run per chunk of bins in each worker); the other
+            JAX samplers fit the bins one after the other.
         overwrite : bool
             ``False`` (default): finished bins are skipped; bins whose folder
             holds a different fit (data, regressors or priors changed) stop
@@ -382,8 +393,15 @@ class SpectroscopicFit:
         bins : sequence of int or None
             Only these bins (default all bins with data); bins without
             data are skipped.
-        nsamples : int
-            Posterior samples for the saved median models.
+        nsamples : int or None
+            Posterior samples for the saved median models (default 500).
+            With a JAX sampler a given ``nsamples`` is also the sampler's
+            number of draws (per chain for NUTS; default 1000).
+        batch : int or None
+            ``'blackjax-nuts'``: bins vmapped at once (default: all on a GPU,
+            where they run in parallel; 1 on a CPU, where vmapped NUTS
+            chains wait for the longest tree and bins are faster one after
+            the other inside the compiled program).
         **fit_kwargs
             Passed to ``juliet.load.fit`` (e.g. ``n_live_points``, ``dlogz``,
             ``bound``). In parallel runs dynesty's progress output is off
@@ -393,7 +411,17 @@ class SpectroscopicFit:
         -------
         Spectrum
         """
-        idx = [b['index'] for b in self.bins if b['datasets']]
+        jname = jax_sampler_name(sampler)
+        model_samples = 500 if nsamples is None else int(nsamples)
+        if jname and nsamples is not None:      # the JAX samplers' own nsamples (draws)
+            fit_kwargs.setdefault('nsamples', int(nsamples))
+        if jname and nproc > 1:
+            import jax
+            if jax.default_backend() != 'cpu':
+                raise ValueError(f'nproc > 1 runs JAX workers on the CPU; on a GPU '
+                                 f'({jax.default_backend()}) use nproc=1 and batch (bins in parallel '
+                                 'in one compiled program).')
+        idx =[b['index'] for b in self.bins if b['datasets']]
         if bins is not None:
             bins = [int(i) for i in bins]
             bad = [i for i in bins if not 0 <= i < len(self.bins)]
@@ -447,27 +475,42 @@ class SpectroscopicFit:
                 print(f'[{k}/{len(todo)}] bin {i} ({b["lo"]:.4g}-{b["hi"]:.4g} um, '
                       f'{"+".join(b["datasets"])}): {msg}', flush=True)
 
-        if nproc <= 1:
+        if nproc <= 1 and jname == 'blackjax-nuts' and todo:
+            _run_batched(todo, fit_kwargs, model_samples, batch, self.verbose, report)
+        elif nproc <= 1:
             for k, (i, bb) in enumerate(todo, 1):
-                report(k, i, _run_bin(bb, sampler, False, fit_kwargs, nsamples))
+                report(k, i, _run_bin(bb, sampler, False, fit_kwargs, model_samples))
         elif todo:
             import multiprocessing
             from concurrent.futures import ProcessPoolExecutor, as_completed
-            old = {v: os.environ.get(v) for v in _THREAD_VARS}
-            for v in _THREAD_VARS:
-                os.environ[v] = '1'
+            env = {v: '1' for v in _THREAD_VARS}
+            if jname:      # workers inherit the environment. XLA's CPU thread pool cannot be
+                env['JAX_PLATFORMS'] = 'cpu'   # limited (jax 0.12), but per-bin NUTS is mostly serial
+            old = {v: os.environ.get(v) for v in env}
+            os.environ.update(env)
+            if jname == 'blackjax-nuts':     # chunks of bins, one compiled batched run each
+                nch = min(len(todo), 2 * int(nproc))
+                tasks = [(_run_chunk, (todo[c::nch], fit_kwargs, model_samples, batch)) for c in range(nch)]
+            else:
+                tasks = [(_run_bin, (bb, sampler, False, fit_kwargs, model_samples)) for _, bb in todo]
+            bins_of = [[i for i, _ in a[0]] if f is _run_chunk else [todo[n][0]]
+                       for n, (f, a) in enumerate(tasks)]
+            k = 0
             try:
                 ctx = multiprocessing.get_context('spawn')
                 with ProcessPoolExecutor(max_workers=int(nproc), mp_context=ctx) as ex:
-                    fut = {ex.submit(_run_bin, bb, sampler, False, fit_kwargs, nsamples): i
-                           for i, bb in todo}
-                    for k, f in enumerate(as_completed(fut), 1):
-                        i = fut[f]
+                    fut = {ex.submit(f, *a): n for n, (f, a) in enumerate(tasks)}
+                    for f in as_completed(fut):
+                        n = fut[f]
                         try:
-                            r = f.result()
+                            out = f.result()
+                            out = out if isinstance(out, list) else [(bins_of[n][0], out)]
                         except Exception:
-                            r = dict(ok=False, error=traceback.format_exc(), seconds=np.nan)
-                        report(k, i, r)
+                            err = dict(ok=False, error=traceback.format_exc(), seconds=np.nan)
+                            out = [(i, err) for i in bins_of[n]]
+                        for i, r in out:
+                            k += 1
+                            report(k, i, r)
             finally:
                 for v, x in old.items():
                     if x is None:
@@ -713,6 +756,75 @@ class SpectroscopicFit:
             a2.set_ylabel('residual p2p scatter / error')
             a2.legend()
         return fig, (a1, a2)
+
+
+def _run_batched(todo, fit_kwargs, nsamples, batch, verbose, report=None):
+    """blackjax-nuts over the bins ``todo`` (``[(index, BroadbandFit)]``) at once
+    (:func:`jaxfit.batch.run_batch`); every bin is then saved as by
+    :meth:`BroadbandFit.fit`. ``report(k, index, result)`` is called per bin as it finishes;
+    returns ``[(index, result)]``."""
+    from .jaxfit.batch import run_batch
+    name = 'blackjax-nuts'
+    out = []
+
+    def done(i, r):
+        out.append((i, r))
+        if report is not None:
+            report(len(out), i, r)
+
+    prepared, opts = [], {}
+    for i, bb in todo:
+        t0 = time.time()
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                bb._check_eclipse_timing(fit_kwargs)
+                opts, res = bb._jax_prepare(name, False, fit_kwargs)
+                if res is not None:                # finished run found in the folder
+                    bb._jax_finish(name, res, new=False)
+                    bb.diagnostics(save=True)
+                    bb.save_residuals(nsamples=nsamples)
+            if res is not None:
+                done(i, dict(ok=True, seconds=time.time() - t0))
+            else:
+                prepared.append((i, bb))
+        except Exception:
+            done(i, dict(ok=False, error=traceback.format_exc(), seconds=np.nan))
+    if not prepared:
+        return out
+    t0 = time.time()
+    opts = dict(opts, progress=verbose and opts.get('progress', True))
+    try:
+        results = run_batch([bb.jax_model for _, bb in prepared], name, batch=batch, **opts)
+    except Exception:
+        err = traceback.format_exc()
+        for i, _ in prepared:
+            done(i, dict(ok=False, error=err, seconds=np.nan))
+        return out
+    shared = (time.time() - t0) / len(prepared)
+    for (i, bb), r in zip(prepared, results):
+        t1 = time.time()
+        if isinstance(r, Exception):
+            err = ''.join(traceback.format_exception(type(r), r, r.__traceback__))
+            done(i, dict(ok=False, error=err, seconds=np.nan))
+            continue
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                bb._jax_finish(name, r, new=True)
+                bb.diagnostics(save=True)
+                bb.save_residuals(nsamples=nsamples)
+            done(i, dict(ok=True, seconds=shared + time.time() - t1))
+        except Exception:
+            done(i, dict(ok=False, error=traceback.format_exc(), seconds=np.nan))
+    return out
+
+
+def _run_chunk(todo, fit_kwargs, nsamples, batch):
+    """Worker (nproc > 1): blackjax-nuts over a chunk of bins in one compiled run."""
+    for _, bb in todo:
+        bb.verbose = False
+    return _run_batched(todo, fit_kwargs, nsamples, batch, False)
 
 
 def _run_bin(bb, sampler, overwrite, fit_kwargs, nsamples):

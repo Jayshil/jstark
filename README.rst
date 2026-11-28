@@ -23,6 +23,9 @@ Installation
 
     pip install "jwstark[fitting] @ git+https://github.com/Jayshil/jstark.git"
 
+    # optional: JAX samplers for the light-curve fits (NUTS, GPUs)
+    pip install "jwstark[fitting,jax] @ git+https://github.com/Jayshil/jstark.git"
+
 The package is installed as ``jwstark`` and imported as ``jstark``.
 
 Documentation

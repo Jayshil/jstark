@@ -1,6 +1,6 @@
 # jstark light-curve fitting: development notes
 
-As of 2026-11-23. The record of what was discussed, decided, implemented
+As of 2026-11-27. The record of what was discussed, decided, implemented
 and measured while building the light-curve fitting stage of jstark
 (`jstark/fitting/`), for anyone continuing the work, including future work
 sessions. The code and its docstrings remain the reference for details;
@@ -48,6 +48,8 @@ one: `docs/detector_processing_notes.md` and `docs/extraction_notes.md`.
 | `fit.py` | `BroadbandFit`, `ExpRamp`, `NonLinear`, `red_noise_beta` |
 | `spectroscopic.py` | `SpectroscopicFit` (one `BroadbandFit` per wavelength bin, parallel, resumable), `Spectrum` (astropy `Table` subclass), `make_bins`, `restrict_priors` |
 | `plots.py` | `julietPlots` (moved from `jstark.py`, fixed) |
+| `jaxfit/` | optional JAX backend (5.10-5.14): `PriorSet` (juliet priors, transforms), `orbit` (batman geometry), `planet` (limb darkening, eclipse, phase curves), `JaxModel` (juliet's model and likelihood), `samplers` (`run_sampler`: blackjax / numpyro NUTS), `JaxResults` (chains, diagnostics, files), `JaxEvaluator` (posterior models) |
+| `evaluators.py` | the model interface of the result methods and plots; `JulietEvaluator` (5.11, 5.13) |
 | `utils.py` | helpers moved from `jstark/utils.py`: `t14`, `b_to_inc`, `inc_to_b`, `rho_to_ar`, `lcbin`, `pipe_mad`, `rms`, `fake_allan_deviation`, `corner_plot`, `make_psd`, `psd_fitting_kernel`, `planck_func`, `BrightnessTemperatureCalculator` |
 
 Dropped from `utils.py`: `clip_outliers` (replaced by `LightCurves.clip`),
@@ -74,7 +76,7 @@ runs; the spectroscopic test spawns 2 worker processes).
    initialised* when the regressor is unsorted (juliet sorts only global
    GPs).
 5. Priors: user priors first; then per dataset `mdilution` fixed 1, `mflux`
-   N(0, 0.1), `sigma_w` LU(0.1, 1e5) ppm, `theta<i>` U(-1, 1), GP
+   N(0, 0.1), `sigma_w` LU(0.1, 1e4) ppm (1e5 until 2026-11-28), `theta<i>` U(-1, 1), GP
    hyperparameters (relative-flux amplitude LU(1e-6, 1e-2); timescales
    LU(cadence, 10 x span)), ramp amplitude U(-0.1, 0.1) and timescale
    LU(2 cadences, duration). `nuisance=` overrides the defaults.
@@ -1415,6 +1417,704 @@ overlap, so differences in combined sigma are only indicative.
 - The GP timescale differs from ERS (0.51 vs 1.56 d, 2 sigma): other data
   (sector 91, only the windows around transits).
 
+### 5.10 JAX models and samplers, Phase 0: the model (2026-11-27)
+
+**Decisions (2026-11-27).** An optional JAX backend next to juliet (juliet stays
+the default). It is chosen by the sampler name: `'blackjax-nuts'`,
+`'blackjax-nss'` (nested slice sampling, gives `lnZ`), `'numpyro-nuts'`
+(underscores accepted), so more samplers can be added later; the rest of the
+front end is unchanged. GPs with tinygp (pure JAX: jit, grad and vmap; its
+quasiseparable `SHO` equals celerite1's SHO log-likelihood exactly with
+sigma^2 = S0 w0 Q, and juliet's approximate Matern, celerite1 `eps=0.01`, is
+reproduced exactly by `quasisep.Celerite(a=s^2, b=s^2 w/eps, c=w, d=eps)`,
+w = sqrt(3)/rho; celerite2 0.3.3 works under jit and grad but has no vmap
+batching rule). **No juliet post-processing of JAX fits**: results and plots
+of a JAX fit use the JAX model. Result methods and plots stay one code base;
+the few calls that evaluate a model go through a small model interface with a
+juliet and a JAX implementation. CPU speed tests are reported but do not
+decide anything (JAX aims at GPUs); a GPU benchmark script is to be written
+for later. Phases: 0 model; 1 samplers and `BroadbandFit`; 2 GPs, RVs, NSS,
+light-travel delay; 3 plots; 4 `SpectroscopicFit` with vmap; 5 real data;
+6 docs and GPU script. Other limb-darkening laws matter less than the
+quadratic one (user).
+
+**Environment** (`jaxoplanet`): jax 0.12.1, jaxoplanet 0.2.0, numpyro 0.22.0,
+blackjax 1.7.1, tinygp 0.3.1, celerite2 0.3.3; jstark installed editable
+(`pip install -e . --no-deps`). pytest there needs `-o addopts=""`
+(pytest-doctestplus is not installed).
+
+**Code** (`jstark/fitting/jaxfit/`; importing it switches on float64):
+- `priors.py`, `PriorSet`: juliet's distributions as its nested samplers draw
+  them (the prior transforms; juliet's MCMC log-prior of `beta` has a wrong
+  bounds check, its `exponential` is a gamma with shape `a`). Logistic maps
+  for bounded priors, `exp` for positive ones, `mu + sigma z` for normal
+  ones; log-densities, Jacobians, unit draws, starting points.
+  Hyperparameters are an `(ndim, 4)` array, so batched fits can have
+  different priors.
+- `orbit.py`: batman's geometry: `t0` = conjunction, periastron time from
+  the conjunction phase, `jaxoplanet.core.kepler` (batman's circular branch
+  below e = 1e-5), separation 100 on the half-orbit without an event,
+  `t_secondary` <-> conjunction, `a` from `rho` (juliet's G), r1/r2.
+- `planet.py`: quadratic/linear with `jaxoplanet.core.limb_dark` (order 20:
+  <= 1e-4 ppm from order 60; 30% faster than the default 40); other laws
+  (square-root, logarithmic, exponential, power-2, 4-parameter) by
+  Gauss-Legendre over the stellar radius (32 nodes after a cosine map, <=
+  4e-4 ppm from 200 nodes); uniform-disk eclipse `1 + fp * visible
+  fraction`; juliet's Cowan & Agol and sine phase curves.
+- `model.py`, `JaxModel(.from_fit(BroadbandFit))`: juliet's name resolution
+  (`*_iname`: LD, theta, sigma_w, mdilution, mflux, p, fp, C1-D2,
+  phaseoffset; shared and group names), model flags (transit / eclipse /
+  joint, phase curves), the joint transit + eclipse branch (`transit *
+  (eclipse - fp)`, or `transit * (1 + pc * visible)` with a phase curve; the
+  sine phase curve uses the conjunction implied by `t_secondary`, as batman
+  leaves it), dilution and `mflux`, linear terms, ramps, your non-linear
+  functions (written with `jax.numpy`; group aliases), supersampling,
+  `sigma_w`. juliet's rejected draws (b > 1 + p, cos i >= 1, e > ecclim,
+  periods not increasing in planet order) are -inf. Raises
+  `NotImplementedError` for GPs, RVs and `light_travel_delay` (Phase 2) and
+  for TTVs, catwoman, Lambert/kelp and global models (not used by jstark).
+  Data are a pytree argument of the log-density (for vmap later).
+
+**Checks** (`jstark/tests/test_jaxfit.py`, 13 tests, ~30 s): log-likelihood,
+full model and variances against juliet's own `model` object at 40 prior
+draws per configuration (same draws rejected; log-likelihood within the bound
+the model difference implies, since prior draws sit hundreds of sigma from
+the data): two transit visits (linear terms, ramp); rho, free e/omega,
+square-root and power-2 laws; eclipses with secosomega and supersampling;
+joint transit + eclipse with Cowan & Agol and sine phase curves (and without);
+two planets with r1/r2 and ecosomega; non-linear functions (multiplicative
+with a 2-term ramp, additive with two regressors), groups and shared
+parameters; linear, logarithmic and 4-parameter laws; priors vs scipy;
+gradients vs finite differences.
+
+| Comparison | max model difference |
+| --- | --- |
+| quadratic and linear vs juliet (all configurations) | < 0.1 ppm (0.05 ppm with free e, omega: batman's Kepler tolerance 1e-7) |
+| eclipses, phase curves vs juliet | < 0.1 ppm |
+| other laws vs juliet's batman | 2.8-7.9 ppm |
+| other laws vs batman with `max_err=0.01` | <= 0.15 ppm |
+
+- **juliet's batman is the less accurate one for non-polynomial laws**: batman
+  fixes its integration step (`fac`) once, at juliet's initial dummy
+  parameters (u = 0.1, 0.3, rp = 0.1); its 1 ppm `max_err` does not hold at
+  other coefficients. With a fresh step both agree to 0.15 ppm.
+- **batman's exponential law** is off by up to 30 ppm near the limb, where the
+  profile diverges (batman stops the integral short of r = 1); the JAX value
+  equals scipy `quad` to 1e-11. Same profile and normalisation otherwise.
+- batman failures at isolated points: the quadratic model at z = p exactly
+  (`ellpic_bulirsch` does not converge, 21-25 ppm), the eclipse at z = 1 - p
+  exactly (NaN); the JAX models are finite and correct there.
+
+**Speed on this CPU (M4 Pro, for the record only).** Transit with linear
+terms and jitter, 12 free parameters: one gradient inside a compiled loop
+0.12 ms (465 points) and 2.0 ms (21,500 points); per chain with 8 chains
+vmapped 0.07 / 1.5 ms. One juliet log-likelihood (no gradient): 0.02 ms /
+0.47 ms (with changing parameters). The transit model dominates (value 0.36
+ms, value + gradient 1.7 ms at 21,500 points); with a ramp and 5-fold
+supersampling 9.7 ms per gradient. So on CPU a NUTS gradient costs 3-5x a
+juliet evaluation; whether a fit is faster depends on the number of
+evaluations (dynesty vs NUTS), the dimension, vmap, and on a GPU.
+
+### 5.11 JAX backend, Phase 1: samplers and `BroadbandFit` (2026-11-27)
+
+**Front end.** `BroadbandFit.fit(sampler='blackjax-nuts')` or
+`'numpyro-nuts'` (underscores work; `jax_sampler_name`), everything else as
+before; every other sampler name goes to juliet, which never imports jax.
+JAX options: `nchains` 4, `nwarmup` 1000, `nsamples` 1000 per chain, `seed`
+0, `target_accept` 0.9, `max_tree_depth` 10, `dense_mass` True,
+`chain_method` (`'vectorized'`: all chains in one vmapped computation, or
+`'sequential'`), `init` (`'map'`, `'prior'`, `{name: value}`), `nstart` 8,
+`progress`; juliet's model options `pl`, `pu`, `ecclim` apply. Other juliet
+options (`nthreads`, `n_live_points`, dynesty keywords) are ignored with a
+warning, so switching only the sampler name works. Unknown JAX options,
+`blackjax-nss` (Phase 2) and features the JAX model lacks (GPs, RVs,
+light-travel delay) raise before `overwrite=True` empties the folder.
+`SpectroscopicFit.run(sampler='blackjax-nuts')` works with `nproc=1` (bins
+one after the other; `nproc > 1` raises, each JAX process already uses all
+cores; vmap over bins is Phase 4). `plots()` raises for JAX fits (Phase 3).
+
+**Code.**
+- `jaxfit/samplers.py`, `run_sampler(model, sampler, **options)`: L-BFGS
+  (scipy, JAX gradients) from the prior centre and `nstart - 1` prior draws;
+  the Laplace covariance at the best maximum (Hessian eigenvalues made
+  positive and floored at 1/10^2, so it always exists); chains start at
+  draws from it. Sampling is in whitened coordinates `u = L^-1 (z - z_map)`
+  (`L L^T` the Laplace covariance; an affine map, so the posterior is
+  unchanged). blackjax: `window_adaptation` + `nuts` in `lax.scan`, chains
+  vmapped; numpyro: `NUTS(potential_fn=...)`, `chain_method` passed on.
+  blackjax's progress bar needs its `progress` extra (jaxtap, not installed
+  here); without it one line per stage is printed.
+- `jaxfit/results.py`, `JaxResults`: chains `(nchains, ndraws, ndim)`, the
+  log-likelihood of every draw, sampler statistics; `posteriors` is juliet's
+  dict (`posterior_samples` + `loglike`), so `posteriors`, `values`,
+  `summary`, `channel_priors`, `phase_curve` are unchanged code;
+  `diagnostics()` (rank-normalised split R-hat, bulk and tail ESS from
+  `blackjax.diagnostics`; divergences, tree-depth hits, acceptance, step
+  sizes, times) and `report()` (warnings for R-hat >= 1.01, ESS < 400,
+  divergences, depth hits; `fit` turns them into Python warnings).
+- The model interface (`fitting/evaluators.py`: `data`, `lc(name,
+  nsamples, components)`, `rv_data`, `rv`, `index`): `JulietEvaluator`
+  (juliet's `results.lc.evaluate`) and `jaxfit.JaxEvaluator` (the JAX model
+  at `nsamples` random posterior draws, fixed seed, vmapped in chunks of <=
+  2e6 model elements; median model and `planet` = juliet's `transit`
+  component, `1 + sum(planet_i - 1)` before dilution, checked in juliet's
+  code). `BroadbandFit.evaluator` picks one; `residuals` and `rv_residuals`
+  use it, and with them `common_mode`, `channel_common_mode`,
+  `save_residuals`, `diagnostics`.
+- Folder of a JAX fit: `jstark_fit.json` (as before), `jstark_jax_inputs.npz`
+  (t, y, e, X, ramp_x, N, index per dataset), `jstark_jax_priors.json`
+  (complete priors in order), `jstark_jax_posteriors.npz`,
+  `jstark_jax_diagnostics.ecsv`, and the usual summary/diagnostics/residual
+  files. `overwrite` works as for juliet (same fingerprint: loaded, also with
+  other sampler settings; a run of the other JAX sampler is replaced).
+  `BroadbandFit.load` rebuilds the JAX model from these (non-linear
+  functions passed again, as for juliet).
+
+**Warmup needs whitening (found here).** The first runs took > 10 min for 600
+points: every draw hit the maximum tree depth (1023 steps) at acceptance 0.94
+with step sizes ~0.003. A Gaussian with the exact posterior covariance did the
+same, so the cause is the adaptation, not the model: blackjax's (and numpyro's)
+Stan-style mass-matrix regularisation, `(n/(n+5)) var + 1e-3 * 5/(n+5)`,
+assumes parameters of unit scale. Unconstrained widths here go down to 2e-5
+(the linear coefficients, `mflux`), so their adapted variances came out up to
+8e4x too large. Sampling in the whitened coordinates fixes it: 31 steps per
+draw, 28 s instead of > 10 min.
+
+**Sampler settings.** 600-point transit with a ramp and a linear term (11
+free parameters), blackjax, 4 x 1000 draws:
+
+| settings | time | divergences | ESS bulk (b, a) | max R-hat |
+| --- | --- | --- | --- | --- |
+| target_accept 0.8, diagonal mass | 54 s | 39 | ~120 | 1.037 |
+| target_accept 0.9 | 83 s | 0 | ~440 | 1.012 |
+| target_accept 0.95 | 101 s | 0 | ~500 | 1.007 |
+| target_accept 0.9, dense mass (default) | 84 s | 0 | ~1200 | 1.006 |
+
+The divergences were spread over the bulk of the posterior (b 0.2-0.48), not
+at a prior edge: transit models curve sharply where points cross the contacts.
+
+**Against dynesty** (same data, juliet `dynamic_dynesty`, `nthreads=1`):
+dynesty 718 s, blackjax 97 s, numpyro 85 s. Medians agree within 0.16 sigma
+for all 11 parameters (both samplers; R-hat <= 1.007, 0 divergences, min ESS
+720 / 378). The NUTS widths of b and a were 7-8% (68% intervals) and 12-20%
+(1-99%) smaller than dynesty's, so a third, gradient-free sampler decided:
+emcee (64 walkers x 60,000 steps, 10,000 discarded, autocorrelation time
+~750) on the same JAX log-posterior in parameter space, once started from
+NUTS draws and once from dynesty draws. The two emcee runs agree to <= 2.3%
+in every 68% width, so their pooled draws are the reference:
+
+| ratio to emcee (68% / 95% width) | p | b | a | q1 | q2 | t0 |
+| --- | --- | --- | --- | --- | --- | --- |
+| blackjax-nuts | 0.97 / 0.97 | 1.00 / 0.96 | 1.00 / 0.98 | 0.98 / 0.97 | 0.99 / 0.97 | 1.01 / 1.02 |
+| numpyro-nuts | 1.01 / 1.02 | 1.00 / 0.99 | 0.99 / 1.00 | 1.02 / 1.06 | 1.02 / 1.05 | 0.98 / 0.97 |
+| juliet dynamic_dynesty | 1.03 / 1.05 | 1.08 / 1.13 | 1.07 / 1.12 | 0.96 / 1.01 | 0.95 / 0.96 | 0.97 / 1.00 |
+
+The NUTS posteriors are right to the 2-3% their ESS allows; this dynesty run
+(juliet's defaults) is the one off, too wide along the b-a degeneracy. One
+run only, so not yet a statement about dynesty in general.
+
+**Tests** (`jstark/tests/test_jaxfit.py`, now 19, ~2.3 min): sampler names;
+both samplers recover a batman transit (p, b, a within 4 sigma) with short
+chains; summary, residuals (planet component, detrended, index),
+diagnostics; `load` gives identical posteriors and models; the same fit is
+loaded, not re-run (another seed), `overwrite=True` runs again; juliet
+options warn; unknown options, `blackjax-nss` and a GP fit raise (the
+earlier fit's files stay); `init='prior'` / given values with vectorized and
+sequential chains; a NumPy operation on a parameter in a non-linear function
+raises a `TypeError` that says to use `jax.numpy` (NumPy on the data alone
+is fine); `SpectroscopicFit` with `blackjax-nuts` over two bins (and
+`nproc=2` refused). `test_fitting.py` (juliet) still passes with the
+refactored `residuals` / `rv_residuals` (35 tests).
+
+### 5.12 JAX backend, Phase 2: GPs, RVs, light-travel delay, nested sampling (2026-11-27)
+
+**Code.**
+- `jaxfit/gp.py`: juliet's light-curve kernels in tinygp, chosen by the
+  names of the `GP_` priors as juliet chooses them: celerite `Exp`,
+  `Matern`, `MaternExp`, `SHO`, `QP` (juliet's `RotationTerm`), `DoubleSHO`,
+  `MaternSHO` (quasiseparable, O(N), sorted 1D input), george `SE` and `M32`
+  (multi-dimensional) and `ExpSineSquaredSE` (dense, exact). The jitter is
+  on the diagonal with the errors, as juliet's `JitterTerm` / george
+  white noise. The residual model is juliet's `GP.predict(residuals, X)`:
+  computed as `r - D (K + D)^-1 r` because tinygp 0.3.1 cannot `condition`
+  sums of quasiseparable kernels (an assertion in its solver).
+- `JaxModel`: GP likelihood per dataset; radial velocities (offsets
+  `mu_<inst>`, jitters, Keplerians with radvel's conventions and juliet's
+  sorted `K_p<n>` numbering, `rv_slope` / `rv_quad` about `ta`, juliet's
+  rejections); `light_travel_delay` with `stellar_radius` (juliet:
+  `t_secondary` from `t0` with batman, eclipse and phase curves at `t - dt`,
+  dt the line-of-sight position relative to the transit over c, Bell's
+  `KeplerOrbit` with Omega = 270 deg; the transit at `t`).
+- Fixed from Phase 0: juliet **sorts** the planet numbers
+  (`numbering.sort()`); the JAX model took them in the order of the priors
+  (only different with `p2` priors before `p1`, and only for the period
+  ordering check).
+- `blackjax-nss`: nested slice sampling (Yallup, Kroupa & Handley 2026) on
+  the unconstrained z with the z-space prior density (Jacobian included,
+  normalised, so lnZ is that of juliet's priors); prior draws as live
+  points; stops at dynesty's criterion `log(Z + Z_live) - log Z < dlogz`;
+  lnZ and its error from 200 simulated volume sequences; posterior
+  resampled from the weighted dead points (default size = ESS). Options:
+  `nlive` 500 (juliet's `n_live_points` is accepted), `num_delete` nlive/10,
+  `num_inner_steps` 5 x dimension (blackjax warns that ~dimension biases
+  lnZ upward above 10 dimensions), `dlogz` 0.01, `max_steps`, `nsamples`.
+  `summary()` carries lnZ as for dynesty; `diagnostics()` / `report()` give
+  ESS, dead points, steps and a warning if `max_steps` stopped it.
+- `JaxEvaluator`: light-curve models include the GP prediction (`gp`
+  component too); `rv_data` / `rv` for `rv_residuals` and `rv_diagnostics`.
+  `load` restores the RVs (stored in `jstark_jax_inputs.npz`).
+
+**Checks against juliet** (`test_jaxfit.py`, now 35 tests, ~4 min): every
+kernel at juliet's own residuals (20 prior draws each):
+
+| kernel | lnL, relative | GP prediction / std(r) |
+| --- | --- | --- |
+| Exp, SHO (Q 0.2-5), QP, DoubleSHO | <= 1e-14 | <= 1e-14 |
+| SE (2D), M32, ExpSineSquaredSE vs george's exact solve | <= 2e-15 | <= 3e-14 |
+| Matern, MaternExp, MaternSHO | <= 2e-5 | <= 3e-6 |
+
+RVs (two planets, one RV-only with secosomega; quadratic trend; two
+instruments) and the light-travel delay (circular and e = 0.3, joint transit
++ eclipse with a Cowan & Agol phase curve and supersampling) agree with
+juliet to < 1e-8 m/s and < 1e-7 relative flux.
+
+**juliet / package behaviour found here.**
+- **radvel 1.5.0's Kepler solver stops after one iteration** (NumPy path:
+  `nd = np.sum(convd is True)` is always 0; the C extension is not built in
+  this environment, so juliet uses this path). Residual of Kepler's
+  equation: 6e-10 (e = 0.05), 4e-5 (e = 0.35), 3e-3 (e = 0.7), so juliet's
+  eccentric RVs are off by up to ~3e-3 K (0.3 m/s for K = 100 m/s at e =
+  0.7). jaxoplanet's solver is good to 2e-15. The test gives radvel a
+  converged solver; then juliet and JAX agree to 1e-8 m/s.
+- **juliet's george GPs use the HODLR solver by default** (approximate). At
+  prior draws its lnL was off by factors of 2-3 (e.g. -2.6e7 vs -6.8e7
+  exact); near the posterior the error is not measured. JAX solves exactly.
+- **george's constant kernel in n dimensions is n exp(log_constant)**, so
+  juliet's multi-dimensional SE / M32 amplitude is n (1e-6 sigma)^2;
+  reproduced.
+- **juliet's Matern is celerite's eps = 0.01 approximation.** Its celerite
+  form loses precision in tinygp for rho near the cadence (-inf), so JAX
+  uses the exact Matern-3/2: |dlnL| vs celerite <= 1e-5 (300 points, 0.24 d),
+  1e-3 (2000-20,000 points, <= 1 d), but up to 1.2 over a 27-day span
+  (TESS sector), where celerite's approximation is off, not JAX.
+- **juliet's exponential kernel is `GP_sigma exp(-GP_timescale tau)`**
+  (`log sigma`, `log timescale` go into celerite's `RealTerm(log_a,
+  log_c)`): `GP_sigma` is a variance and `GP_timescale` a rate (1/day).
+  jstark's default priors for `gp_kernel='exp'` and `'matern-exp'` treat
+  them as an amplitude (1e-6-1e-2) and a timescale (cadence to 10 x span),
+  so the default exp GP has amplitudes 1e-3-0.1 and correlation times from
+  1/(10 span) to 1/cadence. Not changed (it changes juliet fits too);
+  for the user to decide.
+- **Only kernels that contain a full jstark kernel set can be set up
+  through `BroadbandFit`**: `build_priors` adds the default priors of
+  `gp_kernel` (default matern) whenever not all of its variables are
+  given, so george kernels and DoubleSHO always get an extra prior and
+  juliet then finds no kernel. The JAX models support them (tested by
+  removing the extra prior).
+- `_check_eclipse_timing` still refuses a fixed `t_secondary` with a varying
+  orbit (a juliet + batman bug, 5.3); the JAX models would place it
+  correctly, but the check stays so both backends accept the same fits.
+
+**Evidence.** 600-point transit with a ramp (11 parameters, an estimated ~50 nats of
+compression; the Phase 1 problem):
+
+| method | lnZ | time |
+| --- | --- | --- |
+| importance sampling, multivariate t from the NUTS posterior (3 proposals) | 3984.12 +- 0.01 | |
+| blackjax-nss (500 live) | 3983.90 +- 0.37 | 421 s |
+| juliet dynesty (static, 500 live, defaults) | 3981.68 +- 0.54 | 98 s |
+| juliet dynesty (static, `sample='rslice'`) | 3979.57 +- 0.52 | 103 s |
+| juliet dynamic_dynesty (defaults) | 3975.65 +- 0.23 | 718 s |
+
+NSS agrees with the reference; the dynesty runs are 2.4-8.5 nats low and
+disagree with each other by more than their errors. NSS posteriors vs the
+emcee reference: medians within 0.06 sigma, 68% widths 0.98-1.04. On a
+5-parameter transit, NSS and static dynesty agree (test).
+
+**GP fit** (600-point transit plus a Matern-3/2 red-noise draw of 300 ppm,
+rho 0.02 d; Matern GP on time; 10 free parameters):
+
+| | time | lnZ | medians vs dynesty | 68% widths / dynesty |
+| --- | --- | --- | --- | --- |
+| blackjax-nuts | 183 s | | within 0.19 sigma | 0.92-1.14 (GP_sigma 0.61) |
+| blackjax-nss | 327 s | 3995.06 +- 0.24 | within 0.17 sigma | 0.91-1.13 (GP_sigma 0.61) |
+| juliet dynesty (static, 500 live) | 72 s | 3991.22 +- 0.43 | | |
+| importance sampling (reference) | | 3995.10 +- 0.07 | | |
+
+The GP posterior is broad (rho 0.4 +- 0.8 d on a 0.3-day visit, degenerate
+with GP_sigma), so NUTS mixes more slowly there: ESS 270-350 for p, b, a in
+4 x 1000 draws (R-hat <= 1.009, 1 divergence) and the ESS warning asks for
+more draws. NUTS and NSS agree with each other on GP_sigma; dynesty is wider.
+dynesty's lnZ is again low (3.9 nats).
+
+### 5.13 JAX backend, Phase 3: plots through the model interface (2026-11-27)
+
+`BroadbandFit.plots()` works for JAX fits. `julietPlots` (name kept) no
+longer calls juliet: every model comes from the fit's evaluator, so the
+plot code is the same for both backends.
+
+**Code**
+- `fitting/evaluators.py`: the interface grows from the residual methods'
+  needs to the plots' (`posteriors`, `priors`, `regressors`, `fit_type`,
+  `lc_models` (draws, median, 68% band, linear model, GP prediction and
+  band), `planet_models(name, nsamples, t=None)` (planet only, at the data
+  or any times), `non_linear`, `orbit(planet, name)` (medians of `P`, `t0`,
+  `p`, `a`, `b`, `ecc`, `w`, `eclipse_phase`), `gp_predict(name, x, resid,
+  err, x_pred, params)`, `keplerian`, `rv_ta`). `JulietEvaluator` holds the
+  juliet code moved out of `plots.py` unchanged: `lc.evaluate`, the
+  planet-only draws, the regressor interpolation and the juliet re-fit
+  workaround for high-resolution models, juliet's GP object, radvel.
+- `jaxfit/model.py`: the planet part of `components` is `_planet(pv, inst,
+  t, tt)`; `planet_model(pv, inst, t)` evaluates it at any times
+  (supersampled like the dataset; the light-travel delay included);
+  `components` also returns `linear`; `geometry(pv, inst, n)` (derived
+  `a`, `b`, `inc`, `ecc`, `w`, `t_secondary`); `gp_predict(pv, inst, X, r,
+  variance, X_pred)`: mean `K*(K+D)^-1 r` and variance `k** - |L^-1 K*|^2`
+  with the dense cross-covariance and tinygp's triangular solver (works for
+  sums and products of quasiseparable kernels and for the george kernels).
+- `jaxfit/evaluate.py`: the JAX implementations. Quantiles are the 16/50/84
+  percentiles over the draws; the GP for `plot_gp(highres=True)` and
+  `compute_gp_model` is at the posterior medians (`parameter_vector`:
+  `{prior name: value}` replacing medians; for juliet fits it is still the
+  GP object's vector). Predictions are chunked (2e6 elements).
+- `plot_rv`: the Keplerians come from the evaluator (radvel for juliet, the
+  converged JAX solver for JAX fits).
+- `BroadbandFit.plots(**kwargs)`: JAX fits take no juliet.fit keywords
+  (TypeError).
+
+**Checks**
+
+| check | result |
+| --- | --- |
+| juliet path before vs after (eclipse fit with ramp + linear + GP; transit with linear + GP; every array the plots compute, seeded) | identical (eclipse); 1e-11 (transit, = run-to-run) |
+| JAX plots vs juliet plots with the JAX draws swapped into juliet (all 1000 draws, compared per point after sorting) | full models 2e-9 (GP, exact vs eps Matern) / 3e-14; planet models at the data and at 10000 times 3e-13 (eclipse), 9e-9 (transit); linear models 1e-14; orbit identical |
+| medians of the same draws | ~1e-6: juliet's even-count median is one order statistic off `np.median` |
+| `gp_predict` vs celerite (Matern, eps 0.01) | 5e-8 relative (mean and std) |
+| `gp_predict` vs dense solve (Matern; Exp + Celerite; Exp x Matern) | 1e-13 |
+| `planet_model` at permuted data times vs at the data (supersampled phase curve, light-travel delay, secosomega) | 1e-14 |
+| `keplerian` JAX vs radvel (converged solver), shared and per-draw times | < 1e-8 |
+
+Tests (`test_jaxfit.py`): planet models at any times; Keplerians; every plot
+method on a JAX eclipse fit with a ramp, linear models and a GP, and the
+models against juliet's with the same draws; `plot_rv` on the JAX RV fit.
+
+**Fixed in jstark's juliet plot path** (2026-11-27, after review; these
+are jstark bugs in `julietPlots`/`JulietEvaluator`, not juliet's)
+- `plot_gp` / `compute_gp_model` counted `sigma_w` twice: juliet's GP object
+  has its own jitter term and the plots pass errors that already include
+  `sigma_w` (with `sigma_w` = the photometric error, the GP mean moved by 9%
+  of its scatter and the band was 16% too wide), and the GP parameters were
+  those of the last draw juliet evaluated. `JulietEvaluator.gp_predict` now
+  sets the GP object to the posterior medians (`params`: `{prior name:
+  value}` replacing some, as for JAX fits; a raw celerite/george vector is
+  still accepted) with its jitter term off. It equals the JAX prediction to
+  5e-8 (celerite's eps Matern). The reference fits' GP predictions moved by
+  2-4e-5; every other plot array is identical.
+- The planet-only draws set a fitted `mdilution` to 0, which made juliet's
+  planet-only model flat (`(M D + 1 - D) / (1 + D mflux) = 1`); now 1.
+- juliet's `lc.evaluate(t=...)` leaves the dataset's model arrays (`ones`,
+  `M`, ...) at the new length, so evaluating at the data afterwards failed
+  (e.g. `phase_folded_lc(highres=True)` then `highres=False`).
+  `JulietEvaluator` restores the state after such calls.
+- The same-draws test now has a free `mdilution` and compares the GP
+  predictions; it failed before the fixes.
+
+**Other findings**
+- For a transit-only juliet fit, batman's `t_secondary` gives an eclipse
+  phase of 0.83 instead of 0.5 (unused in transit plots).
+- `plot_fake_allan_deviation` warns "invalid value encountered in scalar
+  divide" (`utils.fake_allan_deviation`), for both backends.
+
+### 5.14 JAX backend, Phase 4: `SpectroscopicFit` with batched NUTS (2026-11-27)
+
+`SpectroscopicFit.run(sampler='blackjax-nuts')` samples all bins in one
+compiled program (`jaxfit/batch.py`, `run_batch`); `numpyro-nuts` and
+`blackjax-nss` still fit the bins one after the other.
+
+**How**
+- Every bin is prepared as before (`BroadbandFit`, `JaxModel`, folder and
+  input files: `BroadbandFit._jax_prepare`), and saved as before
+  (`_jax_finish`, diagnostics, residuals), so bin folders, `load`,
+  `spectrum()` and resuming are unchanged. Finished bins are loaded.
+- Bins are grouped by `structure(model)`: everything the compiled function
+  bakes in (datasets, model configuration, free parameter names and prior
+  types, fixed parameter names, model options, array keys and trailing
+  shapes). One log density takes a bin's data, prior hyperparameters
+  (`PriorSet.hyper`, already an array since Phase 0) and fixed values
+  (`JaxModel._log_likelihood(..., fixed=)`) as arguments.
+- Bins of different lengths (NaN integrations dropped in some bins,
+  clipping) are padded to the longest with a `mask`: white noise leaves the
+  padded points out of the sums; GPs give them a zero residual and variance
+  1e20, place the GP regressor of padded points far beyond the data, and
+  take their constant terms off (`_PAD_VARIANCE`). Padded and unpadded
+  log-likelihoods agree to 1e-7 nats (Exp, Matern, SHO, Matern x Exp).
+- Starting points and the whitening (posterior maximum, Laplace covariance)
+  per bin, with the shared compiled value-and-gradient and Hessian
+  (`find_start(vg=, hess=)`).
+- Warmup and sampling: blackjax window adaptation and NUTS, chains vmapped,
+  mapped over the bins with `jax.lax.map(batch_size=batch)`: `batch` bins
+  vmapped at a time, the rest one after the other inside the program. Every
+  bin keeps its own step size and mass matrix. The log-likelihoods of the
+  draws are computed in the batch too.
+- Default `batch` (`default_batch`): all bins on a GPU, 1 on a CPU. NUTS
+  trees differ in size, and vmapped lanes move in lockstep, each iteration
+  costing the largest tree of all lanes; on a CPU the lanes are computed one
+  after the other, so vmapping bins only adds that cost.
+
+**Checks** (8 bins of a 300-point transit with a Matern GP and a linear
+model per bin; NaN integrations in two bins, 298 and 299 points; per-bin
+priors: fixed limb darkening and depth ranges; 4 chains x 500 + 500 draws;
+CPU, M4 Pro)
+
+| run | wall time | warmup | sampling |
+| --- | --- | --- | --- |
+| one bin at a time (`BroadbandFit.fit` per bin, before) | 360 s | 123 s | 215 s |
+| batched, mapped (`batch=1`, CPU default) | 321 s | 136 s | 170 s |
+| batched, all 8 vmapped | 687 s | 282 s | 390 s |
+
+- The batched log-likelihood of every saved draw equals the bin's own
+  (unpadded) model to 2e-12.
+- Mapped vs one at a time: `p` medians within 0.12 sd, widths 0.92-1.03;
+  `theta0` within 0.07 sd, widths 1.01-1.05; GP hyperparameters within
+  0.03 sd (their widths scatter, 0.8-1.65: heavy tails, ESS 200-600).
+- On a CPU the work is the same, so the gain is the compilations (one per
+  model structure instead of one per bin): about 10% here. vmapping bins is
+  for GPUs (Phase 6 benchmark script); on a GPU all bins at once may need
+  `batch` smaller for memory (bins x chains x points per lane).
+
+Tests: padding exact (white noise, ramp, supersampling, GP); batched runs
+with shorter bins and per-bin priors, mapped and vmapped, saved
+log-likelihoods against each bin's own model, truth recovered, finished
+bins loaded on a second run.
+
+### 5.15 JAX backend, Phase 5: real-data validation (2026-11-27/28)
+
+Each fit repeats a finished dynesty fit with the same data, priors and model
+(the fit fingerprint is checked) with `blackjax-nuts` (4 chains x 1000 +
+1000), CPU (M4 Pro). Scripts: `jwst-ers/NRSG395H/Outputs/scripts/`
+`jax_validate_g395h.py`, `jax_validate_joint.py`;
+`jwst-ers/Data/MIRI/reduction/fits/jax_validate_wasp43b.py`;
+`gj3929/Data/jax_validate_gj3929.py`, `fit_gj3929_rslice.py`.
+
+| fit | free | NUTS time | medians (NUTS - dynesty) | widths (NUTS / dynesty) | R-hat, ESS, divergences |
+| --- | --- | --- | --- | --- | --- |
+| G395H NRS1 white light | 11 | 25 s | <= 0.05 sd | 0.96-1.04 | 1.002, 1236, 0 |
+| G395H NRS2 white light | 11 | 25 s | <= 0.07 sd | 0.97-1.04 | 1.005, 1197, 0 |
+| G395H NRS1 R100 (30 bins, batched) | 8 per bin | 1107 s | depth mean +0.1 ppm, rms 2.5, <= 0.05 sd | errors 0.97-1.08 (median 1.005) | 6 bins R-hat >= 1.01, min ESS 86 |
+| G395H NRS2 R100 (29 bins, batched) | 8 per bin | 1018 s | depth mean -0.9 ppm, rms 4.0, <= 0.12 sd | errors 0.97-1.06 (median 1.000) | 6 bins R-hat >= 1.01, min ESS 88 |
+| WASP-43 b MIRI LRS phase curve | 19 | 392 s | <= 0.08 sd (fp, nightside, offset included) | 0.96-1.03 | 1.006, 769, 0 |
+| WASP-39 b joint C (NRS1+2, TESS 51+91 + GP, 2 RVs) | 34 | 887 s | <= 0.07 sd | 0.96-1.08 | 1.003, 1559, 1 |
+| GJ 3929 b D/F/E (5 visits, ramps) | 39-42 | 1600-1840 s | see below | see below | R-hat up to 1.06, ESS 85 |
+
+**G395H R100 bins that mix badly.** All in `sigma_w`: its default prior
+(log-uniform 0.1-1e5 ppm) leaves a long prior-dominated tail below a narrow
+peak (bin 7: peak at 250 ppm, NUTS 6.5% of the draws below 50 ppm, dynesty
+~3%). `target_accept=0.95` with `nwarmup=2000` does not help (bin 7 ESS 30).
+The depths are unaffected; a narrower default jitter prior would fix it (it
+would change juliet fits and fingerprints too: open, user decision).
+
+**GJ 3929 b: dynesty's random walk mis-weights the ramp timescale.**
+- NUTS and dynesty disagree (F: fp 93 vs 111 ppm, -0.96 sd; E: fp of V3 10
+  vs 77 ppm; ramp parameters up to 150 sd apart). The JAX log-likelihood
+  at dynesty's draws equals dynesty's to 1e-10, so the models are the same.
+- The ramp of each visit has a long-timescale solution (tau near the top of
+  its prior, the visit length ~0.22 d) that trades off against the flux
+  offset and the linear time term. In the 5-visit fits dynesty put V3 95%
+  at short tau (< 0.01 d), NUTS 80-100% at long tau (all four chains).
+- V3 alone (11 free parameters, variant F priors): both samplers put >= 95%
+  at long tau, but inside it they disagree (tau 0.19 vs 0.14 d, fp 10 vs 30
+  ppm). An arbiter that uses neither sampler, the Laplace marginal of tau
+  (on a grid of the unconstrained tau, the other parameters maximised and
+  their Hessian determinant added), agrees with NUTS:
+
+  | tau (d) | < 0.004 | 0.004-0.13 | 0.13-0.18 | 0.18-0.21 | > 0.21 |
+  | --- | --- | --- | --- | --- | --- |
+  | Laplace | 0.005 | 0.095 | 0.37 | 0.41 | 0.12 |
+  | NUTS (default; target_accept 0.97, 2000 + 2000) | 0 | 0.09 | 0.30-0.32 | 0.42 | 0.18-0.19 |
+  | dynesty rwalk (500 live) | 0.043 | 0.20 | 0.58 | 0.15 | 0.02 |
+  | dynesty rslice (1500 live) | 0.038 | 0.17 | 0.40 | 0.30 | 0.09 |
+
+  fp: NUTS 10 (both settings), dynesty rwalk 30, rslice 20 ppm (+-40).
+  Importance sampling with a Gaussian mixture fitted to both samplers'
+  draws failed (ESS 1: the mixture misses the corner at the tau bound).
+- So the published-style GJ 3929 depths (§5.3, `current_eclipses_*`, rwalk)
+  are likely biased high. NUTS: D 129 (rwalk 134), F 93 (111), E V1 31 (65),
+  V3 10 (77) ppm. The 5-visit NUTS runs are not fully converged (R-hat up to
+  1.06, ESS 85) and cannot hop between eclipse-time modes (D: no draws in
+  the +60 min mode, rwalk 3.4%). Variant D with dynesty rslice: below.
+- The first rslice run of D crashed after 58 min, 27.7 M calls, near the
+  end of the initial run ("Slice sampler has failed to find a valid
+  point"); its lnZ was then 70710.6 +- 0.7 with dlogz 3.6 to go, already
+  13 nats above rwalk's final 70697.3 (rwalk misses posterior volume).
+  Cause: the batman 2.5.1 eclipse bug of §5.3 (fixed `t_secondary`) also
+  hits a free `t_secondary` whenever a call repeats the previous call's
+  value on the same batman object: `light_curve` moves `params.t0` to the
+  conjunction of `t_secondary` only when `t_secondary` changed, and juliet
+  resets `params.t0` to the transit epoch every call, so the repeated call
+  puts the eclipse at phase 0.5 (GJ 3929 D: lnL 7.7 lower, every one of 200
+  posterior draws). Slice steps below the float resolution of a BJD repeat
+  `t_secondary`, every proposal is then rejected and the slice shrinks to
+  zero. rwalk proposals move `t_secondary` every call, so rwalk results are
+  not affected (300 draws re-evaluated: equal to dynesty's stored lnL).
+  Workaround in `fit_gj3929_rslice.py` only (module level, so dynesty's
+  spawned workers get it): `TransitModel.light_curve` wrapped to set
+  `self.t_secondary = nan` for eclipse models (conjunction recomputed every
+  call); repeated calls then agree and first calls are unchanged. A jstark
+  fix (and an upstream report) is the user's decision.
+- Not changed: refitting with rslice or NUTS, or a narrower ramp timescale
+  prior (a ramp as long as the visit is degenerate with the linear time
+  term), is the user's decision.
+
+**blackjax-nss on GJ 3929 D: stopped.** 39 parameters, 500 live, 50
+replaced per step, 195 slice steps per point: ~8.5 s per step on the CPU and
+~2700 steps needed (prior-to-posterior information ~260 nats, 0.105 nats per
+step), ~6.5 h, against dynesty rwalk's 8.3 M likelihood calls (58 per
+iteration) on 8 processes. NSS runs its replaced points vectorised, which
+only pays on a GPU (Phase 6). Stopped after 731 steps (user).
+
+**CPU use and `nproc > 1` for JAX.** One JAX process keeps only ~2.7 cores
+busy (NUTS ~130 CPU-s per R100 bin, dynesty ~70), so
+`SpectroscopicFit.run(nproc=N)` now runs JAX samplers in N worker processes
+on the CPU (user, 2026-11-28): `blackjax-nuts` in chunks of bins (2N
+chunks, one batched compiled run each), the other JAX samplers one bin per
+task; refused on a GPU (use `batch`). XLA's CPU thread pool cannot be
+limited in jax 0.12 (`--xla_cpu_multi_thread_eigen=false` is accepted but
+matmul and element-wise ops still use 8-10 cores), so workers are not
+single-threaded; per-bin NUTS is mostly serial anyway. 12 G395H NRS1 R100
+bins, with a 6-thread dynesty run on the machine:
+
+| nproc | wall | per bin | CPU per bin | cores busy | depth vs batched validation run |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 577 s | 48 s | 132 s | 2.7 | identical |
+| 2 | 364 s | 30 s | 136 s | 4.5 | <= 0.06 sd |
+| 4 | 239 s | 20 s | 144 s | 7.2 | <= 0.07 sd |
+
+Each JAX worker needs ~1-1.5 GB. Draws differ from `nproc=1` because the
+random keys follow a bin's position in its chunk.
+
+**GJ 3929 D with dynesty rslice (patched batman), 6 processes, 3494 s:**
+eclipse -8.5 min, +60 min mode 0.7% (rwalk 3.4%, NUTS 0); fp 137.7 +20.0
+-19.6 ppm (rwalk 134.0 +17.3 -19.5, NUTS 129.4 +-21.9); lnZ 70708.74 +-
+0.63 (rwalk 70697.33 +- 0.62: 11.4 nats low). Long-tau fractions V1, V2,
+V3, V4a, V4b: rslice 1.00, 0.01, 0.21, 0.03, 0.26; rwalk 1.00, 0.04, 0.03,
+0.04, 0.04; NUTS 1.00, 0.40, 0.86, 0.25, 0.28. So in D rslice and NUTS
+disagree on V3 (the V3-alone arbiter used F priors, eclipse at -54 min,
+and does not carry over). Pinned (user, 2026-11-28): the Laplace marginal
+of tau_V3 in the full D fit (38 other parameters) would decide.
+
+**Samplers vs the original dynesty runs.** dynesty: dynamic, rwalk, 500
+live, 8 processes (wall time = posterior pickle minus `jstark_fit.json`
+modification time); NUTS: one process, ~2.7 cores busy.
+
+| fit | dynesty wall | dynesty calls | dynesty lnZ | NUTS wall | NUTS vs dynesty posteriors |
+| --- | --- | --- | --- | --- | --- |
+| G395H NRS1 / NRS2 white | 42 / 39 s | 1.4 / 1.3 M | 3331.39 / 3197.06 | 25 / 25 s | <= 0.07 sd, widths 0.96-1.04 |
+| G395H NRS1 / NRS2 R100 | 63 s per bin; 255 / 250 s for all (parallel) | | | 1107 / 1018 s (`nproc=1`); ~20 s per bin with `nproc=4` | depths <= 0.12 sd, errors +-8% |
+| WASP-43 b LRS phase curve | 373 s | 2.8 M | 54224.46 | 392 s | <= 0.08 sd |
+| WASP-39 b joint C | 616 s | 5.9 M | 23467.15 | 887 s | <= 0.07 sd |
+| GJ 3929 D / F / E | 1106 / 1101 / 1321 s | 8.3 / 8.1 / 9.4 M | 70697.33 / 70693.75 / 70668.43 | 1786 / 1838 / 1609 s (not converged) | ramp-mode weights differ; fp -0.25 / -0.96 / up to -2.2 sd |
+
+**numpyro-nuts on real data (2026-11-28).** Same fits, same defaults (4
+chains x 1000 + 1000, dense mass, Laplace whitening); outputs
+`fits/jax_numpyro_nuts_white_<det>`, `..._w5.174-10.488_numpyro_nuts`,
+`joint/jax_numpyro_nuts_C`; comparison `scratchpad compare_samplers.py`.
+
+| fit | numpyro vs dynesty | numpyro vs blackjax | numpyro: time, R-hat, min ESS bulk/tail, div. | blackjax: time (warmup + sampling) |
+| --- | --- | --- | --- | --- |
+| G395H NRS1 white | <= 0.05 sd, widths 0.96-1.02 | <= 0.07 sd, 0.96-1.03 | 26 s, 1.0025, 1455/775, 0 | 25 s (11 + 5) |
+| G395H NRS2 white | <= 0.06 sd, 0.95-1.03 | <= 0.05 sd, 0.94-1.02 | 18 s, 1.0022, 1688/1192, 0 | 25 s (11 + 10) |
+| WASP-43 b phase curve | <= 0.08 sd, 0.97-1.05 | <= 0.09 sd, 0.96-1.06 | 296 s, 1.0042, 1810/1350, 0 | 392 s (211 + 108) |
+| WASP-39 b joint C | <= 0.05 sd, 0.97-1.07 | <= 0.06 sd, 0.91-1.06 | 984 s, 1.0042, 1786/1106, 2 | 887 s (708 + 104) |
+
+The two NUTS implementations agree with each other and with dynesty as
+well as either does with dynesty; neither is consistently faster. Plots
+(phase-folded, full model, TESS GP, RVs) through the evaluator are fine.
+blackjax spends most of its time in warmup (joint C: 708 of 887 s; the
+Laplace whitening may allow a shorter default `nwarmup`: not tested).
+
+On this CPU NUTS is about as fast as 8-process dynesty for single fits
+(faster for small ones, 1.4-1.6x slower for the 34-42 parameter fits) at
+~1/3 of the CPU; R100 spectra are faster with dynesty's 8 processes. lnZ:
+only dynesty here (NSS stopped; its lnZ biased on synthetic tests, 5.13);
+rwalk lnZ is not exact either (GJ 3929 D: 11.4 nats below rslice).
+
+**GJ 3929 b refit with ramptau capped at 0.1 d (2026-11-28).** Script
+`gj3929/Data/fit_gj3929_taucap.py`: as `fit_gj3929_current.py`, but with the
+new jitter default and `ramptau_<visit>` LU(2 cadences, 0.1 d) (was up to
+the visit length); outputs `fits/taucap_eclipses_<D|F|E>_<sampler>`.
+dynesty rwalk with 10 processes: 1195 / 1235 / 1274 s; blackjax-nuts at
+the same time: 1877 / 1864 / 1654 s.
+
+| fit | capped rwalk | capped NUTS | old rwalk | old NUTS |
+| --- | --- | --- | --- | --- |
+| F fp | 112.6 +17.3 -17.7 | 105.6 +-20.1 | 111.0 +-18.3 | 93.4 +-24.3 |
+| E V1 / V2 / V3 / V4 fp | 57 / 149 / 65 / 69 | 56 / 160 / 57 / 68 | 65 / 160 / 77 / 89 | 31 / 159 / 10 / 73 |
+| D fp, t_sec | **-146.0 at +65.8 min (98.6%)** | 137.8 +20.7 -22.3 at -8.4 | 134.0 at -8.5 | 129.4 at -8.3 |
+| NUTS R-hat / min ESS | | 1.013 / 305 (D), 1.012 / 133 (F), 1.022 / 293 (E) | | 1.028 / 155, 1.059 / 85, 1.027 / 37 |
+| lnZ (rwalk) D / F / E | 70719.09 / 70708.15 / 70702.20 | | 70697.33 / 70693.75 / 70668.43 | |
+
+- With the cap, F and E agree between the samplers within 0.4 sd (they
+  differed by up to 2.2 sd), and NUTS mixes better. It still flags R-hat
+  1.01-1.02 on the short-tau ramps (V1, V3, V4a/V4b).
+- **D, capped rwalk: 98.6% of the posterior is an inverted eclipse**
+  (fp < 0 at +66 min, near the edge of the +-72 min prior). This mode is
+  in every dynesty run of D: old rwalk 3.4%, rslice 0.7%. Its weight is
+  nested-sampling noise between two separated modes. Direct optimisation
+  of the JAX model with the capped priors (`scratchpad d_mode_opt.py`,
+  starts from the best samples of all five D runs) gives:
+  - eclipse mode: lnL 70973.43, log posterior 70916.18 (-6.8 min,
+    +137.8 ppm);
+  - inverted mode: lnL 70969.17 (4.3 lower), log posterior 70913.96
+    (2.2 lower; Hessian not positive definite there).
+  The eclipse is the higher mode. The capped rwalk run's best eclipse-mode
+  point was 70957.9, 15.5 below the peak, so it never converged there.
+  The odds against the inverted dip are only ~e^2-e^4. So with fp free in
+  sign and t_sec free, D's eclipse time is modest evidence. An fp >= 0
+  prior would remove the inverted mode (user decision).
+- rwalk lnZ moved by +22 / +14 / +34 (D / F / E). The prior changes alone
+  shift it by ~+2: the narrower jitter prior gives +0.2 per visit, the
+  tau cap +0.15 per visit. So the rwalk lnZ of these 40-parameter fits
+  scatters by tens of nats and cannot be used for model comparison here.
+
+### 5.16 JAX backend, Phase 6: docs and GPU benchmark (2026-11-28)
+
+- User guide (`docs/user_guide/fitting.rst`), new section "JAX samplers
+  (optional)": install, the model and what it does not support, how NUTS
+  starts, options, results and diagnostics, spectroscopic fits (`batch`,
+  `nproc`), real-data tests, limitations, the benchmark. Also a note on
+  long ramps in "Priors" (cap `ramptau` when it runs to the top of its
+  prior; GJ 3929). API page `jstark.fitting.jaxfit`. Install line
+  `jwstark[fitting,jax]` in the README and quick start. New `jax` extra
+  in `pyproject.toml`: jax, jaxoplanet, blackjax, numpyro and tinygp, with
+  the tested versions as lower bounds. Read the Docs installs it for the
+  API pages.
+- `python -m jstark.fitting.jaxfit.benchmark` (`jaxfit/benchmark.py`). It
+  uses synthetic data made with batman: a transit with a ramp and two
+  regressors. It times:
+  - `gradient`: log density + gradient for 1e3-1e5 points, alone and
+    vmapped over 16-1024 parameter vectors;
+  - `fit`: a white-light fit per NUTS sampler (`--dynesty` adds juliet);
+  - `spectrum`: 64 bins with `batch` 1, 8 and all.
+  The output is JSON with the device and versions. `JAX_PLATFORMS=cpu`
+  gives the same tests on the CPU. Smoke test:
+  `test_benchmark_script_runs`.
+- `--quick` on the M4 Pro CPU, 5 min:
+  - gradient: 0.27 ms (1e3 points) and 1.07 ms (1e4); vmapped 87 /
+    750-885 us per evaluation;
+  - fit, 1000 points: blackjax-nuts 33 s, numpyro-nuts 29 s;
+  - spectrum, 8 bins x 500 points: batch 1 109 s, batch 8 96 s. vmapping
+    here is not slower, unlike the Phase 4 test (8 bins x 4 chains, 1.9x).
+- Fixed along the way:
+  - `SpectroscopicFit.run(nsamples=...)` (the draws of the saved median
+    models) swallowed the JAX samplers' `nsamples`, so a bin's NUTS always
+    drew 1000 per chain. Now `nsamples=None` (models: 500) and, with a JAX
+    sampler, a given `nsamples` is also the sampler's draws. The test
+    checks `ndraws`.
+  - numpyro-nuts `timing['sampling']` stopped the clock before JAX
+    finished (asynchronous dispatch; 4.2 s of a 29 s run). It now stops
+    after the draws are fetched. The Phase 5 numpyro times were wall
+    times, so they are unaffected.
+
 ## 6. Open issues and next steps
 
 - [x] Phase 2: `SpectroscopicFit` (per bin, all datasets covering it,
@@ -1463,6 +2163,62 @@ overlap, so differences in combined sigma are only indicative.
 - [ ] TTVs: `channel_priors` would need P and t0 derived from the `T_`
       parametrisation. GPs and linear regressors on RVs.
 - [ ] Report the juliet `non_linear_functions` / `input_folder` bug.
+- [ ] JAX backend (5.10-5.15): Phases 0-4 done 2026-11-27 (model;
+      samplers, `BroadbandFit`, interface, folders, `load`; GPs, RVs,
+      light-travel delay, `blackjax-nss`; plots through the model
+      interface; batched NUTS over spectroscopic bins); Phase 5 (real-data
+      validation, `nproc > 1` for JAX) 2026-11-28; Phase 6 (docs, GPU
+      benchmark script, 5.16) 2026-11-28, in review. Next: run the benchmark on
+      a GPU (user).
+- [ ] GJ 3929 b depths (5.3) likely biased by dynesty rwalk on the ramp
+      timescale degeneracy (5.15): refit (rslice / NUTS) or narrow the
+      ramp tau prior; user decision. Pinned (2026-11-28): Laplace marginal
+      of tau_V3 in the full D fit to decide between rslice and NUTS.
+      Refit with ramptau <= 0.1 d done (2026-11-28, 5.15): F and E agree
+      between the samplers (F 113 / 106 ppm). D rwalk fell into the
+      inverted-eclipse mode (fp < 0 at +66 min; the eclipse mode is 4.3
+      higher in lnL). Open: an fp >= 0 prior for D, and which run to
+      adopt (user decision). Pinned (user, 2026-11-28): whether the cap or
+      sampler noise moved D's rwalk run into the inverted mode (a second seed
+      would tell; the best points of both modes are within the cap).
+- [ ] batman 2.5.1 eclipse bug (fixed or repeated `t_secondary` -> eclipse
+      at phase 0.5; 5.3, 5.15): fix in jstark (wrap
+      `TransitModel.light_curve`) and report to batman; user decision.
+- [x] Default jitter prior: log-uniform 0.1-1e5 -> 0.1-1e4 ppm (user,
+      2026-11-28). Fits made with the old default no longer match their
+      fingerprint (`overwrite=True` or a new folder to refit). The lower
+      end is unchanged, so the low-sigma_w tail behind the poor NUTS mixing
+      in some R100 bins (5.15) remains. `init='prior'` with a short warmup can
+      leave a chain in another mode (R-hat flags it); `init='map'` is the
+      default.
+- [ ] juliet's batman models for non-polynomial laws are good to only a
+      few ppm (integration step fixed at juliet's initial parameters, 5.10).
+- [ ] Default priors of `gp_kernel='exp'` / `'matern-exp'` assume an
+      amplitude and a timescale; juliet's kernel takes a variance and a
+      rate (5.12). Decide whether to change them.
+- [ ] blackjax-nss evidence biased low on the 5-parameter NSS test problem
+      (found 2026-11-27 while testing Phase 3; the test against dynesty
+      fails intermittently). Reference: importance sampling from the NUTS
+      posterior, 1316.90 +- 0.01 (two proposals agree; the z-space prior
+      integrates to 1 within 0.007). NSS (400 live): 1315.55 / 1315.45
+      (seeds 0, 1), 1316.06 (100 slice steps), 1315.25 (1 deleted per
+      step), 1316.38 (20 deleted, 60 steps), 1316.24 (1000 live): 0.5-1.65
+      nats low, with quoted errors 0.13-0.23. dynesty: 1316.03, 1315.88,
+      1317.86 (+-0.37). The NSS posterior equals NUTS's (medians within
+      0.1 sd, widths 0.98-1.01). With `sigma_w` fixed or log-uniform
+      [1, 1000] instead of the default [0.1, 1e5], NSS is within -0.6 to
+      +0.06 nats of the reference, so the bias comes with the wide,
+      prior-dominated `sigma_w` direction; the quoted errors understate the
+      run-to-run scatter (~0.5 nats) in every case. The 11-parameter check of
+      5.12 agreed. Pinned by the user (2026-11-27): investigate later; do not
+      trust NSS evidences until then.
+- [ ] radvel 1.5.0 NumPy Kepler solver stops after one iteration (juliet's
+      eccentric RVs off by up to ~3e-3 K at e = 0.7; 5.12): report upstream.
+- [ ] dynesty evidences 2.4-8.5 nats low on an 11-parameter transit with a
+      ramp (5.12): check on real fits before using juliet's lnZ for model
+      comparison; `blackjax-nss` matched an importance-sampling reference.
+- [ ] george kernels and DoubleSHO cannot be set up through `BroadbandFit`
+      (default priors of `gp_kernel` are added; 5.12).
 - [ ] `phase_folded_lc` y-limits: include the binned data (low-S/N
       eclipses).
 - [ ] GJ 3929: V1 depth vs systematics model (trim, ramp, PLD/PCA) if the

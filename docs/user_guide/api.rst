@@ -33,3 +33,7 @@ Light-curve fitting
 .. automodapi:: jstark.fitting.utils
    :no-inheritance-diagram:
    :no-main-docstr:
+
+.. automodapi:: jstark.fitting.jaxfit
+   :no-inheritance-diagram:
+   :no-main-docstr:

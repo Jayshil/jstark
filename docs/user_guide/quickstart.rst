@@ -15,6 +15,9 @@ Installation
    conda activate jstark
    pip install "jwstark[fitting] @ git+https://github.com/Jayshil/jstark.git"
 
+   # optional: JAX samplers for the light-curve fits (NUTS, GPUs)
+   pip install "jwstark[fitting,jax] @ git+https://github.com/Jayshil/jstark.git"
+
    # where the jwst pipeline keeps its reference files (several GB)
    export CRDS_PATH=$HOME/crds_cache
    export CRDS_SERVER_URL=https://jwst-crds.stsci.edu

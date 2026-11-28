@@ -32,6 +32,15 @@ fitting = [
     "corner",
     "radvel",
 ]
+# optional JAX samplers of jstark.fitting (versions tested: jax 0.12.1, jaxoplanet 0.2.0,
+# blackjax 1.7.1, numpyro 0.22.0, tinygp 0.3.1); GPUs: also pip install "jax[cuda12]"
+jax = [
+    "jax>=0.12",
+    "jaxoplanet>=0.2",
+    "blackjax>=1.7",
+    "numpyro>=0.22",
+    "tinygp>=0.3",
+]
 test = [
     "pytest",
     "pytest-doctestplus",
