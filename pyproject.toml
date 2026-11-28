@@ -1,6 +1,6 @@
 [build-system]
 requires = [
-  "setuptools>=62.1",
+  "setuptools>=77.0",
   "setuptools_scm[toml]>=8.0.0",
   "wheel",]
 build-backend = "setuptools.build_meta"
@@ -10,7 +10,8 @@ name = "jwstark"
 description = "Tool to reduce, extract, and analyse JWST timeseries data"
 requires-python = ">=3.11"
 readme = { file = "README.rst", content-type = "text/x-rst" }
-license = { file = "licenses/LICENSE.rst" }
+license = "GPL-3.0-or-later"
+license-files = ["licenses/LICENSE.rst", "licenses/TEMPLATE_LICENSE.rst"]
 authors = [
   { name = "Jayshil A. Patel", email = "jaspa@dtu.dk" },
 ]
@@ -28,6 +29,7 @@ dynamic = ["version"]
 [project.optional-dependencies]
 fitting = [
     "juliet",
+    "setuptools",     # batman (via juliet) imports distutils, removed in Python 3.12
     "photutils",
     "corner",
     "radvel",
